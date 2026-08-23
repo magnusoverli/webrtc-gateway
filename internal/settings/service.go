@@ -6,6 +6,7 @@ import (
 	"slices"
 	"time"
 
+	"webrtc-gateway/internal/controlplane"
 	"webrtc-gateway/internal/mediamtx"
 )
 
@@ -17,17 +18,22 @@ type GlobalManager interface {
 type ChannelReconciler interface {
 	Reconcile(context.Context) error
 	ReconcileSRTListeners(context.Context) error
+	ValidatePortPolicy(context.Context, int, int, []int) error
 }
 
 type Service struct {
 	store    Repository
 	media    GlobalManager
 	channels ChannelReconciler
+	control  *controlplane.Coordinator
 	now      func() time.Time
 }
 
-func NewService(store Repository, media GlobalManager, channels ChannelReconciler) *Service {
-	return &Service{store: store, media: media, channels: channels, now: time.Now}
+func NewService(store Repository, media GlobalManager, channels ChannelReconciler, control *controlplane.Coordinator) *Service {
+	if control == nil {
+		control = controlplane.NewCoordinator()
+	}
+	return &Service{store: store, media: media, channels: channels, control: control, now: time.Now}
 }
 
 func (s *Service) Get(ctx context.Context) (Settings, error) {
@@ -35,6 +41,12 @@ func (s *Service) Get(ctx context.Context) (Settings, error) {
 }
 
 func (s *Service) Update(ctx context.Context, value Settings) (Settings, error) {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return Settings{}, err
+	}
+	defer release()
+
 	current, err := s.store.Get(ctx)
 	if err != nil {
 		return Settings{}, err
@@ -43,10 +55,17 @@ func (s *Service) Update(ctx context.Context, value Settings) (Settings, error) 
 	if err != nil {
 		return Settings{}, err
 	}
+	if s.channels != nil {
+		srtPort, _ := listenerPort("srtAddress", validated.SRTAddress, false)
+		webrtcPort, _ := listenerPort("webRTCLocalUDPAddress", validated.WebRTCLocalUDPAddress, false)
+		if err := s.channels.ValidatePortPolicy(ctx, validated.RTPPortMin, validated.RTPPortMax, []int{srtPort, webrtcPort}); err != nil {
+			return Settings{}, err
+		}
+	}
 	if err := s.store.Update(ctx, validated); err != nil {
 		return Settings{}, err
 	}
-	return s.apply(ctx, validated, current.MediaBindAddress != validated.MediaBindAddress)
+	return s.apply(ctx, validated, current.MediaBindAddress != validated.MediaBindAddress, true)
 }
 
 func (s *Service) RTPPortRange(ctx context.Context) (int, int, error) {
@@ -58,15 +77,28 @@ func (s *Service) RTPPortRange(ctx context.Context) (int, int, error) {
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	value, err := s.store.Get(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = s.apply(ctx, value, false)
+	// Channel reconciliation is the controller's next desired-state step.
+	_, err = s.apply(ctx, value, false, false)
 	return err
 }
 
 func (s *Service) ReconcilePending(ctx context.Context) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	value, err := s.store.Get(ctx)
 	if err != nil {
 		return err
@@ -74,11 +106,13 @@ func (s *Service) ReconcilePending(ctx context.Context) error {
 	if value.ApplyState == ApplyApplied {
 		return nil
 	}
-	_, err = s.apply(ctx, value, false)
+	// A prior apply can fail after MediaMTX accepted the patch but before every
+	// dependent channel was refreshed, so pending settings force a complete pass.
+	_, err = s.apply(ctx, value, true, true)
 	return err
 }
 
-func (s *Service) apply(ctx context.Context, value Settings, forceChannelReconcile bool) (Settings, error) {
+func (s *Service) apply(ctx context.Context, value Settings, forceChannelReconcile, reconcileChannels bool) (Settings, error) {
 	desired := mediamtx.GlobalConfig{
 		LogLevel:                 value.LogLevel,
 		ReadTimeout:              value.ReadTimeout,
@@ -95,7 +129,7 @@ func (s *Service) apply(ctx context.Context, value Settings, forceChannelReconci
 		WebRTCTrackGatherTimeout: value.WebRTCTrackGatherTimeout,
 	}
 	current, err := s.media.GetGlobal(ctx)
-	bindingChanged := forceChannelReconcile || !sameListenerHosts(current, desired)
+	bindingChanged := forceChannelReconcile || current.SRTAddress != desired.SRTAddress || !sameListenerHosts(current, desired)
 	patched := false
 	if err == nil && !equalGlobal(current, desired) {
 		err = s.media.PatchGlobal(ctx, desired)
@@ -104,7 +138,7 @@ func (s *Service) apply(ctx context.Context, value Settings, forceChannelReconci
 	if err == nil && patched && bindingChanged {
 		err = s.waitForMediaAPI(ctx)
 	}
-	if err == nil && s.channels != nil {
+	if err == nil && reconcileChannels && s.channels != nil {
 		if bindingChanged {
 			err = s.channels.Reconcile(ctx)
 		} else {

@@ -1,7 +1,9 @@
 package compatibility
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -330,6 +332,52 @@ func TestEnsureTranscodedQueuesWhenCapacityIsBusy(t *testing.T) {
 	}
 }
 
+func TestReconcileNonSRTChannelCleansUpTranscodedPathAndRetriesFailure(t *testing.T) {
+	const channelID = "channel-id"
+	compatPath := CompatibilityPath(channelID)
+	configured := channel.Channel{
+		ID: channelID, Path: "channel", Enabled: true,
+		Input: channel.Input{Mode: channel.InputRTPUnicast},
+	}
+	media := &reconcileMediaManager{
+		status: mediamtx.Status{Channels: []mediamtx.Channel{
+			{Name: configured.Path, Available: true, Online: true},
+			{Name: compatPath, Available: true, Online: true},
+		}},
+		deleteErrors: []error{errors.New("temporary delete failure"), nil},
+	}
+	var logs bytes.Buffer
+	workerStopped := false
+	manager := &Manager{
+		logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+		channels: reconcileChannelReader{items: []channel.Channel{configured}},
+		media:    media,
+		entries: map[string]*entry{channelID: {
+			fingerprint: "srt-source", classified: true,
+			decision: decision{required: true, transcodeVideo: true},
+			state: State{
+				State: StateReady, Mode: ModeTranscoded, Required: true,
+				Worker: WorkerState{Running: true}, OutputPath: compatPath,
+			},
+			worker: &worker{cancel: func() { workerStopped = true }},
+		}},
+	}
+
+	manager.reconcile(context.Background())
+	state := manager.Snapshot(channelID)
+	if !workerStopped || state.State != StateReady || state.Mode != ModeDirect || state.Required || state.OutputPath != configured.Path {
+		t.Fatalf("workerStopped = %v, direct state = %#v", workerStopped, state)
+	}
+	if !strings.Contains(logs.String(), "stale compatibility path cleanup failed") || !strings.Contains(logs.String(), "temporary delete failure") {
+		t.Fatalf("cleanup failure was not logged: %s", logs.String())
+	}
+
+	manager.reconcile(context.Background())
+	if !reflect.DeepEqual(media.deleted, []string{compatPath, compatPath}) {
+		t.Fatalf("deleted paths = %#v, want cleanup retried", media.deleted)
+	}
+}
+
 func TestFingerprintIgnoresMetadataEnrichment(t *testing.T) {
 	available := "2026-08-22T21:00:00Z"
 	initial := mediamtx.Channel{
@@ -431,6 +479,38 @@ func TestWorkerStartupTimeoutStopsWorkerAndSchedulesRetry(t *testing.T) {
 	if manager.entries["channel-id"].retryAt.Before(time.Now()) {
 		t.Fatalf("retry was not scheduled: %v", manager.entries["channel-id"].retryAt)
 	}
+}
+
+type reconcileChannelReader struct {
+	items []channel.Channel
+}
+
+func (r reconcileChannelReader) List(context.Context) ([]channel.Channel, error) {
+	return r.items, nil
+}
+
+type reconcileMediaManager struct {
+	status       mediamtx.Status
+	deleteErrors []error
+	deleted      []string
+}
+
+func (m *reconcileMediaManager) Status(context.Context) (mediamtx.Status, error) {
+	return m.status, nil
+}
+
+func (m *reconcileMediaManager) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
+	return nil
+}
+
+func (m *reconcileMediaManager) DeletePath(_ context.Context, path string) error {
+	m.deleted = append(m.deleted, path)
+	if len(m.deleteErrors) == 0 {
+		return nil
+	}
+	err := m.deleteErrors[0]
+	m.deleteErrors = m.deleteErrors[1:]
+	return err
 }
 
 func containsPair(values []string, first, second string) bool {

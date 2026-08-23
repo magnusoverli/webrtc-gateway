@@ -17,6 +17,7 @@ import (
 	"webrtc-gateway/internal/compatibility"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/settings"
+	"webrtc-gateway/internal/srtrelay"
 )
 
 type fakeMediaMTX struct {
@@ -29,8 +30,9 @@ func (f fakeMediaMTX) Status(context.Context) (mediamtx.Status, error) {
 }
 
 type fakeChannels struct {
-	items []channel.Channel
-	err   error
+	items     []channel.Channel
+	err       error
+	deleteErr error
 }
 
 type fakePathManager struct{}
@@ -48,6 +50,12 @@ type fakeCompatibility struct {
 }
 
 func (f *fakeCompatibility) Snapshot(string) compatibility.State { return f.state }
+
+type fakeRelays struct {
+	status srtrelay.Status
+}
+
+func (f fakeRelays) Snapshot(string) srtrelay.Status { return f.status }
 
 func (f fakeSettings) Get(context.Context) (settings.Settings, error) {
 	return f.value, f.err
@@ -79,7 +87,19 @@ func (f fakeChannels) Update(context.Context, string, channel.Draft) (channel.Ch
 }
 
 func (f fakeChannels) Delete(context.Context, string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	return errors.New("not implemented")
+}
+
+func TestDeleteReportsAcceptedWhileCleanupIsPending(t *testing.T) {
+	handler := newTestHandler(t, fakeMediaMTX{}, fakeChannels{deleteErr: channel.ErrDeleting}, "http://127.0.0.1:1")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodDelete, "/api/v1/channels/channel-1", nil))
+	if res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), `"status":"deleting"`) {
+		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
 }
 
 func TestStatusEndpoint(t *testing.T) {
@@ -118,6 +138,27 @@ func TestFocusedChannelEndpointIncludesRuntimeAndPlayerPaths(t *testing.T) {
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"outputReady":true`) ||
 		!strings.Contains(res.Body.String(), `"viewerPath":"/view/channel-1"`) ||
 		!strings.Contains(res.Body.String(), `"automaticPreview":true`) {
+		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+}
+
+func TestStatusIncludesRelayRuntimeStateForSRTChannels(t *testing.T) {
+	handler, err := New(Options{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MediaMTX: fakeMediaMTX{},
+		Channels: fakeChannels{items: []channel.Channel{{
+			ID: "channel-1", Name: "SRT", Input: channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000}},
+		}}},
+		Settings:        fakeSettings{value: settings.Defaults(time.Now())},
+		Relays:          fakeRelays{status: srtrelay.Status{State: srtrelay.StateRetrying, Restarts: 3, LastError: "bind failed"}},
+		MediaMTXWHEPURL: "http://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"relay":{"state":"retrying","restarts":3,"lastError":"bind failed"}`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
 	}
 }
@@ -257,6 +298,36 @@ func TestWHEPProxyPinsCompatibilitySessionRoute(t *testing.T) {
 	}
 }
 
+func TestWHEPRejectsDeletingChannel(t *testing.T) {
+	handler := newTestHandler(t, fakeMediaMTX{}, fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Enabled: true, ApplyState: channel.ApplyDeleting,
+		Input: channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000}},
+	}}}, "http://127.0.0.1:1")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/channels/channel-1/whep", strings.NewReader("offer")))
+	if res.Code != http.StatusConflict || !strings.Contains(res.Body.String(), "deletion is pending") {
+		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+}
+
+func TestWHEPAllowsSessionDeleteWhileChannelDeletionIsPending(t *testing.T) {
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/demo/whep/session-1" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer mediaServer.Close()
+	handler := newTestHandler(t, fakeMediaMTX{}, fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Path: "demo", Enabled: false, ApplyState: channel.ApplyDeleting,
+	}}}, mediaServer.URL)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodDelete, "/api/v1/channels/channel-1/whep/d/session-1", nil))
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+}
+
 func TestStatusDoesNotReuseCompatibilityDecisionForNewSource(t *testing.T) {
 	oldRuntime := mediamtx.Channel{
 		Name: "demo", Available: true, Online: true,
@@ -290,7 +361,7 @@ func TestChannelCRUDMasksAndPreservesPassphrase(t *testing.T) {
 		t.Fatalf("OpenSQLite() error = %v", err)
 	}
 	defer store.Close()
-	service := channel.NewService(store, fakePathManager{}, nil, nil)
+	service := channel.NewService(store, fakePathManager{}, nil, nil, nil)
 	handler := newTestHandler(t, fakeMediaMTX{}, service, "http://127.0.0.1:1")
 
 	createBody := `{"name":"Secure input","enabled":true,"input":{"mode":"srt-push","srt":{"port":10000,"passphrase":"0123456789","sdp":"v=0\\nm=video 0 RTP/AVP 96\\na=rtpmap:96 H264/90000"}},"maxReaders":4}`

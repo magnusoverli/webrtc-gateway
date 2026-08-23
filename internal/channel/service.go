@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"webrtc-gateway/internal/controlplane"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
 )
@@ -57,11 +58,15 @@ type Service struct {
 	media      PathManager
 	portPolicy PortPolicy
 	srt        SRTListenerManager
+	control    *controlplane.Coordinator
 	now        func() time.Time
 }
 
-func NewService(store Repository, media PathManager, portPolicy PortPolicy, srt SRTListenerManager) *Service {
-	return &Service{store: store, media: media, portPolicy: portPolicy, srt: srt, now: time.Now}
+func NewService(store Repository, media PathManager, portPolicy PortPolicy, srt SRTListenerManager, control *controlplane.Coordinator) *Service {
+	if control == nil {
+		control = controlplane.NewCoordinator()
+	}
+	return &Service{store: store, media: media, portPolicy: portPolicy, srt: srt, control: control, now: time.Now}
 }
 
 func (s *Service) List(ctx context.Context) ([]Channel, error) {
@@ -73,7 +78,12 @@ func (s *Service) Get(ctx context.Context, id string) (Channel, error) {
 }
 
 func (s *Service) Create(ctx context.Context, draft Draft) (Channel, error) {
-	var err error
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return Channel{}, err
+	}
+	defer release()
+
 	draft, err = ValidateDraft(draft)
 	if err != nil {
 		return Channel{}, err
@@ -92,9 +102,18 @@ func (s *Service) Create(ctx context.Context, draft Draft) (Channel, error) {
 }
 
 func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, error) {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return Channel{}, err
+	}
+	defer release()
+
 	current, err := s.store.Get(ctx, id)
 	if err != nil {
 		return Channel{}, err
+	}
+	if current.ApplyState == ApplyDeleting {
+		return Channel{}, ErrDeleting
 	}
 	draft, err = ValidateDraft(draft)
 	if err != nil {
@@ -179,22 +198,96 @@ func (s *Service) validateUDPPort(ctx context.Context, draft Draft, excludeID st
 	return nil
 }
 
+func (s *Service) ValidatePortPolicy(ctx context.Context, minimum, maximum int, reserved []int) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	items, err := s.store.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Input.RTP != nil {
+			port := item.Input.RTP.Port
+			if port < minimum || port > maximum {
+				return fmt.Errorf("%w: RTP port range must include port %d used by %s", ErrInvalid, port, item.Name)
+			}
+			continue
+		}
+		if item.Input.Mode != InputSRTPush || item.Input.SRT == nil {
+			continue
+		}
+		port := item.Input.SRT.Port
+		if port >= minimum && port <= maximum {
+			return fmt.Errorf("%w: RTP port range cannot include SRT listener port %d used by %s", ErrInvalid, port, item.Name)
+		}
+		for _, reservedPort := range reserved {
+			if port == reservedPort {
+				return fmt.Errorf("%w: global UDP listeners cannot use SRT listener port %d assigned to %s", ErrInvalid, port, item.Name)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Service) Delete(ctx context.Context, id string) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	item, err := s.store.Get(ctx, id)
 	if err != nil {
 		return err
 	}
+	if item.ApplyState != ApplyDeleting {
+		item.Enabled = false
+		item.ApplyState = ApplyDeleting
+		item.ApplyError = ""
+		item.UpdatedAt = s.now().UTC()
+		if err := s.store.Update(ctx, item); err != nil {
+			return err
+		}
+	}
+	return s.finishDelete(ctx, item)
+}
+
+func (s *Service) finishDelete(ctx context.Context, item Channel) error {
 	var relayErr error
 	if s.srt != nil {
 		relayErr = s.srt.Stop(ctx, item.ID)
 	}
-	if err := s.media.DeletePath(ctx, item.Path); err != nil {
-		return errors.Join(relayErr, fmt.Errorf("remove MediaMTX path: %w", err))
+	mediaErr := s.media.DeletePath(ctx, item.Path)
+	cleanupErr := errors.Join(relayErr, errorWithPrefix("remove MediaMTX path", mediaErr))
+	if cleanupErr != nil {
+		_ = s.store.SetApplyResult(ctx, item.ID, ApplyDeleting, cleanupErr.Error())
+		return errors.Join(ErrDeleting, cleanupErr)
 	}
-	return errors.Join(relayErr, s.store.Delete(ctx, id))
+	if err := s.store.Delete(ctx, item.ID); err != nil {
+		_ = s.store.SetApplyResult(ctx, item.ID, ApplyDeleting, err.Error())
+		return errors.Join(ErrDeleting, err)
+	}
+	return nil
+}
+
+func errorWithPrefix(prefix string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	items, err := s.store.List(ctx)
 	if err != nil {
 		return err
@@ -202,6 +295,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 	var failures []error
 	for _, item := range items {
+		if item.ApplyState == ApplyDeleting {
+			if err := s.finishDelete(ctx, item); err != nil {
+				failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
+			}
+			continue
+		}
 		if _, err := s.apply(ctx, item); err != nil {
 			failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
 		}
@@ -210,6 +309,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 }
 
 func (s *Service) ReconcilePending(ctx context.Context) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	items, err := s.store.List(ctx)
 	if err != nil {
 		return err
@@ -217,6 +322,12 @@ func (s *Service) ReconcilePending(ctx context.Context) error {
 
 	var failures []error
 	for _, item := range items {
+		if item.ApplyState == ApplyDeleting {
+			if err := s.finishDelete(ctx, item); err != nil {
+				failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
+			}
+			continue
+		}
 		if item.ApplyState == ApplyApplied {
 			continue
 		}
@@ -228,12 +339,24 @@ func (s *Service) ReconcilePending(ctx context.Context) error {
 }
 
 func (s *Service) ReconcileSRTListeners(ctx context.Context) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	items, err := s.store.List(ctx)
 	if err != nil {
 		return err
 	}
 	var failures []error
 	for _, item := range items {
+		if item.ApplyState == ApplyDeleting {
+			if err := s.finishDelete(ctx, item); err != nil {
+				failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
+			}
+			continue
+		}
 		if err := s.applySRTListener(ctx, item); err != nil {
 			failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
 		}

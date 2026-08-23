@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -49,7 +50,9 @@ type GlobalConfig struct {
 }
 
 type PathConfigList struct {
-	Items []PathConfig `json:"items"`
+	ItemCount int          `json:"itemCount"`
+	PageCount int          `json:"pageCount"`
+	Items     []PathConfig `json:"items"`
 }
 
 type PathSource struct {
@@ -83,7 +86,9 @@ type Path struct {
 }
 
 type PathList struct {
-	Items []Path `json:"items"`
+	ItemCount int    `json:"itemCount"`
+	PageCount int    `json:"pageCount"`
+	Items     []Path `json:"items"`
 }
 
 type Channel struct {
@@ -126,18 +131,18 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 
-	var configs PathConfigList
-	if err := c.get(ctx, "/v3/config/paths/list", &configs); err != nil {
+	configs, err := getAllPages[PathConfig](ctx, c, "/v3/config/paths/list")
+	if err != nil {
 		return Status{}, err
 	}
 
-	var runtimePaths PathList
-	if err := c.get(ctx, "/v3/paths/list", &runtimePaths); err != nil {
+	runtimePaths, err := getAllPages[Path](ctx, c, "/v3/paths/list")
+	if err != nil {
 		return Status{}, err
 	}
 
-	channels := make(map[string]Channel, len(configs.Items)+len(runtimePaths.Items))
-	for _, item := range configs.Items {
+	channels := make(map[string]Channel, len(configs)+len(runtimePaths))
+	for _, item := range configs {
 		channels[item.Name] = Channel{
 			Name:             item.Name,
 			ConfiguredSource: item.Source,
@@ -146,7 +151,7 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		}
 	}
 
-	for _, item := range runtimePaths.Items {
+	for _, item := range runtimePaths {
 		channel := channels[item.Name]
 		channel.Name = item.Name
 		channel.Available = item.Available
@@ -204,7 +209,19 @@ func (c *Client) PatchGlobal(ctx context.Context, config GlobalConfig) error {
 func (c *Client) get(ctx context.Context, endpoint string, target any) error {
 	requestURL := *c.baseURL
 	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
+	return c.getURL(ctx, endpoint, requestURL, target)
+}
 
+func (c *Client) getPage(ctx context.Context, endpoint string, pageNumber int, target any) error {
+	requestURL := *c.baseURL
+	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
+	query := requestURL.Query()
+	query.Set("page", strconv.Itoa(pageNumber))
+	requestURL.RawQuery = query.Encode()
+	return c.getURL(ctx, endpoint, requestURL, target)
+}
+
+func (c *Client) getURL(ctx context.Context, endpoint string, requestURL url.URL, target any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
 		return fmt.Errorf("create MediaMTX request: %w", err)
@@ -223,6 +240,31 @@ func (c *Client) get(ctx context.Context, endpoint string, target any) error {
 		return fmt.Errorf("decode MediaMTX %s: %w", endpoint, err)
 	}
 	return nil
+}
+
+func getAllPages[T any](ctx context.Context, c *Client, endpoint string) ([]T, error) {
+	items := []T(nil)
+	pageCount := 1
+	for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
+		var response struct {
+			ItemCount int `json:"itemCount"`
+			PageCount int `json:"pageCount"`
+			Items     []T `json:"items"`
+		}
+		if err := c.getPage(ctx, endpoint, pageNumber, &response); err != nil {
+			return nil, err
+		}
+		if pageNumber == 0 {
+			if response.ItemCount > 0 {
+				items = make([]T, 0, response.ItemCount)
+			}
+			if response.PageCount > 0 {
+				pageCount = response.PageCount
+			}
+		}
+		items = append(items, response.Items...)
+	}
+	return items, nil
 }
 
 func (c *Client) mutate(ctx context.Context, method, endpoint string, body any, allowNotFound bool) error {

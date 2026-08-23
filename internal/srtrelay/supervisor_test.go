@@ -2,11 +2,14 @@ package srtrelay
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"webrtc-gateway/internal/channel"
 )
@@ -149,6 +152,138 @@ func TestEnsureReportsMissingExecutable(t *testing.T) {
 	err = supervisor.Ensure(context.Background(), plan)
 	if err == nil || !strings.Contains(err.Error(), "start SRT channel ingest") {
 		t.Fatalf("Ensure() error = %v", err)
+	}
+}
+
+func TestSupervisorReportsRestartFailures(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	var starts atomic.Int32
+	wait := make(chan error)
+	supervisor.startFn = func(context.Context, string) (inputSession, error) {
+		if starts.Add(1) == 1 {
+			return inputSession{wait: wait}, nil
+		}
+		return inputSession{}, errors.New("restart failed")
+	}
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+		return "mpegts", errors.New("connection ended")
+	}
+	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
+		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
+		Port: 10000, DestinationAddress: ":8890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	defer supervisor.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := supervisor.Snapshot("channel-1")
+		if status.State == StateRetrying && status.LastError == "restart failed" && status.NextRetryAt != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay status = %#v", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSupervisorBacksOffRepeatedPostLaunchExits(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	var starts atomic.Int32
+	wait := make(chan error)
+	supervisor.startFn = func(context.Context, string) (inputSession, error) {
+		starts.Add(1)
+		return inputSession{wait: wait}, nil
+	}
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+		return "", errors.New("process exited")
+	}
+	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
+		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
+		Port: 10000, DestinationAddress: ":8890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	defer supervisor.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := supervisor.Snapshot("channel-1")
+		if starts.Load() >= 2 && status.State == StateRetrying && status.LastError == "process exited" && status.NextRetryAt != nil {
+			if remaining := time.Until(*status.NextRetryAt); remaining < 300*time.Millisecond {
+				t.Fatalf("second crash retry delay = %s", remaining)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("starts = %d, status = %#v", starts.Load(), status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSnapshotDoesNotBlockWhileListenerIsStopping(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	wait := make(chan error)
+	relayStarted := make(chan struct{})
+	releaseRelay := make(chan struct{})
+	supervisor.startFn = func(context.Context, string) (inputSession, error) {
+		return inputSession{wait: wait}, nil
+	}
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+		close(relayStarted)
+		<-releaseRelay
+		return "", nil
+	}
+	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
+		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
+		Port: 10000, DestinationAddress: ":8890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	<-relayStarted
+	stopped := make(chan error, 1)
+	go func() { stopped <- supervisor.Stop(context.Background(), "channel-1") }()
+
+	deadline := time.Now().Add(time.Second)
+	for supervisor.Snapshot("channel-1").State != StateStopping {
+		if time.Now().After(deadline) {
+			t.Fatal("listener did not enter stopping state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseRelay)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if status := supervisor.Snapshot("channel-1"); status.State != StateStopped {
+		t.Fatalf("relay status = %#v", status)
+	}
+}
+
+func TestRestartDelayIsCapped(t *testing.T) {
+	if got := restartDelay(0); got != 250*time.Millisecond {
+		t.Fatalf("restartDelay(0) = %s", got)
+	}
+	if got := restartDelay(1); got != 500*time.Millisecond {
+		t.Fatalf("restartDelay(1) = %s", got)
+	}
+	if got := restartDelay(20); got != maximumRestartDelay {
+		t.Fatalf("restartDelay(20) = %s", got)
 	}
 }
 

@@ -297,6 +297,11 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 
 	if item.Input.Mode != channel.InputSRTPush && item.Input.Mode != channel.InputSRTPull {
 		m.setDirect(item.ID, item.Path, fingerprint(raw), decision{})
+		if _, ok := byPath[compatPath]; ok {
+			if err := m.media.DeletePath(ctx, compatPath); err != nil {
+				m.logger.Warn("stale compatibility path cleanup failed", "channel", item.ID, "path", compatPath, "error", err)
+			}
+		}
 		return
 	}
 

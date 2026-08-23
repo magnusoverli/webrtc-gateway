@@ -44,8 +44,8 @@ func (c *Controller) Run(ctx context.Context) {
 				c.logger.Warn("desired-state reconciliation incomplete", "error", err)
 			} else {
 				c.logger.Info("desired state reconciled", "mediaStarted", info.Started)
+				lastMediaStart = info.Started
 			}
-			lastMediaStart = info.Started
 		} else if err := c.reconcile(checkCtx, true); err != nil {
 			c.logger.Warn("pending desired-state reconciliation incomplete", "error", err)
 		}

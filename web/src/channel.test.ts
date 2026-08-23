@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   channelStateLabel,
+  channelHasFault,
   iframeEmbedCode,
   managementOrigin,
   mediaHost,
@@ -101,6 +102,11 @@ describe("channelStateLabel", () => {
     expect(channelStateLabel({ ...baseChannel, outputReady: true })).toBe("Output ready - direct");
     expect(channelStateLabel({ ...baseChannel, outputReady: true, compatibility: { ...baseChannel.compatibility, mode: "transcoded" } })).toBe("Output ready - normalized");
     expect(channelStateLabel({ ...baseChannel, applyState: "error" })).toBe("Configuration error");
+    expect(channelStateLabel({ ...baseChannel, applyState: "deleting" })).toBe("Deletion pending");
+    expect(channelStateLabel({ ...baseChannel, relay: { state: "retrying", restarts: 2, lastError: "bind failed" } })).toBe("Listener error");
+    expect(channelHasFault({ ...baseChannel, relay: { state: "retrying", restarts: 2 } })).toBe(true);
+    expect(channelHasFault({ ...baseChannel, enabled: false, relay: { state: "stopped", restarts: 0 } })).toBe(false);
+    expect(channelHasFault({ ...baseChannel, applyState: "deleting", relay: { state: "stopped", restarts: 0 } })).toBe(false);
     expect(channelStateLabel({ ...baseChannel, compatibility: { ...baseChannel.compatibility, state: "error" } })).toBe("Output error");
     expect(channelStateLabel({ ...baseChannel, enabled: false })).toBe("Disabled");
   });

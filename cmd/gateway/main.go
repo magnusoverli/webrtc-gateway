@@ -16,6 +16,7 @@ import (
 	"webrtc-gateway/internal/channel"
 	"webrtc-gateway/internal/compatibility"
 	"webrtc-gateway/internal/config"
+	"webrtc-gateway/internal/controlplane"
 	"webrtc-gateway/internal/httpapi"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
@@ -63,8 +64,9 @@ func main() {
 	}
 	relaySupervisor := srtrelay.New(logger, "srt-live-transmit")
 	defer relaySupervisor.Close()
-	channelService := channel.NewService(channelStore, mediaClient, settingsStore, relaySupervisor)
-	settingsService := settings.NewService(settingsStore, mediaClient, channelService)
+	control := controlplane.NewCoordinator()
+	channelService := channel.NewService(channelStore, mediaClient, settingsStore, relaySupervisor, control)
+	settingsService := settings.NewService(settingsStore, mediaClient, channelService, control)
 	compatibilityManager, err := compatibility.New(compatibility.Options{
 		Logger: logger, Channels: channelService, MediaMTX: mediaClient,
 		MediaRTSPURL: cfg.MediaMTXRTSPURL, EncoderThreads: cfg.EncoderThreads,
@@ -84,6 +86,7 @@ func main() {
 		Channels:        channelService,
 		Settings:        settingsService,
 		Compatibility:   compatibilityManager,
+		Relays:          relaySupervisor,
 		MediaMTXWHEPURL: cfg.MediaMTXWHEPURL,
 		Version:         version,
 		StartedAt:       time.Now().UTC(),

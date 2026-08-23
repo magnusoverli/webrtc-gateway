@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { channelStateLabel, type Channel } from "./channel";
+import { channelHasFault, channelStateLabel, type Channel } from "./channel";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
 export function StandalonePlayer({ channelID, embed }: { channelID: string; embed: boolean }) {
@@ -69,7 +69,7 @@ export function StandalonePlayer({ channelID, embed }: { channelID: string; embe
         {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Audio is playing. This channel does not currently include a video track." />}
         {!channel && <PlayerMessage code={loadError ? "ERR" : "..."} title={loadError || "Loading channel"} detail={loadError ? "The player will keep retrying." : "Reading live output status."} error={Boolean(loadError)} />}
         {channel && loadError && <PlayerMessage code="ERR" title="Status unavailable" detail={`${loadError}. The player will keep retrying.`} error />}
-        {channel && !loadError && !channel.outputReady && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channel.applyState === "error" || channel.compatibility.state === "error"} />}
+        {channel && !loadError && !channel.outputReady && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channelHasFault(channel)} />}
         {channel?.outputReady && player.state === "connecting" && <PlayerMessage code="ICE" title="Connecting" detail="Establishing a WebRTC media session." pulse />}
         {channel?.outputReady && player.state === "error" && <PlayerMessage code="ERR" title="Playback interrupted" detail={`${player.error} Retrying automatically.`} error />}
         {channel?.outputReady && player.state === "playing" && !player.hasVideo && !player.hasAudio && <PlayerMessage code="LIVE" title="Connected" detail="Waiting for media tracks." pulse />}
@@ -96,14 +96,17 @@ function PlayerMessage({ code, title, detail, error = false, pulse = false }: {
 }
 
 function stateCode(channel: Channel) {
-  if (channel.applyState === "error" || channel.compatibility.state === "error") return "ERR";
+  if (channelHasFault(channel)) return "ERR";
   if (channel.available && channel.online) return "PREP";
   return "OFF";
 }
 
 function offlineDetail(channel: Channel) {
+  if (channel.applyState === "deleting") return "This channel is being deleted.";
+  if (!channel.enabled) return "This channel is disabled.";
   if (channel.applyState === "error") return channel.applyError ?? "The channel configuration could not be applied.";
   if (channel.compatibility.state === "error") return channel.compatibility.lastError ?? "A browser-compatible output is unavailable.";
+  if (channel.relay?.state === "retrying" || channel.relay?.state === "stopped") return channel.relay.lastError ?? "The SRT listener process is unavailable.";
   if (channel.available && channel.online) return "The encoder is connected and the browser-compatible output is being prepared.";
   return "The player will start automatically when output becomes ready.";
 }

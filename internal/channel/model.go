@@ -27,9 +27,10 @@ const (
 type ApplyState string
 
 const (
-	ApplyPending ApplyState = "pending"
-	ApplyApplied ApplyState = "applied"
-	ApplyError   ApplyState = "error"
+	ApplyPending  ApplyState = "pending"
+	ApplyApplied  ApplyState = "applied"
+	ApplyError    ApplyState = "error"
+	ApplyDeleting ApplyState = "deleting"
 )
 
 type RTPInput struct {
@@ -81,6 +82,7 @@ type Draft struct {
 
 var pathCleaner = regexp.MustCompile(`[^a-z0-9]+`)
 var ErrInvalid = errors.New("invalid channel")
+var ErrDeleting = errors.New("channel deletion is pending")
 
 func New(draft Draft, now time.Time) (Channel, error) {
 	draft, err := ValidateDraft(draft)

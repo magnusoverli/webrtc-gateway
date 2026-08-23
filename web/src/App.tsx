@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   absolutePath,
+  channelHasFault,
   channelStateLabel,
   iframeEmbedCode,
   listenerPort,
@@ -13,6 +14,7 @@ import {
   type InputMode,
   type Track,
 } from "./channel";
+import { startSerialPolling } from "./polling";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 import type { WHEPPlayerState } from "./useWHEPPlayer";
 import { codecWarnings } from "./webrtc";
@@ -135,6 +137,7 @@ export function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [selectedID, setSelectedID] = useState("");
   const [statusError, setStatusError] = useState("");
+  const [deleteError, setDeleteError] = useState("");
   const [editingID, setEditingID] = useState<string | null>(null);
   const [form, setForm] = useState<ChannelForm | null>(null);
   const [formError, setFormError] = useState("");
@@ -156,9 +159,9 @@ export function App() {
   useEffect(() => {
     let disposed = false;
 
-    const load = async () => {
+    const load = async (signal: AbortSignal) => {
       try {
-        const response = await fetch("/api/v1/status", { cache: "no-store" });
+        const response = await fetch("/api/v1/status", { cache: "no-store", signal });
         if (!response.ok) throw new Error(`status ${response.status}`);
         const nextStatus = (await response.json()) as Status;
         if (disposed) return;
@@ -170,19 +173,21 @@ export function App() {
             : nextStatus.channels[0]?.id ?? "",
         );
       } catch {
-        if (!disposed) setStatusError("Gateway status is not responding");
+        if (!disposed && !signal.aborted) setStatusError("Gateway status is not responding");
       }
     };
 
-    void load();
-    const timer = window.setInterval(load, pollInterval);
+    const stopPolling = startSerialPolling(load, pollInterval);
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      stopPolling();
     };
   }, [pollInterval, refreshToken]);
 
+  useEffect(() => setDeleteError(""), [selectedID]);
+
   const selected = status?.channels.find((item) => item.id === selectedID) ?? null;
+  const selectedFault = Boolean(selected && channelHasFault(selected));
   const inputLive = Boolean(selected?.available && selected.online);
   const isLive = Boolean(selected?.outputReady);
   const preview = useWHEPPlayer({
@@ -430,14 +435,20 @@ export function App() {
 
   const deleteChannel = async (item: Channel) => {
     if (!window.confirm(`Delete ${item.name}? Existing viewers will be disconnected.`)) return;
-    const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}`, { method: "DELETE" });
-    if (!response.ok) {
-      const result = (await response.json()) as { error?: string };
-      setStatusError(result.error ?? "Unable to delete channel");
-      return;
+    setDeleteError("");
+    try {
+      const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(result.error ?? `Unable to delete channel (${response.status})`);
+      }
+      if (response.status !== 202) {
+        setSelectedID(status?.channels.find((channel) => channel.id !== item.id)?.id ?? "");
+      }
+      setRefreshToken((current) => current + 1);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Unable to delete channel");
     }
-    setSelectedID(status?.channels.find((channel) => channel.id !== item.id)?.id ?? "");
-    setRefreshToken((current) => current + 1);
   };
 
   const gatewaySettingsState = status?.settings.applyState === "error"
@@ -490,6 +501,7 @@ export function App() {
             {status?.channels.map((item) => {
               const live = item.outputReady;
               const state = channelStateLabel(item);
+              const fault = channelHasFault(item);
               return (
                 <button
                   className={item.id === selectedID ? "channel active" : "channel"}
@@ -497,7 +509,7 @@ export function App() {
                   onClick={() => setSelectedID(item.id)}
                   type="button"
                 >
-                  <span className={live ? "signal online" : item.applyState === "error" || item.compatibility.state === "error" ? "signal fault" : "signal"} />
+                  <span className={live ? "signal online" : fault ? "signal fault" : "signal"} />
                   <span>{item.name}</span>
                   <small>{state}</small>
                 </button>
@@ -543,10 +555,10 @@ export function App() {
             <h1>{workspaceTitle}</h1>
           </div>
           <div className="topbar-actions">
-            {selected && <button className="button secondary" type="button" onClick={() => openEdit(selected)}>Configure channel</button>}
+            {selected && <button className="button secondary" type="button" disabled={selected.applyState === "deleting"} onClick={() => openEdit(selected)}>Configure channel</button>}
             {status && !selected && <button className="button secondary" type="button" onClick={status.channels.length ? undefined : openCreate} disabled={status.channels.length > 0}>Create channel</button>}
             <div className={isLive ? "state-pill live" : statusError && !status ? "state-pill fault" : "state-pill"}>
-              <span className={isLive ? "signal online" : selected?.applyState === "error" || selected?.compatibility.state === "error" || statusError && !status ? "signal fault" : "signal"} />
+              <span className={isLive ? "signal online" : selectedFault || Boolean(statusError && !status) ? "signal fault" : "signal"} />
               {selected ? channelStateLabel(selected) : status === null ? statusError ? "Unavailable" : "Loading" : status.channels.length ? "Selecting" : "Empty"}
             </div>
           </div>
@@ -554,6 +566,9 @@ export function App() {
 
         <div className="channel-notices" aria-label="Channel notices">
           {selected?.applyState === "error" && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Configuration saved but not applied: ${selected.applyError ?? "Channel apply failed"}`} />}
+          {selected?.applyState === "deleting" && <ScopedNotice scope={`Channel · ${selected.name}`} message="Deletion is pending and will be retried automatically." />}
+          {selected && deleteError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Deletion failed: ${deleteError}`} />}
+          {selected?.enabled && selected.applyState !== "deleting" && selected.relay && (selected.relay.state === "retrying" || selected.relay.state === "stopped") && <ScopedNotice scope={`Channel · ${selected.name}`} message={`SRT listener is unavailable: ${selected.relay.lastError ?? "the relay process stopped"}. Gateway will retry automatically.`} />}
           {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Automatic preview was not updated: ${previewSettingError}`} />}
         </div>
 
@@ -632,7 +647,7 @@ export function App() {
                   <button
                     className={selected.automaticPreview ? "toggle active" : "toggle"}
                     type="button"
-                    disabled={previewSaving}
+                    disabled={previewSaving || selected.applyState === "deleting"}
                     aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
                     aria-pressed={selected.automaticPreview}
                     onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
@@ -645,8 +660,8 @@ export function App() {
                     <strong>Automatic preview disabled for this channel</strong>
                     <p>Enable the persisted setting to create a dashboard WHEP reader when output is ready.</p>
                   </div>}
-                  {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${selected.compatibility.state === "error" || selected.applyState === "error" ? " error-message" : ""}`}>
-                    <span className="preview-icon">{selected.compatibility.state === "error" || selected.applyState === "error" ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
+                  {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`}>
+                    <span className="preview-icon">{channelHasFault(selected) ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
                     <strong>{channelStateLabel(selected)}</strong>
                     <p>{previewOfflineDetail(selected)}</p>
                   </div>}
@@ -703,7 +718,7 @@ export function App() {
               <InfoLine label="WebRTC route" value={selected.compatibility.mode === "transcoded" ? "Automatic H264/Opus compatibility" : "Direct passthrough"} />
               <InfoLine label="WHEP signaling" value={whepURL} mono />
               <div className="danger-row">
-                <button className="button danger" type="button" onClick={() => void deleteChannel(selected)}>Delete channel</button>
+                <button className="button danger" type="button" disabled={selected.applyState === "deleting"} onClick={() => void deleteChannel(selected)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete channel"}</button>
               </div>
             </section>
           </>
@@ -1428,8 +1443,11 @@ function previewTitle(state: WHEPPlayerState, automatic: boolean, live: boolean)
 }
 
 function previewOfflineDetail(item: Channel) {
+  if (item.applyState === "deleting") return "Channel cleanup is pending and will be retried automatically.";
+  if (!item.enabled) return "This channel is disabled.";
   if (item.applyState === "error") return item.applyError ?? "The channel configuration could not be applied.";
   if (item.compatibility.state === "error") return item.compatibility.lastError ?? "A browser-compatible output is unavailable.";
+  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return item.relay.lastError ?? "The SRT listener process is unavailable.";
   if (item.available && item.online) return "The encoder is connected and browser-compatible output is being prepared.";
   return "Preview starts automatically when output becomes ready.";
 }

@@ -51,6 +51,79 @@ func TestStatusMergesConfiguredAndRuntimePaths(t *testing.T) {
 	}
 }
 
+func TestStatusMergesAllConfiguredAndRuntimePathPages(t *testing.T) {
+	var configPages []string
+	var runtimePages []string
+	checkQuery := func(t *testing.T, r *http.Request) string {
+		t.Helper()
+		if token := r.URL.Query().Get("token"); token != "secret" {
+			t.Errorf("token query = %q, want secret", token)
+		}
+		return r.URL.Query().Get("page")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /mediamtx/v3/info", func(w http.ResponseWriter, r *http.Request) {
+		checkQuery(t, r)
+		fmt.Fprint(w, `{"started":"2026-08-22T10:00:00Z","version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /mediamtx/v3/config/paths/list", func(w http.ResponseWriter, r *http.Request) {
+		page := checkQuery(t, r)
+		configPages = append(configPages, page)
+		switch page {
+		case "0":
+			fmt.Fprint(w, `{"itemCount":2,"pageCount":2,"items":[{"name":"standby","source":"publisher"}]}`)
+		case "1":
+			fmt.Fprint(w, `{"itemCount":2,"pageCount":2,"items":[{"name":"live","source":"publisher"}]}`)
+		default:
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+		}
+	})
+	mux.HandleFunc("GET /mediamtx/v3/paths/list", func(w http.ResponseWriter, r *http.Request) {
+		page := checkQuery(t, r)
+		runtimePages = append(runtimePages, page)
+		switch page {
+		case "0":
+			fmt.Fprint(w, `{"itemCount":2,"pageCount":2,"items":[{"name":"live","available":true,"online":true,"inboundBytes":1200}]}`)
+		case "1":
+			fmt.Fprint(w, `{"itemCount":2,"pageCount":2,"items":[{"name":"runtime-only","available":true,"online":true,"outboundBytes":600}]}`)
+		default:
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+		}
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := NewClient(server.URL+"/mediamtx?token=secret", time.Second)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	status, err := client.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+
+	if got := fmt.Sprint(configPages); got != "[0 1]" {
+		t.Errorf("config pages = %s, want [0 1]", got)
+	}
+	if got := fmt.Sprint(runtimePages); got != "[0 1]" {
+		t.Errorf("runtime pages = %s, want [0 1]", got)
+	}
+	if len(status.Channels) != 3 {
+		t.Fatalf("channel count = %d, want 3: %#v", len(status.Channels), status.Channels)
+	}
+	if live := status.Channels[0]; live.Name != "live" || live.ConfiguredSource != "publisher" || !live.Online || live.InboundBytes != 1200 {
+		t.Errorf("live channel was not merged across pages: %#v", live)
+	}
+	if runtimeOnly := status.Channels[1]; runtimeOnly.Name != "runtime-only" || !runtimeOnly.Online || runtimeOnly.OutboundBytes != 600 {
+		t.Errorf("runtime-only channel missing from second page: %#v", runtimeOnly)
+	}
+	if standby := status.Channels[2]; standby.Name != "standby" || standby.Online {
+		t.Errorf("standby channel missing from first page: %#v", standby)
+	}
+}
+
 func TestStatusReportsMediaMTXFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "failed", http.StatusInternalServerError)

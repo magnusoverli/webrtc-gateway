@@ -21,6 +21,7 @@ import (
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
 	"webrtc-gateway/internal/settings"
+	"webrtc-gateway/internal/srtrelay"
 	"webrtc-gateway/internal/webui"
 )
 
@@ -45,12 +46,17 @@ type compatibilityReader interface {
 	Snapshot(string) compatibility.State
 }
 
+type relayStatusReader interface {
+	Snapshot(string) srtrelay.Status
+}
+
 type Options struct {
 	Logger          *slog.Logger
 	MediaMTX        mediaStatusReader
 	Channels        channelService
 	Settings        settingsService
 	Compatibility   compatibilityReader
+	Relays          relayStatusReader
 	MediaMTXWHEPURL string
 	Version         string
 	StartedAt       time.Time
@@ -70,6 +76,7 @@ type server struct {
 	channels    channelService
 	settings    settingsService
 	compat      compatibilityReader
+	relays      relayStatusReader
 	version     string
 	startedAt   time.Time
 	whepTarget  *url.URL
@@ -167,6 +174,7 @@ type channelResponse struct {
 	OutputReady          bool                  `json:"outputReady"`
 	OutputTracks         []mediamtx.Track      `json:"outputTracks"`
 	Compatibility        compatibility.State   `json:"compatibility"`
+	Relay                *srtrelay.Status      `json:"relay,omitempty"`
 }
 
 type inputResponse struct {
@@ -236,6 +244,7 @@ func New(options Options) (http.Handler, error) {
 		channels:    options.Channels,
 		settings:    options.Settings,
 		compat:      options.Compatibility,
+		relays:      options.Relays,
 		version:     options.Version,
 		startedAt:   options.StartedAt,
 		whepTarget:  whepTarget,
@@ -385,6 +394,8 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil && value.UpdatedAt.IsZero() {
 		if errors.Is(err, settings.ErrInvalid) {
 			writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), settings.ErrInvalid.Error()+": "))
+		} else if errors.Is(err, channel.ErrInvalid) {
+			writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), channel.ErrInvalid.Error()+": "))
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal server error")
 		}
@@ -426,7 +437,7 @@ func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	responses := make([]channelResponse, 0, len(items))
 	for _, item := range items {
-		responses = append(responses, channelView(item, mediamtx.Channel{}))
+		responses = append(responses, s.channelView(item, mediamtx.Channel{}))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"channels": responses})
 }
@@ -446,7 +457,7 @@ func (s *server) createChannel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("channel saved but not applied", "channel", item.ID, "error", err)
 	}
-	writeJSON(w, http.StatusCreated, channelView(item, mediamtx.Channel{}))
+	writeJSON(w, http.StatusCreated, s.channelView(item, mediamtx.Channel{}))
 }
 
 func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
@@ -491,7 +502,12 @@ func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	if !item.Enabled {
+	if item.ApplyState == channel.ApplyDeleting {
+		if r.Method == http.MethodPost {
+			writeError(w, http.StatusConflict, channel.ErrDeleting.Error())
+			return
+		}
+	} else if !item.Enabled {
 		writeError(w, http.StatusConflict, "channel is disabled")
 		return
 	}
@@ -596,11 +612,15 @@ func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request
 	if err != nil {
 		s.logger.Warn("channel saved but not applied", "channel", item.ID, "error", err)
 	}
-	writeJSON(w, http.StatusOK, channelView(item, mediamtx.Channel{}))
+	writeJSON(w, http.StatusOK, s.channelView(item, mediamtx.Channel{}))
 }
 
 func (s *server) deleteChannel(id string, w http.ResponseWriter, r *http.Request) {
 	if err := s.channels.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, channel.ErrDeleting) {
+			writeJSON(w, http.StatusAccepted, map[string]string{"status": "deleting"})
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
@@ -776,7 +796,9 @@ func (s *server) mergeChannels(configured []channel.Channel, runtime []mediamtx.
 		if state.OutputPath != "" && state.OutputPath != item.Path {
 			output = byPath[state.OutputPath]
 		}
-		responses = append(responses, channelRuntimeView(item, raw, output, state))
+		view := channelRuntimeView(item, raw, output, state)
+		s.attachRelayStatus(item, &view)
+		responses = append(responses, view)
 	}
 	return responses
 }
@@ -797,7 +819,7 @@ func stateForRuntime(state compatibility.State, runtime mediamtx.Channel, direct
 	return state
 }
 
-func channelView(item channel.Channel, runtime mediamtx.Channel) channelResponse {
+func (s *server) channelView(item channel.Channel, runtime mediamtx.Channel) channelResponse {
 	state := compatibility.State{
 		State: compatibility.StateOffline, Mode: compatibility.ModeDirect,
 		Reasons: []string{}, OutputPath: item.Path,
@@ -805,7 +827,17 @@ func channelView(item channel.Channel, runtime mediamtx.Channel) channelResponse
 	if runtime.Available && runtime.Online {
 		state.State = compatibility.StateReady
 	}
-	return channelRuntimeView(item, runtime, runtime, state)
+	view := channelRuntimeView(item, runtime, runtime, state)
+	s.attachRelayStatus(item, &view)
+	return view
+}
+
+func (s *server) attachRelayStatus(item channel.Channel, view *channelResponse) {
+	if s.relays == nil || (item.Input.Mode != channel.InputSRTPush && item.Input.Mode != channel.InputSRTPull) {
+		return
+	}
+	status := s.relays.Snapshot(item.ID)
+	view.Relay = &status
 }
 
 func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, compatibilityState compatibility.State) channelResponse {
@@ -875,6 +907,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "channel not found")
 	case errors.Is(err, channel.ErrInvalid):
 		writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), channel.ErrInvalid.Error()+": "))
+	case errors.Is(err, channel.ErrDeleting):
+		writeError(w, http.StatusConflict, channel.ErrDeleting.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}

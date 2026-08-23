@@ -18,18 +18,24 @@ type fakeGlobalManager struct {
 }
 
 type fakeChannelReconciler struct {
-	channels int
-	srt      int
+	channels      int
+	srt           int
+	err           error
+	validationErr error
 }
 
 func (f *fakeChannelReconciler) Reconcile(context.Context) error {
 	f.channels++
-	return nil
+	return f.err
 }
 
 func (f *fakeChannelReconciler) ReconcileSRTListeners(context.Context) error {
 	f.srt++
-	return nil
+	return f.err
+}
+
+func (f *fakeChannelReconciler) ValidatePortPolicy(context.Context, int, int, []int) error {
+	return f.validationErr
 }
 
 func (f *fakeGlobalManager) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) {
@@ -65,7 +71,7 @@ func TestServiceSkipsIdenticalGlobalPatch(t *testing.T) {
 		WebRTCIPsFromInterfaces: value.WebRTCIPsFromInterfaces, WebRTCAdditionalHosts: value.WebRTCAdditionalHosts,
 		WebRTCHandshakeTimeout: value.WebRTCHandshakeTimeout, WebRTCTrackGatherTimeout: value.WebRTCTrackGatherTimeout,
 	}}
-	service := NewService(store, media, nil)
+	service := NewService(store, media, nil, nil)
 	if err := service.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
@@ -81,7 +87,7 @@ func TestServiceUpdatesAndAppliesSettings(t *testing.T) {
 	}
 	defer store.Close()
 	media := &fakeGlobalManager{}
-	service := NewService(store, media, nil)
+	service := NewService(store, media, nil, nil)
 
 	value, err := service.Get(context.Background())
 	if err != nil {
@@ -101,6 +107,30 @@ func TestServiceUpdatesAndAppliesSettings(t *testing.T) {
 	}
 }
 
+func TestServiceRejectsChannelPortConflictBeforePersistingSettings(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	current, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels := &fakeChannelReconciler{validationErr: errors.New("port conflict")}
+	service := NewService(store, &fakeGlobalManager{config: globalConfig(current)}, channels, nil)
+	updated := current
+	updated.LogLevel = "debug"
+
+	if _, err := service.Update(context.Background(), updated); err == nil || err.Error() != "port conflict" {
+		t.Fatalf("Update() error = %v", err)
+	}
+	persisted, err := store.Get(context.Background())
+	if err != nil || persisted.LogLevel != current.LogLevel {
+		t.Fatalf("persisted settings = %#v, %v", persisted, err)
+	}
+}
+
 func TestServiceReconcilesEveryChannelWhenMediaBindingChanges(t *testing.T) {
 	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -113,7 +143,7 @@ func TestServiceReconcilesEveryChannelWhenMediaBindingChanges(t *testing.T) {
 	}
 	media := &fakeGlobalManager{config: globalConfig(value), restartReadsAfterPatch: 2}
 	channels := &fakeChannelReconciler{}
-	service := NewService(store, media, channels)
+	service := NewService(store, media, channels, nil)
 	value.MediaBindAddress = "127.0.0.1"
 
 	updated, err := service.Update(context.Background(), value)
@@ -125,6 +155,61 @@ func TestServiceReconcilesEveryChannelWhenMediaBindingChanges(t *testing.T) {
 	}
 	if channels.channels != 1 || channels.srt != 0 {
 		t.Fatalf("reconcile calls = channels %d, SRT %d", channels.channels, channels.srt)
+	}
+}
+
+func TestServiceReconcilesEveryChannelWhenSRTPortChanges(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	value, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &fakeGlobalManager{config: globalConfig(value)}
+	channels := &fakeChannelReconciler{}
+	service := NewService(store, media, channels, nil)
+	value.SRTAddress = ":8891"
+
+	if _, err := service.Update(context.Background(), value); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if channels.channels != 1 || channels.srt != 0 {
+		t.Fatalf("reconcile calls = channels %d, SRT %d", channels.channels, channels.srt)
+	}
+}
+
+func TestPendingSettingsRetryForcesCompleteChannelReconcile(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	value, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &fakeGlobalManager{config: globalConfig(value)}
+	channels := &fakeChannelReconciler{err: errors.New("channel apply failed")}
+	service := NewService(store, media, channels, nil)
+	value.SRTAddress = ":8891"
+
+	updated, err := service.Update(context.Background(), value)
+	if err == nil || updated.ApplyState != ApplyError {
+		t.Fatalf("Update() = %#v, %v", updated, err)
+	}
+	channels.err = nil
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatalf("ReconcilePending() error = %v", err)
+	}
+	if channels.channels != 2 || channels.srt != 0 {
+		t.Fatalf("reconcile calls = channels %d, SRT %d", channels.channels, channels.srt)
+	}
+	persisted, err := store.Get(context.Background())
+	if err != nil || persisted.ApplyState != ApplyApplied {
+		t.Fatalf("settings = %#v, %v", persisted, err)
 	}
 }
 

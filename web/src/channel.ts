@@ -31,7 +31,7 @@ export type Channel = {
   };
   maxReaders: number;
   useAbsoluteTimestamp: boolean;
-  applyState: "pending" | "applied" | "error";
+  applyState: "pending" | "applied" | "error" | "deleting";
   applyError?: string;
   whepPath: string;
   viewerPath: string;
@@ -45,6 +45,12 @@ export type Channel = {
   tracks: Track[];
   outputReady: boolean;
   outputTracks: Track[];
+  relay?: {
+    state: "running" | "starting" | "retrying" | "stopping" | "stopped";
+    restarts: number;
+    lastError?: string;
+    nextRetryAt?: string;
+  };
   compatibility: {
     state: "offline" | "probing" | "starting" | "ready" | "error";
     mode?: "direct" | "transcoded";
@@ -89,9 +95,12 @@ export function resolveBinding(
 }
 
 export function channelStateLabel(item: Channel) {
+  if (item.applyState === "deleting") return "Deletion pending";
   if (!item.enabled) return "Disabled";
   if (item.applyState === "error") return "Configuration error";
   if (item.compatibility.state === "error") return "Output error";
+  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
+  if (item.relay?.state === "starting") return "Listener restarting";
   if (item.outputReady) {
     return item.compatibility.mode === "transcoded"
       ? "Output ready - normalized"
@@ -109,6 +118,12 @@ export function channelStateLabel(item: Channel) {
     return "Listener ready - waiting for encoder";
   }
   return "Waiting for input";
+}
+
+export function channelHasFault(item: Channel) {
+  return item.applyState === "error" || item.compatibility.state === "error" ||
+    item.enabled && item.applyState !== "deleting" &&
+    (item.relay?.state === "retrying" || item.relay?.state === "stopped");
 }
 
 export function listenerPort(address: string) {

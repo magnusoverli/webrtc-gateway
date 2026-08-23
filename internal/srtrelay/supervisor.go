@@ -22,6 +22,7 @@ import (
 
 const (
 	startupGrace            = 150 * time.Millisecond
+	maximumRestartDelay     = 30 * time.Second
 	listenerCapacityWarning = 40
 	classificationLimit     = 64 * 1024
 	maximumUDPPacketSize    = 64 * 1024
@@ -30,10 +31,44 @@ const (
 	rtpMP2TPayloadType      = 33
 )
 
+const (
+	StateRunning  = "running"
+	StateStarting = "starting"
+	StateRetrying = "retrying"
+	StateStopping = "stopping"
+	StateStopped  = "stopped"
+)
+
+type Status struct {
+	State       string     `json:"state"`
+	Restarts    int        `json:"restarts"`
+	LastError   string     `json:"lastError,omitempty"`
+	NextRetryAt *time.Time `json:"nextRetryAt,omitempty"`
+}
+
 type listenerProcess struct {
-	plan   channel.SRTIngestPlan
-	cancel context.CancelFunc
-	done   chan struct{}
+	plan     channel.SRTIngestPlan
+	cancel   context.CancelFunc
+	done     chan struct{}
+	statusMu sync.RWMutex
+	status   Status
+}
+
+func (p *listenerProcess) setStatus(state string, restarts int, lastError string, nextRetryAt *time.Time) {
+	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
+	p.status = Status{State: state, Restarts: restarts, LastError: lastError, NextRetryAt: nextRetryAt}
+}
+
+func (p *listenerProcess) snapshot() Status {
+	p.statusMu.RLock()
+	defer p.statusMu.RUnlock()
+	result := p.status
+	if p.status.NextRetryAt != nil {
+		next := *p.status.NextRetryAt
+		result.NextRetryAt = &next
+	}
+	return result
 }
 
 type inputSession struct {
@@ -65,15 +100,29 @@ type Supervisor struct {
 	mu        sync.Mutex
 	listeners map[string]*listenerProcess
 	prepared  map[string]channel.SRTIngestPlan
+	snapshots sync.Map
 	closed    bool
+	startFn   func(context.Context, string) (inputSession, error)
+	relayFn   func(context.Context, channel.SRTIngestPlan, inputSession) (string, error)
 }
 
 func New(logger *slog.Logger, executable string) *Supervisor {
-	return &Supervisor{
+	supervisor := &Supervisor{
 		logger: logger, executable: executable,
 		listeners: make(map[string]*listenerProcess),
 		prepared:  make(map[string]channel.SRTIngestPlan),
 	}
+	supervisor.startFn = supervisor.startInput
+	supervisor.relayFn = supervisor.relayConnection
+	return supervisor
+}
+
+func (s *Supervisor) Snapshot(channelID string) Status {
+	value, ok := s.snapshots.Load(channelID)
+	if !ok {
+		return Status{State: StateStopped}
+	}
+	return value.(*listenerProcess).snapshot()
 }
 
 func (s *Supervisor) Prepare(ctx context.Context, config channel.SRTListener) (channel.SRTIngestPlan, error) {
@@ -154,7 +203,9 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 		return errors.New("SRT relay supervisor is closed")
 	}
 	if current := s.listeners[plan.Listener.ChannelID]; current != nil && current.plan == plan {
-		return nil
+		if current.snapshot().State != StateStopping {
+			return nil
+		}
 	}
 	if current := s.listeners[plan.Listener.ChannelID]; current != nil {
 		if err := s.stopLocked(ctx, plan.Listener.ChannelID, current); err != nil {
@@ -163,7 +214,7 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 	}
 
 	processCtx, cancel := context.WithCancel(context.Background())
-	session, err := s.startInput(processCtx, inputEndpoint)
+	session, err := s.startFn(processCtx, inputEndpoint)
 	if err != nil {
 		cancel()
 		return err
@@ -184,8 +235,12 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 	case <-timer.C:
 	}
 
-	process := &listenerProcess{plan: plan, cancel: cancel, done: make(chan struct{})}
+	process := &listenerProcess{
+		plan: plan, cancel: cancel, done: make(chan struct{}),
+		status: Status{State: StateRunning},
+	}
 	s.listeners[plan.Listener.ChannelID] = process
+	s.snapshots.Store(plan.Listener.ChannelID, process)
 	delete(s.prepared, plan.Listener.ChannelID)
 	go s.monitor(processCtx, process, inputEndpoint, session)
 	s.logger.Info("SRT channel ingest started", "channel", plan.Listener.ChannelID, "mode", plan.Listener.Mode, "port", plan.Listener.Port, "elementaryRTP", plan.RTPSDP != "")
@@ -211,29 +266,54 @@ func (s *Supervisor) Close() error {
 	s.closed = true
 	clear(s.prepared)
 	for channelID, process := range s.listeners {
+		process.setStatus(StateStopping, process.snapshot().Restarts, "", nil)
 		process.cancel()
 		<-process.done
 		delete(s.listeners, channelID)
+		s.snapshots.CompareAndDelete(channelID, process)
 	}
 	return nil
 }
 
 func (s *Supervisor) stopLocked(ctx context.Context, channelID string, process *listenerProcess) error {
-	delete(s.listeners, channelID)
+	status := process.snapshot()
+	process.setStatus(StateStopping, status.Restarts, status.LastError, nil)
 	process.cancel()
 	select {
 	case <-process.done:
+		if s.listeners[channelID] == process {
+			delete(s.listeners, channelID)
+		}
+		s.snapshots.CompareAndDelete(channelID, process)
 		s.logger.Info("SRT channel ingest stopped", "channel", channelID, "port", process.plan.Listener.Port)
 		return nil
 	case <-ctx.Done():
+		go s.reap(channelID, process)
 		return ctx.Err()
 	}
 }
 
+func (s *Supervisor) reap(channelID string, process *listenerProcess) {
+	<-process.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listeners[channelID] == process {
+		delete(s.listeners, channelID)
+	}
+	s.snapshots.CompareAndDelete(channelID, process)
+}
+
 func (s *Supervisor) monitor(ctx context.Context, process *listenerProcess, inputEndpoint string, session inputSession) {
-	defer close(process.done)
+	defer func() {
+		status := process.snapshot()
+		process.setStatus(StateStopped, status.Restarts, status.LastError, nil)
+		close(process.done)
+	}()
+	restarts := 0
+	failures := 0
+	sessionStarted := time.Now()
 	for {
-		detected, err := s.relayConnection(ctx, process.plan, session)
+		detected, err := s.relayFn(ctx, process.plan, session)
 		if ctx.Err() != nil {
 			return
 		}
@@ -244,12 +324,28 @@ func (s *Supervisor) monitor(ctx context.Context, process *listenerProcess, inpu
 		if err != nil {
 			attributes = append(attributes, "error", err)
 			s.logger.Warn("SRT channel connection ended", attributes...)
+			if time.Since(sessionStarted) >= 5*time.Second {
+				failures = 0
+			}
+			failures++
 		} else {
 			s.logger.Info("SRT sender disconnected", attributes...)
+			failures = 0
 		}
 
+		lastError := ""
+		if err != nil {
+			lastError = err.Error()
+		}
 		for {
-			timer := time.NewTimer(250 * time.Millisecond)
+			delay := restartDelay(max(0, failures-1))
+			nextRetry := time.Now().Add(delay)
+			state := StateStarting
+			if failures > 0 {
+				state = StateRetrying
+			}
+			process.setStatus(state, restarts, lastError, &nextRetry)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -257,13 +353,27 @@ func (s *Supervisor) monitor(ctx context.Context, process *listenerProcess, inpu
 			case <-timer.C:
 			}
 			var startErr error
-			session, startErr = s.startInput(ctx, inputEndpoint)
+			session, startErr = s.startFn(ctx, inputEndpoint)
 			if startErr == nil {
+				restarts++
+				sessionStarted = time.Now()
+				process.setStatus(StateRunning, restarts, "", nil)
 				break
 			}
+			failures++
+			lastError = startErr.Error()
+			process.setStatus(StateRetrying, restarts, lastError, nil)
 			s.logger.Warn("SRT channel ingest restart failed", "channel", process.plan.Listener.ChannelID, "port", process.plan.Listener.Port, "error", startErr)
 		}
 	}
+}
+
+func restartDelay(failures int) time.Duration {
+	delay := 250 * time.Millisecond
+	for range min(failures, 7) {
+		delay *= 2
+	}
+	return min(delay, maximumRestartDelay)
 }
 
 func (s *Supervisor) startInput(ctx context.Context, inputEndpoint string) (inputSession, error) {
