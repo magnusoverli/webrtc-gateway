@@ -1,0 +1,8 @@
+.git
+.gitignore
+PLAN.md
+README.md
+web/node_modules
+web/dist
+coverage
+*.db

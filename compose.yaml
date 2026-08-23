@@ -1,0 +1,40 @@
+name: webrtc-gateway
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.20.1
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./deploy/mediamtx.yml:/mediamtx.yml:ro
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-8g}
+    pids_limit: ${GATEWAY_PIDS_LIMIT:-2048}
+    depends_on:
+      - mediamtx
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:18080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    environment:
+      GATEWAY_LISTEN_ADDR: ":8080"
+      GATEWAY_HEALTH_LISTEN_ADDR: 127.0.0.1:18080
+      GATEWAY_MEDIAMTX_API_URL: http://127.0.0.1:9997
+      GATEWAY_MEDIAMTX_WHEP_URL: http://127.0.0.1:8889
+      GATEWAY_MEDIAMTX_RTSP_URL: rtsp://127.0.0.1:8554
+      GATEWAY_STATE_PATH: /var/lib/webrtc-gateway/gateway.db
+      GATEWAY_COMPATIBILITY_ENCODER_THREADS: ${GATEWAY_COMPATIBILITY_ENCODER_THREADS:-}
+      GATEWAY_COMPATIBILITY_CAPACITY: ${GATEWAY_COMPATIBILITY_CAPACITY:-}
+    volumes:
+      - gateway-state:/var/lib/webrtc-gateway
+
+volumes:
+  gateway-state:

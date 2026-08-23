@@ -1,0 +1,66 @@
+###############################################
+# Core routing and reliability
+
+logLevel: info
+logDestinations: [stdout]
+logStructured: true
+
+readTimeout: 5s
+writeTimeout: 5s
+writeQueueSize: 512
+udpMaxPayloadSize: 1452
+udpReadBufferSize: 4194304
+
+###############################################
+# Private control and monitoring services
+
+api: true
+apiAddress: 127.0.0.1:9997
+apiAllowOrigins: []
+
+metrics: true
+metricsAddress: 127.0.0.1:9998
+metricsAllowOrigins: []
+
+pprof: false
+playback: false
+
+###############################################
+# Internal protocol used only by compatibility workers
+
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:8554
+
+rtmp: false
+hls: false
+moq: false
+
+###############################################
+# WebRTC output
+
+webrtc: true
+webrtcAddress: 127.0.0.1:8889
+webrtcAllowOrigins: []
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: true
+webrtcAdditionalHosts: []
+
+###############################################
+# SRT input
+
+srt: true
+srtAddress: :8890
+
+###############################################
+# Paths are managed and restored by Gateway through the Control API.
+
+pathDefaults:
+  source: publisher
+  sourceOnDemand: false
+  maxReaders: 16
+  overridePublisher: true
+  record: false
+
+paths: {}

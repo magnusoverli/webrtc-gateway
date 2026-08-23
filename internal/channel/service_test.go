@@ -1,0 +1,307 @@
+package channel
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"path/filepath"
+	"testing"
+
+	"webrtc-gateway/internal/mediamtx"
+)
+
+type fakePathManager struct {
+	replacedName   string
+	replacedConfig mediamtx.PathConfig
+	replacements   int
+	deletedName    string
+	err            error
+}
+
+type fakeRTPPolicy struct {
+	minimum    int
+	maximum    int
+	srtAddress string
+	reserved   []int
+	mediaBind  string
+}
+
+func (f fakeRTPPolicy) ChannelPortPolicy(context.Context) (int, int, string, []int, error) {
+	return f.minimum, f.maximum, f.srtAddress, f.reserved, nil
+}
+
+func (f fakeRTPPolicy) MediaBindAddress(context.Context) (string, error) {
+	if f.mediaBind == "" {
+		return "custom", nil
+	}
+	return f.mediaBind, nil
+}
+
+type fakeSRTListenerManager struct {
+	prepared SRTListener
+	ensured  SRTListener
+	stopped  string
+	err      error
+}
+
+func (f *fakeSRTListenerManager) Prepare(_ context.Context, listener SRTListener) (SRTIngestPlan, error) {
+	f.prepared = listener
+	if listener.SDP != "" {
+		return SRTIngestPlan{
+			Listener: listener, Source: "udp+rtp://127.0.0.1:30000?source=127.0.0.1", RTPSDP: listener.SDP,
+		}, f.err
+	}
+	return SRTIngestPlan{
+		Listener: listener, Source: "publisher", PublishPassphrase: listener.Passphrase,
+	}, f.err
+}
+
+func TestServiceConfiguresElementaryRTPOverSRTSource(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	media := &fakePathManager{}
+	relay := &fakeSRTListenerManager{}
+	service := NewService(store, media, fakeRTPPolicy{
+		minimum: 22000, maximum: 22999, srtAddress: "192.0.2.20:8890", mediaBind: "192.0.2.20",
+	}, relay)
+	sdp := "v=0\nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000"
+	item, err := service.Create(context.Background(), Draft{
+		Name: "Elementary RTP tunnel", Enabled: true,
+		Input: Input{Mode: InputSRTPush, SRT: &SRTInput{Port: 10000, SDP: sdp}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if relay.ensured.ChannelID != item.ID || relay.ensured.SDP != sdp {
+		t.Fatalf("relay plan = %#v", relay.ensured)
+	}
+	if media.replacedConfig.Source != "udp+rtp://127.0.0.1:30000?source=127.0.0.1" || media.replacedConfig.RTPSDP != sdp || media.replacedConfig.SRTPublishPassphrase != "" {
+		t.Fatalf("MediaMTX path = %#v", media.replacedConfig)
+	}
+}
+
+func (f *fakeSRTListenerManager) Ensure(_ context.Context, plan SRTIngestPlan) error {
+	f.ensured = plan.Listener
+	return f.err
+}
+
+func (f *fakeSRTListenerManager) Stop(_ context.Context, channelID string) error {
+	f.stopped = channelID
+	return f.err
+}
+
+func (f *fakePathManager) ReplacePath(_ context.Context, name string, config mediamtx.PathConfig) error {
+	f.replacedName = name
+	f.replacedConfig = config
+	f.replacements++
+	return f.err
+}
+
+func TestServiceUpdatesAutomaticPreviewWithoutReapplyingMedia(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	media := &fakePathManager{}
+	service := NewService(store, media, nil, nil)
+	draft := Draft{
+		Name: "Preview preference", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+	}
+	item, err := service.Create(context.Background(), draft)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if media.replacements != 1 {
+		t.Fatalf("initial replacements = %d", media.replacements)
+	}
+	draft.AutomaticPreview = true
+	updated, err := service.Update(context.Background(), item.ID, draft)
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if !updated.AutomaticPreview || media.replacements != 1 {
+		t.Fatalf("preview update = %#v, replacements %d", updated, media.replacements)
+	}
+}
+
+func (f *fakePathManager) DeletePath(_ context.Context, name string) error {
+	f.deletedName = name
+	return f.err
+}
+
+func TestServiceCreatesAndAppliesSRTPull(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	media := &fakePathManager{}
+	service := NewService(store, media, nil, nil)
+
+	item, err := service.Create(context.Background(), Draft{
+		Name:    "Remote SRT",
+		Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{
+			Host: "source.local", Port: 9000, StreamID: "camera one", Passphrase: "test+secret", LatencyMS: 200,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if item.ApplyState != ApplyApplied || media.replacedName != item.Path {
+		t.Fatalf("channel was not applied: %#v, path %q", item, media.replacedName)
+	}
+	source, err := url.Parse(media.replacedConfig.Source)
+	if err != nil {
+		t.Fatalf("parse source URL: %v", err)
+	}
+	if source.Query().Get("passphrase") != "test+secret" || source.Query().Get("streamid") != "camera one" || source.Query().Get("latency") != "200" {
+		t.Fatalf("unexpected SRT source query: %q", source.RawQuery)
+	}
+}
+
+func TestServicePersistsApplyFailureForRetry(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	media := &fakePathManager{err: errors.New("offline")}
+	service := NewService(store, media, nil, nil)
+
+	item, err := service.Create(context.Background(), Draft{
+		Name: "SRT push", Enabled: true,
+		Input: Input{Mode: InputSRTPush, SRT: &SRTInput{Port: 10000}},
+	})
+	if err == nil || item.ApplyState != ApplyError {
+		t.Fatalf("Create() = %#v, %v; want apply error", item, err)
+	}
+	persisted, getErr := store.Get(context.Background(), item.ID)
+	if getErr != nil || persisted.ApplyState != ApplyError || persisted.ApplyError == "" {
+		t.Fatalf("persisted apply state = %#v, %v", persisted, getErr)
+	}
+
+	media.err = nil
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatalf("ReconcilePending() error = %v", err)
+	}
+	persisted, _ = store.Get(context.Background(), item.ID)
+	if persisted.ApplyState != ApplyApplied {
+		t.Fatalf("ApplyState = %q, want applied", persisted.ApplyState)
+	}
+}
+
+func TestServiceEnforcesRTPPortPolicy(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	service := NewService(store, &fakePathManager{}, fakeRTPPolicy{minimum: 22000, maximum: 22010}, nil)
+
+	draft := Draft{
+		Name: "RTP one", Enabled: true,
+		Input: Input{Mode: InputRTPUnicast, RTP: &RTPInput{
+			Address: "0.0.0.0", Port: 21999, SDP: "v=0\nm=video 21999 RTP/AVP 96",
+		}},
+	}
+	if _, err := service.Create(context.Background(), draft); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("out-of-range Create() error = %v", err)
+	}
+
+	draft.Input.RTP.Port = 22000
+	draft.Input.RTP.SDP = "v=0\nm=video 22000 RTP/AVP 96"
+	if _, err := service.Create(context.Background(), draft); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	draft.Name = "RTP two"
+	if _, err := service.Create(context.Background(), draft); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate-port Create() error = %v", err)
+	}
+}
+
+func TestServiceStartsPerChannelSRTPushListener(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	relay := &fakeSRTListenerManager{}
+	service := NewService(store, &fakePathManager{}, fakeRTPPolicy{
+		minimum: 22000, maximum: 22999, srtAddress: "192.0.2.20:8890", reserved: []int{8890, 8189}, mediaBind: "192.0.2.20",
+	}, relay)
+
+	item, err := service.Create(context.Background(), Draft{
+		Name: "Port-only sender", Enabled: true,
+		Input: Input{Mode: InputSRTPush, SRT: &SRTInput{Port: 10000, Passphrase: "0123456789"}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if relay.ensured.ChannelID != item.ID || relay.ensured.Port != 10000 || relay.ensured.BindAddress != "192.0.2.20" || relay.ensured.LatencyMS != DefaultSRTLatencyMS || relay.ensured.DestinationAddress != "192.0.2.20:8890" {
+		t.Fatalf("relay listener = %#v", relay.ensured)
+	}
+	if relay.ensured.Passphrase != "0123456789" {
+		t.Fatal("relay passphrase was not preserved")
+	}
+}
+
+func TestServiceAppliesGlobalBindingToRTPUnicast(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	media := &fakePathManager{}
+	service := NewService(store, media, fakeRTPPolicy{
+		minimum: 22000, maximum: 22999, mediaBind: "192.0.2.30",
+	}, nil)
+	_, err = service.Create(context.Background(), Draft{
+		Name: "RTP camera", Enabled: true,
+		Input: Input{Mode: InputRTPUnicast, RTP: &RTPInput{
+			Address: "0.0.0.0", Port: 22000, SDP: "v=0\nm=video 22000 RTP/AVP 96",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	source, err := url.Parse(media.replacedConfig.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Hostname() != "192.0.2.30" || source.Port() != "22000" {
+		t.Fatalf("RTP source = %q", media.replacedConfig.Source)
+	}
+}
+
+func TestServiceRejectsConflictingSRTPushPorts(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v", err)
+	}
+	defer store.Close()
+	service := NewService(store, &fakePathManager{}, fakeRTPPolicy{
+		minimum: 22000, maximum: 22999, srtAddress: ":8890", reserved: []int{8890, 8189},
+	}, &fakeSRTListenerManager{})
+	draft := Draft{Name: "SRT one", Enabled: true, Input: Input{Mode: InputSRTPush, SRT: &SRTInput{Port: 22000}}}
+	if _, err := service.Create(context.Background(), draft); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("RTP-range Create() error = %v", err)
+	}
+	draft.Input.SRT.Port = 8890
+	if _, err := service.Create(context.Background(), draft); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("reserved-port Create() error = %v", err)
+	}
+	draft.Input.SRT.Port = 10000
+	if _, err := service.Create(context.Background(), draft); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	draft.Name = "SRT two"
+	if _, err := service.Create(context.Background(), draft); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate-port Create() error = %v", err)
+	}
+}
