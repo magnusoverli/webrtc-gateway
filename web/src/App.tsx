@@ -639,7 +639,6 @@ export function App() {
                   ><span /></button>
                 </div>
                 <div className="preview-stage">
-                  <div className="scanline" />
                   <video ref={preview.videoRef} autoPlay playsInline muted controls />
                   {!selected.automaticPreview && <div className="preview-message overlay-message">
                     <span className="preview-icon">OFF</span>

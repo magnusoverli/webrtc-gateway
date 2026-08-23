@@ -66,7 +66,6 @@ export function StandalonePlayer({ channelID, embed }: { channelID: string; embe
       )}
       <section className="standalone-stage" aria-label={channel ? `${channel.name} player` : "Channel player"}>
         <video ref={player.videoRef} autoPlay playsInline muted controls />
-        <div className="scanline" />
         {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Audio is playing. This channel does not currently include a video track." />}
         {!channel && <PlayerMessage code={loadError ? "ERR" : "..."} title={loadError || "Loading channel"} detail={loadError ? "The player will keep retrying." : "Reading live output status."} error={Boolean(loadError)} />}
         {channel && loadError && <PlayerMessage code="ERR" title="Status unavailable" detail={`${loadError}. The player will keep retrying.`} error />}

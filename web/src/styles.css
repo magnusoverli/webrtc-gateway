@@ -709,15 +709,6 @@ h2 {
   background-size: 32px 32px;
 }
 
-.scanline {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(transparent 50%, rgba(0, 0, 0, 0.08) 50%);
-  background-size: 100% 4px;
-  pointer-events: none;
-  z-index: 2;
-}
-
 .preview-stage video {
   position: absolute;
   inset: 0;
