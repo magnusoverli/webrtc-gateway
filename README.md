@@ -39,7 +39,7 @@ http://HOST_IP:8080/view/CHANNEL_ID
 http://HOST_IP:8080/embed/CHANNEL_ID
 ```
 
-Viewer, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Automatic dashboard preview is enabled by default and is stored per channel; disabling it is an application preference change and does not restart media listeners. Only the selected dashboard channel creates a preview reader. Standalone player routes always attempt playback when output is ready.
+Viewer, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Standalone player routes always attempt playback when output is ready.
 
 SRT passphrases remain masked in normal channel and status responses. The selected channel can explicitly retrieve and copy its current passphrase through a non-cacheable API request. The deployment is intended for a trusted internal LAN and does not add authentication to management, player, passphrase, or restart endpoints.
 

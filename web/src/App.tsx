@@ -121,7 +121,7 @@ const emptyForm = (settings?: GlobalSettings, srtPort = 10000): ChannelForm => (
   clearPassphrase: false,
   latencyMs: "60",
   maxReaders: String(settings?.defaultMaxReaders ?? 16),
-  useAbsoluteTimestamp: false,
+  useAbsoluteTimestamp: true,
 });
 
 const formatBytes = (value: number) => {

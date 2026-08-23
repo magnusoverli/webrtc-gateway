@@ -60,6 +60,7 @@ pathDefaults:
   source: publisher
   sourceOnDemand: false
   maxReaders: 16
+  useAbsoluteTimestamp: true
   overridePublisher: true
   record: false
 

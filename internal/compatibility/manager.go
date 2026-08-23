@@ -96,13 +96,14 @@ type Manager struct {
 }
 
 type entry struct {
-	fingerprint string
-	classified  bool
-	decision    decision
-	state       State
-	worker      *worker
-	retryAt     time.Time
-	compatLimit int
+	fingerprint             string
+	classified              bool
+	decision                decision
+	state                   State
+	worker                  *worker
+	retryAt                 time.Time
+	compatLimit             int
+	compatAbsoluteTimestamp bool
 }
 
 type worker struct {
@@ -359,11 +360,11 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	compatPath := CompatibilityPath(item.ID)
 	m.mu.RLock()
 	current := m.entries[item.ID]
-	refreshPath := current == nil || current.compatLimit != item.MaxReaders
+	refreshPath := current == nil || current.compatLimit != item.MaxReaders || current.compatAbsoluteTimestamp != item.UseAbsoluteTimestamp
 	m.mu.RUnlock()
 	if output.Name == "" || refreshPath {
 		if err := m.media.ReplacePath(ctx, compatPath, mediamtx.PathConfig{
-			Source: "publisher", MaxReaders: item.MaxReaders,
+			Source: "publisher", MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
 		}); err != nil {
 			m.setWorkerError(item.ID, compatPath, result, fmt.Errorf("create compatibility path: %w", err))
 			return
@@ -371,6 +372,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		m.mu.Lock()
 		if current := m.entries[item.ID]; current != nil {
 			current.compatLimit = item.MaxReaders
+			current.compatAbsoluteTimestamp = item.UseAbsoluteTimestamp
 		}
 		m.mu.Unlock()
 	}

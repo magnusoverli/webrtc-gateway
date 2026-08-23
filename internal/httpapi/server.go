@@ -119,7 +119,7 @@ type channelRequest struct {
 	AutomaticPreview     *bool        `json:"automaticPreview,omitempty"`
 	Input                inputRequest `json:"input"`
 	MaxReaders           int          `json:"maxReaders"`
-	UseAbsoluteTimestamp bool         `json:"useAbsoluteTimestamp"`
+	UseAbsoluteTimestamp *bool        `json:"useAbsoluteTimestamp,omitempty"`
 }
 
 type inputRequest struct {
@@ -713,13 +713,20 @@ func (r channelRequest) toDraft(current *channel.Channel) channel.Draft {
 	if r.AutomaticPreview != nil {
 		automaticPreview = *r.AutomaticPreview
 	}
+	useAbsoluteTimestamp := true
+	if current != nil {
+		useAbsoluteTimestamp = current.UseAbsoluteTimestamp
+	}
+	if r.UseAbsoluteTimestamp != nil {
+		useAbsoluteTimestamp = *r.UseAbsoluteTimestamp
+	}
 	return channel.Draft{
 		Name:                 r.Name,
 		Enabled:              r.Enabled,
 		AutomaticPreview:     automaticPreview,
 		Input:                input,
 		MaxReaders:           r.MaxReaders,
-		UseAbsoluteTimestamp: r.UseAbsoluteTimestamp,
+		UseAbsoluteTimestamp: useAbsoluteTimestamp,
 	}
 }
 

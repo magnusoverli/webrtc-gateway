@@ -304,7 +304,7 @@ func TestChannelCRUDMasksAndPreservesPassphrase(t *testing.T) {
 	if strings.Contains(createRes.Body.String(), "0123456789") || !strings.Contains(createRes.Body.String(), `"hasPassphrase":true`) {
 		t.Fatalf("create response leaked or omitted secret state: %s", createRes.Body.String())
 	}
-	if !strings.Contains(createRes.Body.String(), `"automaticPreview":true`) || !strings.Contains(createRes.Body.String(), `"embedPath":"/embed/`) {
+	if !strings.Contains(createRes.Body.String(), `"automaticPreview":true`) || !strings.Contains(createRes.Body.String(), `"useAbsoluteTimestamp":true`) || !strings.Contains(createRes.Body.String(), `"embedPath":"/embed/`) {
 		t.Fatalf("create response omitted operator defaults: %s", createRes.Body.String())
 	}
 	if !strings.Contains(createRes.Body.String(), `"sdp":"v=0\\nm=video 0 RTP/AVP 96`) {
@@ -331,6 +331,9 @@ func TestChannelCRUDMasksAndPreservesPassphrase(t *testing.T) {
 	if !updated.AutomaticPreview {
 		t.Fatal("automatic preview was not preserved by an older update request")
 	}
+	if !updated.UseAbsoluteTimestamp {
+		t.Fatal("timestamp preservation was not preserved by an older update request")
+	}
 	passphraseReq := httptest.NewRequest(http.MethodGet, "/api/v1/channels/"+id+"/srt-passphrase", nil)
 	passphraseRes := httptest.NewRecorder()
 	handler.ServeHTTP(passphraseRes, passphraseReq)
@@ -346,6 +349,14 @@ func TestChannelCRUDMasksAndPreservesPassphrase(t *testing.T) {
 	handler.ServeHTTP(deleteRes, deleteReq)
 	if deleteRes.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d, body = %s", deleteRes.Code, deleteRes.Body.String())
+	}
+}
+
+func TestChannelRequestAllowsTimestampPreservationOptOut(t *testing.T) {
+	disabled := false
+	draft := (channelRequest{UseAbsoluteTimestamp: &disabled}).toDraft(nil)
+	if draft.UseAbsoluteTimestamp {
+		t.Fatal("explicit timestamp preservation opt-out was ignored")
 	}
 }
 
