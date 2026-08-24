@@ -73,6 +73,9 @@ func (s *Service) List(ctx context.Context) ([]Channel, error) {
 }
 
 func (s *Service) Get(ctx context.Context, id string) (Channel, error) {
+	if number, err := strconv.Atoi(id); err == nil && number > 0 {
+		return s.store.GetByNumber(ctx, number)
+	}
 	return s.store.Get(ctx, id)
 }
 
@@ -94,6 +97,17 @@ func (s *Service) Create(ctx context.Context, draft Draft) (Channel, error) {
 	if err != nil {
 		return Channel{}, err
 	}
+	items, err := s.store.List(ctx)
+	if err != nil {
+		return Channel{}, err
+	}
+	usedNumbers := make(map[int]bool, len(items))
+	for _, existing := range items {
+		if existing.Number > 0 {
+			usedNumbers[existing.Number] = true
+		}
+	}
+	item.Number = firstAvailableNumber(usedNumbers)
 	if err := s.store.Create(ctx, item); err != nil {
 		return Channel{}, err
 	}
@@ -107,7 +121,7 @@ func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, 
 	}
 	defer release()
 
-	current, err := s.store.Get(ctx, id)
+	current, err := s.Get(ctx, id)
 	if err != nil {
 		return Channel{}, err
 	}
@@ -118,7 +132,7 @@ func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, 
 	if err != nil {
 		return Channel{}, err
 	}
-	if err := s.validateUDPPort(ctx, draft, id); err != nil {
+	if err := s.validateUDPPort(ctx, draft, current.ID); err != nil {
 		return Channel{}, err
 	}
 	if sameAppliedConfiguration(current, draft) {
@@ -239,7 +253,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	}
 	defer release()
 
-	item, err := s.store.Get(ctx, id)
+	item, err := s.Get(ctx, id)
 	if err != nil {
 		return err
 	}

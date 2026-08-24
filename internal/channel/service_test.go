@@ -96,6 +96,50 @@ func TestServiceConfiguresElementaryRTPOverSRTSource(t *testing.T) {
 	}
 }
 
+func TestServiceAssignsLowestAvailableChannelNumber(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := NewService(store, &fakePathManager{}, nil, nil, nil)
+	create := func(name string, port int) Channel {
+		item, err := service.Create(context.Background(), Draft{
+			Name: name, Enabled: true,
+			Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: port}},
+		})
+		if err != nil {
+			t.Fatalf("Create(%q) error = %v", name, err)
+		}
+		return item
+	}
+
+	first := create("First", 9001)
+	second := create("Second", 9002)
+	third := create("Third", 9003)
+	if first.Number != 1 || second.Number != 2 || third.Number != 3 {
+		t.Fatalf("initial channel numbers = %d, %d, %d", first.Number, second.Number, third.Number)
+	}
+	updated, err := service.Update(context.Background(), "2", Draft{
+		Name: "Second renamed", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9002}},
+	})
+	if err != nil || updated.ID != second.ID || updated.Number != 2 {
+		t.Fatalf("Update(2) = %#v, %v", updated, err)
+	}
+	if err := service.Delete(context.Background(), "2"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	replacement := create("Replacement", 9004)
+	if replacement.Number != 2 {
+		t.Fatalf("replacement channel number = %d, want 2", replacement.Number)
+	}
+	resolved, err := service.Get(context.Background(), "2")
+	if err != nil || resolved.ID != replacement.ID {
+		t.Fatalf("Get(2) = %#v, %v", resolved, err)
+	}
+}
+
 func TestFullReconcileRefreshesSRTDestinationDependentPath(t *testing.T) {
 	for name, sdp := range map[string]string{
 		"raw pull":   "",

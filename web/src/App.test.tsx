@@ -3,7 +3,7 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, ResourceFooter } from "./App";
+import { App, ConnectionRow, ResourceFooter } from "./App";
 import { railCollapsedKey } from "./uiPreferences";
 
 describe("dashboard rail", () => {
@@ -56,5 +56,18 @@ describe("dashboard rail", () => {
     render(<ResourceFooter disconnected />);
     expect(screen.getAllByText("UNAVAILABLE")).toHaveLength(3);
     expect(screen.queryByText("LOADING")).toBeNull();
+  });
+
+  it("makes the numbered channel embed URL copyable and openable", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const value = "http://192.168.15.5:8080/embed/1";
+    render(<ConnectionRow label="Channel embed URL" value={value} openURL />);
+
+    expect((screen.getByRole("textbox", { name: "Channel embed URL value" }) as HTMLInputElement).value).toBe(value);
+    expect(screen.getByRole("link", { name: "Open Channel embed URL" }).getAttribute("href")).toBe(value);
+    await user.click(screen.getByRole("button", { name: "Copy Channel embed URL" }));
+    expect(writeText).toHaveBeenCalledWith(value);
   });
 });

@@ -24,6 +24,7 @@ export type ChannelRateSample = {
 
 export type Channel = {
   id: string;
+  number: number;
   name: string;
   path: string;
   enabled: boolean;

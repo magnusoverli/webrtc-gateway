@@ -58,6 +58,7 @@ type Input struct {
 
 type Channel struct {
 	ID                   string     `json:"id"`
+	Number               int        `json:"number"`
 	Name                 string     `json:"name"`
 	Path                 string     `json:"path"`
 	Enabled              bool       `json:"enabled"`

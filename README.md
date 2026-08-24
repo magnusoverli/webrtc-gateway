@@ -57,16 +57,16 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 1. Create a channel and select its input mode. **SRT push** is the simplest option for encoders that accept a destination IP and port.
 2. Select the channel. Its fixed workspace shows encoder connection details, listener state, stable output links, and a muted WebRTC preview without requiring a separate configuration view.
 3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the selected input show `-`.
-4. Send the stable multiview URL to LAN users or place the channel's UUID-based iframe snippet in another LAN application. Embed URLs do not change when a channel is renamed or switches between direct and compatibility output.
+4. Send the stable multiview URL to LAN users or copy the selected channel's embed URL or iframe snippet into another LAN application. Embed URLs use the channel number and do not change when that channel is renamed or switches between direct and compatibility output.
 
 The multiview and channel embed routes are:
 
 ```text
 http://HOST_IP:8080/view
-http://HOST_IP:8080/embed/CHANNEL_ID
+http://HOST_IP:8080/embed/CHANNEL_NUMBER
 ```
 
-The multiview opens every ready channel simultaneously in a live grid while retaining visible offline, disabled, and error tiles. It refreshes the channel set automatically. Legacy `/view/CHANNEL_ID` links open the same multiview. The embed route remains channel-specific and renders only the muted video surface: no header, status overlay, native controls, border, or opaque page background.
+The multiview opens every ready channel simultaneously in a live grid while retaining visible offline, disabled, and error tiles. It refreshes the channel set automatically. Legacy `/view/CHANNEL_ID` links open the same multiview. Each channel receives the lowest available positive number, producing compact URLs such as `http://192.168.15.5:8080/embed/1`. Existing channels keep their number, but a number becomes available for reuse after its channel is deleted. The embed route renders only the muted video surface: no header, status overlay, native controls, border, or opaque page background. Previously issued UUID embed URLs remain valid aliases for their existing channels.
 
 Multiview, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Each ready channel in multiview creates an independent WebRTC reader. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Embed routes always attempt playback when output is ready.
 

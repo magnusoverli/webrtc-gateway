@@ -162,6 +162,7 @@ type srtInputRequest struct {
 
 type channelResponse struct {
 	ID                   string                `json:"id"`
+	Number               int                   `json:"number"`
 	Name                 string                `json:"name"`
 	Path                 string                `json:"path"`
 	Enabled              bool                  `json:"enabled"`
@@ -692,7 +693,7 @@ func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	item, err := s.channels.Update(r.Context(), id, request.toDraft(&current))
+	item, err := s.channels.Update(r.Context(), current.ID, request.toDraft(&current))
 	if err != nil && item.ID == "" {
 		writeServiceError(w, err)
 		return
@@ -943,6 +944,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 	}
 	view := channelResponse{
 		ID:                   item.ID,
+		Number:               item.Number,
 		Name:                 item.Name,
 		Path:                 item.Path,
 		Enabled:              item.Enabled,
@@ -956,7 +958,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		UpdatedAt:            item.UpdatedAt,
 		WHEPPath:             "/api/v1/channels/" + url.PathEscape(item.ID) + "/whep",
 		ViewerPath:           "/view",
-		EmbedPath:            "/embed/" + url.PathEscape(item.ID),
+		EmbedPath:            "/embed/" + strconv.Itoa(item.Number),
 		Available:            runtime.Available,
 		AvailableTime:        runtime.AvailableTime,
 		Online:               runtime.Online,

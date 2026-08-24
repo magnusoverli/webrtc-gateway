@@ -48,7 +48,7 @@ describe("ChannelViewer", () => {
   });
 
   it("renders every channel as a simultaneous player tile", async () => {
-    const channels = [fixtureChannel("studio-a", "Studio A", true), fixtureChannel("studio-b", "Studio B", false)];
+    const channels = [fixtureChannel("studio-a", 1, "Studio A", true), fixtureChannel("studio-b", 2, "Studio B", false)];
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ channels }) }));
 
     render(<ChannelViewer />);
@@ -64,8 +64,8 @@ describe("ChannelViewer", () => {
   });
 
   it("preserves keyed sessions through reorder and cleans up removed or unready channels", () => {
-    const north = fixtureChannel("north", "North", true);
-    const south = fixtureChannel("south", "South", true);
+    const north = fixtureChannel("north", 1, "North", true);
+    const south = fixtureChannel("south", 2, "South", true);
     const view = render(<MultiviewGrid channels={[north, south]} loaded />);
     expect(playerHarness.started).toEqual([north.whepPath, south.whepPath]);
 
@@ -81,10 +81,11 @@ describe("ChannelViewer", () => {
   });
 
   it("renders embeds as video only without native controls", async () => {
-    const channel = fixtureChannel("studio-a", "Studio A", true);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => channel }));
+    const channel = fixtureChannel("studio-a", 7, "Studio A", true);
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => channel });
+    vi.stubGlobal("fetch", fetch);
 
-    render(<StandalonePlayer channelID="studio-a" />);
+    render(<StandalonePlayer channelID="7" />);
 
     const video = await screen.findByLabelText("Studio A embedded video");
     expect(video.tagName).toBe("VIDEO");
@@ -93,6 +94,7 @@ describe("ChannelViewer", () => {
     expect(video.parentElement?.childElementCount).toBe(1);
     expect(screen.queryByRole("status")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/channels/7", expect.objectContaining({ cache: "no-store" }));
   });
 
   it("initializes document mode from the routed pathname", () => {
@@ -103,9 +105,10 @@ describe("ChannelViewer", () => {
   });
 });
 
-function fixtureChannel(id: string, name: string, outputReady: boolean): Channel {
+function fixtureChannel(id: string, number: number, name: string, outputReady: boolean): Channel {
   return {
     id,
+    number,
     name,
     path: id,
     enabled: true,
@@ -116,7 +119,7 @@ function fixtureChannel(id: string, name: string, outputReady: boolean): Channel
     applyState: "applied",
     whepPath: `/api/v1/channels/${id}/whep`,
     viewerPath: "/view",
-    embedPath: `/embed/${id}`,
+    embedPath: `/embed/${number}`,
     available: outputReady,
     online: outputReady,
     inboundBytes: 0,

@@ -9,6 +9,7 @@ describe("standalone routes", () => {
   });
 
   it("keeps embeds channel-specific and rejects malformed routes", () => {
+    expect(resolveStandaloneRoute("/embed/7")).toEqual({ kind: "embed", channelID: "7" });
     expect(resolveStandaloneRoute("/embed/channel-id/")).toEqual({ kind: "embed", channelID: "channel-id" });
     expect(resolveStandaloneRoute("/embed")).toBeNull();
     expect(resolveStandaloneRoute("/view/channel/extra")).toBeNull();

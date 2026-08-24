@@ -16,6 +16,7 @@ var ErrNotFound = errors.New("channel not found")
 type Repository interface {
 	List(context.Context) ([]Channel, error)
 	Get(context.Context, string) (Channel, error)
+	GetByNumber(context.Context, int) (Channel, error)
 	Create(context.Context, Channel) error
 	Update(context.Context, Channel) error
 	Delete(context.Context, string) error
@@ -71,31 +72,19 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	if err := s.addAutomaticPreviewColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.addChannelNumberColumn(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *SQLiteStore) addAutomaticPreviewColumn(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(channels)`)
+	exists, err := s.channelColumnExists(ctx, "automatic_preview")
 	if err != nil {
-		return fmt.Errorf("inspect channel schema: %w", err)
+		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, notNull, primaryKey int
-		var name, kind string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&id, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
-			return fmt.Errorf("inspect channel column: %w", err)
-		}
-		if name == "automatic_preview" {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("inspect channel schema: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close channel schema inspection: %w", err)
+	if exists {
+		return nil
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN automatic_preview INTEGER NOT NULL DEFAULT 1`); err != nil {
 		return fmt.Errorf("add channel automatic preview setting: %w", err)
@@ -103,11 +92,89 @@ func (s *SQLiteStore) addAutomaticPreviewColumn(ctx context.Context) error {
 	return nil
 }
 
+func (s *SQLiteStore) addChannelNumberColumn(ctx context.Context) error {
+	exists, err := s.channelColumnExists(ctx, "channel_number")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN channel_number INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add channel number: %w", err)
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, `SELECT id, channel_number FROM channels ORDER BY created_at, id`)
+	if err != nil {
+		return fmt.Errorf("list channel numbers: %w", err)
+	}
+	type numberedChannel struct {
+		id     string
+		number int
+	}
+	items := make([]numberedChannel, 0)
+	used := make(map[int]bool)
+	for rows.Next() {
+		var item numberedChannel
+		if err := rows.Scan(&item.id, &item.number); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan channel number: %w", err)
+		}
+		if item.number > 0 {
+			used[item.number] = true
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list channel numbers: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close channel number rows: %w", err)
+	}
+	for _, item := range items {
+		if item.number > 0 {
+			continue
+		}
+		number := firstAvailableNumber(used)
+		if _, err := s.db.ExecContext(ctx, `UPDATE channels SET channel_number = ? WHERE id = ?`, number, item.id); err != nil {
+			return fmt.Errorf("backfill channel number: %w", err)
+		}
+		used[number] = true
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS channels_channel_number_unique ON channels(channel_number)`); err != nil {
+		return fmt.Errorf("index channel number: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) channelColumnExists(ctx context.Context, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(channels)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect channel schema: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, notNull, primaryKey int
+		var name, kind string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&id, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("inspect channel column: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect channel schema: %w", err)
+	}
+	return false, nil
+}
+
 func (s *SQLiteStore) List(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, path, enabled, automatic_preview, input_json, max_readers,
+		SELECT id, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
 		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
-		FROM channels ORDER BY name COLLATE NOCASE, id`)
+		FROM channels ORDER BY channel_number`)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}
@@ -129,7 +196,7 @@ func (s *SQLiteStore) List(ctx context.Context) ([]Channel, error) {
 
 func (s *SQLiteStore) Get(ctx context.Context, id string) (Channel, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, path, enabled, automatic_preview, input_json, max_readers,
+		SELECT id, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
 		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
 		FROM channels WHERE id = ?`, id)
 	item, err := scanChannel(row)
@@ -139,17 +206,32 @@ func (s *SQLiteStore) Get(ctx context.Context, id string) (Channel, error) {
 	return item, err
 }
 
+func (s *SQLiteStore) GetByNumber(ctx context.Context, number int) (Channel, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		FROM channels WHERE channel_number = ?`, number)
+	item, err := scanChannel(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Channel{}, ErrNotFound
+	}
+	return item, err
+}
+
 func (s *SQLiteStore) Create(ctx context.Context, item Channel) error {
+	if item.Number < 1 {
+		return fmt.Errorf("create channel: channel number must be positive")
+	}
 	input, err := json.Marshal(item.Input)
 	if err != nil {
 		return fmt.Errorf("encode channel input: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO channels (
-			id, name, path, enabled, automatic_preview, input_json, max_readers,
+			id, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
 			use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		item.ID, item.Name, item.Path, item.Enabled, item.AutomaticPreview, string(input), item.MaxReaders,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		item.ID, item.Number, item.Name, item.Path, item.Enabled, item.AutomaticPreview, string(input), item.MaxReaders,
 		item.UseAbsoluteTimestamp, item.ApplyState, item.ApplyError,
 		item.CreatedAt.Format(time.RFC3339Nano), item.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
@@ -208,7 +290,7 @@ func scanChannel(row scanner) (Channel, error) {
 	var createdAt string
 	var updatedAt string
 	if err := row.Scan(
-		&item.ID, &item.Name, &item.Path, &enabled, &automaticPreview, &inputJSON, &item.MaxReaders,
+		&item.ID, &item.Number, &item.Name, &item.Path, &enabled, &automaticPreview, &inputJSON, &item.MaxReaders,
 		&useAbsoluteTimestamp, &item.ApplyState, &item.ApplyError, &createdAt, &updatedAt,
 	); err != nil {
 		return Channel{}, err
@@ -229,6 +311,14 @@ func scanChannel(row scanner) (Channel, error) {
 		return Channel{}, fmt.Errorf("decode channel updated time: %w", err)
 	}
 	return item, nil
+}
+
+func firstAvailableNumber(used map[int]bool) int {
+	for number := 1; ; number++ {
+		if !used[number] {
+			return number
+		}
+	}
 }
 
 func requireChanged(result sql.Result) error {

@@ -293,6 +293,7 @@ export function App() {
   const viewerURL = selected ? absolutePath(outputOrigin, selected.viewerPath) : "";
   const pendingViewerURL = selected && pendingOutputOrigin ? absolutePath(pendingOutputOrigin, selected.viewerPath) : "";
   const embedURL = selected ? absolutePath(outputOrigin, selected.embedPath) : "";
+  const pendingEmbedURL = selected && pendingOutputOrigin ? absolutePath(pendingOutputOrigin, selected.embedPath) : "";
   const whepURL = selected ? absolutePath(outputOrigin, selected.whepPath) : "";
   const iframeCode = selected ? iframeEmbedCode(embedURL, selected.name) : "";
 
@@ -709,6 +710,8 @@ export function App() {
                 <div className="connection-rows">
                   <ConnectionRow label={managementBinding.state === "pending-restart" ? "Current viewer URL" : "Viewer URL"} value={viewerURL} openURL />
                   {pendingViewerURL && <ConnectionRow label="Viewer URL after restart" value={pendingViewerURL} secondary />}
+                  <ConnectionRow label={managementBinding.state === "pending-restart" ? "Current channel embed URL" : "Channel embed URL"} value={embedURL} openURL />
+                  {pendingEmbedURL && <ConnectionRow label="Channel embed URL after restart" value={pendingEmbedURL} secondary />}
                   <ConnectionRow label="Iframe embed code" value={iframeCode} />
                   <ConnectionRow label="WHEP API endpoint" value={whepURL} />
                 </div>
@@ -1510,7 +1513,7 @@ export function formatCompactBytes(value: number) {
   return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
 }
 
-function ConnectionRow({ label, value, secondary = false, openURL = false }: {
+export function ConnectionRow({ label, value, secondary = false, openURL = false }: {
   label: string;
   value: string;
   secondary?: boolean;
@@ -1531,7 +1534,7 @@ function ConnectionRow({ label, value, secondary = false, openURL = false }: {
           onFocus={(event) => event.currentTarget.select()}
         />
         <div className="connection-actions">
-          {openURL && value !== "-" && <a className="copy-action open-action" href={value} target="_blank" rel="noreferrer" aria-label={`Open ${label}`}>Open viewer</a>}
+          {openURL && value !== "-" && <a className="copy-action open-action" href={value} target="_blank" rel="noreferrer" aria-label={`Open ${label}`}>{label.toLowerCase().includes("embed") ? "Open embed" : "Open viewer"}</a>}
           <CopyButton label={label} value={value === "-" ? "" : value} input={inputRef} />
         </div>
       </div>
@@ -1763,6 +1766,7 @@ function connectionHelp(label: string) {
   if (label === "SRT mode") return "Caller means the encoder initiates the SRT connection to Gateway.";
   if (label.includes("stream-ID URL")) return "Alternative shared SRT endpoint for MPEG-TS senders that support MediaMTX stream IDs.";
   if (label.includes("Viewer URL")) return "Standalone multiview link that plays every ready channel simultaneously.";
+  if (label.toLowerCase().includes("embed url")) return "Channel-only, transparent video route using the channel's persistent number.";
   if (label === "Iframe embed code") return "Transparent, control-free video for placing this channel directly inside another page.";
   if (label === "WHEP API endpoint") return "Low-level WebRTC-HTTP egress endpoint used by compatible players.";
   return "";

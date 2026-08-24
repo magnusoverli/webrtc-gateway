@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +85,7 @@ func (f fakeChannels) List(context.Context) ([]channel.Channel, error) {
 
 func (f fakeChannels) Get(_ context.Context, id string) (channel.Channel, error) {
 	for _, item := range f.items {
-		if item.ID == id {
+		if item.ID == id || (item.Number > 0 && strconv.Itoa(item.Number) == id) {
 			return item, nil
 		}
 	}
@@ -250,7 +251,7 @@ func TestStatusRequiresRestartWhenBindingModeChangesAtSameAddress(t *testing.T) 
 
 func TestFocusedChannelEndpointIncludesRuntimeAndPlayerPaths(t *testing.T) {
 	channels := fakeChannels{items: []channel.Channel{{
-		ID: "channel-1", Name: "Demo", Path: "demo", Enabled: true, AutomaticPreview: true,
+		ID: "channel-1", Number: 7, Name: "Demo", Path: "demo", Enabled: true, AutomaticPreview: true,
 		Input:      channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000}},
 		ApplyState: channel.ApplyApplied,
 	}}}
@@ -260,9 +261,16 @@ func TestFocusedChannelEndpointIncludesRuntimeAndPlayerPaths(t *testing.T) {
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/channels/channel-1", nil))
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"outputReady":true`) ||
+		!strings.Contains(res.Body.String(), `"number":7`) ||
 		!strings.Contains(res.Body.String(), `"viewerPath":"/view"`) ||
+		!strings.Contains(res.Body.String(), `"embedPath":"/embed/7"`) ||
 		!strings.Contains(res.Body.String(), `"automaticPreview":true`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+	numeric := httptest.NewRecorder()
+	handler.ServeHTTP(numeric, httptest.NewRequest(http.MethodGet, "/api/v1/channels/7", nil))
+	if numeric.Code != http.StatusOK || !strings.Contains(numeric.Body.String(), `"id":"channel-1"`) {
+		t.Fatalf("numeric response = %d %s", numeric.Code, numeric.Body.String())
 	}
 }
 
@@ -534,7 +542,7 @@ func TestChannelCRUDMasksAndPreservesPassphrase(t *testing.T) {
 	if strings.Contains(createRes.Body.String(), "0123456789") || !strings.Contains(createRes.Body.String(), `"hasPassphrase":true`) {
 		t.Fatalf("create response leaked or omitted secret state: %s", createRes.Body.String())
 	}
-	if !strings.Contains(createRes.Body.String(), `"automaticPreview":true`) || !strings.Contains(createRes.Body.String(), `"useAbsoluteTimestamp":true`) || !strings.Contains(createRes.Body.String(), `"embedPath":"/embed/`) {
+	if !strings.Contains(createRes.Body.String(), `"automaticPreview":true`) || !strings.Contains(createRes.Body.String(), `"useAbsoluteTimestamp":true`) || !strings.Contains(createRes.Body.String(), `"embedPath":"/embed/1"`) {
 		t.Fatalf("create response omitted operator defaults: %s", createRes.Body.String())
 	}
 	if !strings.Contains(createRes.Body.String(), `"sdp":"v=0\\nm=video 0 RTP/AVP 96`) {

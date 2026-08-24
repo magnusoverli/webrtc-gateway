@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  absolutePath,
   channelStateLabel,
   channelHasFault,
   hasInputStream,
@@ -20,6 +21,7 @@ import {
 
 const baseChannel: Channel = {
   id: "channel-id",
+  number: 1,
   name: "Studio & Main",
   path: "studio-main",
   enabled: true,
@@ -30,7 +32,7 @@ const baseChannel: Channel = {
   applyState: "applied",
   whepPath: "/api/v1/channels/channel-id/whep",
   viewerPath: "/view",
-  embedPath: "/embed/channel-id",
+  embedPath: "/embed/1",
   available: false,
   online: false,
   inboundBytes: 0,
@@ -196,8 +198,12 @@ describe("channelStateLabel", () => {
 
 describe("iframeEmbedCode", () => {
   it("builds a safe, useful lazy-loading player snippet", () => {
-    expect(iframeEmbedCode("http://desk.local/embed/channel-id?a=1&b=2", 'Studio "A"')).toBe(
-      '<iframe src="http://desk.local/embed/channel-id?a=1&amp;b=2" allow="autoplay" loading="lazy" title="Studio &quot;A&quot;" style="display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; background: transparent;"></iframe>',
+    expect(iframeEmbedCode("http://desk.local/embed/7?a=1&b=2", 'Studio "A"')).toBe(
+      '<iframe src="http://desk.local/embed/7?a=1&amp;b=2" allow="autoplay" loading="lazy" title="Studio &quot;A&quot;" style="display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; background: transparent;"></iframe>',
     );
+  });
+
+  it("builds an absolute numbered embed URL", () => {
+    expect(absolutePath("http://192.168.15.5:8080", "/embed/7")).toBe("http://192.168.15.5:8080/embed/7");
   });
 });
