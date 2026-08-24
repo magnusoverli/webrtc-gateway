@@ -25,6 +25,20 @@ docker compose up --build
 
 Open `http://HOST_IP:8080`. The UI, management API, status endpoints, and WHEP signaling are all served on this port.
 
+### Offline Deployment
+
+Every push to `main` runs the `CI and offline image` GitHub Actions workflow. After its checks pass, the workflow uploads an artifact named `webrtc-gateway-offline-linux-amd64-COMMIT_SHA`. Download it from the workflow run's **Artifacts** section on a connected machine, extract it, and copy the complete directory to the offline server.
+
+The bundle contains the Gateway image, the pinned MediaMTX image, the Compose configuration, the exact source commit, checksums, and deployment instructions. On the offline Linux AMD64 server, run these commands from the extracted directory:
+
+```sh
+sha256sum --check SHA256SUMS
+docker load --input images-linux-amd64.tar.gz
+docker compose up -d --no-build --pull never
+```
+
+The `--no-build --pull never` options guarantee that deployment uses only the transferred images. Loading a newer bundle updates the local `webrtc-gateway:main` tag; running the same Compose command recreates the Gateway container while preserving its named state volume.
+
 ### Operator Workflow
 
 1. Create a channel and select its input mode. **SRT push** is the simplest option for encoders that accept a destination IP and port.

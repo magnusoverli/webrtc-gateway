@@ -1,0 +1,110 @@
+name: CI and offline image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GATEWAY_IMAGE: webrtc-gateway
+  MEDIAMTX_IMAGE: bluenviron/mediamtx:1.20.1
+  IMAGE_ARCHIVE: images-linux-amd64.tar.gz
+
+jobs:
+  build:
+    name: Test and build offline bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Test Go code
+        run: go test -race ./...
+
+      - name: Vet Go code
+        run: go vet ./...
+
+      - name: Install web dependencies
+        run: npm --prefix web ci
+
+      - name: Test web code
+        run: npm --prefix web test
+
+      - name: Check web types
+        run: npm --prefix web run lint
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ${{ env.GATEWAY_IMAGE }}:${{ github.sha }}
+            ${{ env.GATEWAY_IMAGE }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Pull MediaMTX image
+        run: docker pull --platform linux/amd64 "${MEDIAMTX_IMAGE}"
+
+      - name: Assemble offline bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p offline-bundle/deploy
+          docker save \
+            "${GATEWAY_IMAGE}:${GITHUB_SHA}" \
+            "${GATEWAY_IMAGE}:main" \
+            "${MEDIAMTX_IMAGE}" \
+            | gzip --best > "offline-bundle/${IMAGE_ARCHIVE}"
+          cp compose.yaml offline-bundle/compose.yaml
+          cp deploy/mediamtx.yml offline-bundle/deploy/mediamtx.yml
+          cp deploy/OFFLINE_DEPLOYMENT.md offline-bundle/README.md
+          git rev-parse HEAD > offline-bundle/GATEWAY_COMMIT
+
+      - name: Validate offline bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f offline-bundle/compose.yaml config --quiet
+          cd offline-bundle
+          sha256sum \
+            "${IMAGE_ARCHIVE}" \
+            compose.yaml \
+            deploy/mediamtx.yml \
+            README.md \
+            GATEWAY_COMMIT \
+            > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload offline bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-gateway-offline-linux-amd64-${{ github.sha }}
+          path: offline-bundle/
+          if-no-files-found: error
+          compression-level: 0

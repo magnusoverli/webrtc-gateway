@@ -9,6 +9,7 @@ services:
       - ./deploy/mediamtx.yml:/mediamtx.yml:ro
 
   gateway:
+    image: webrtc-gateway:${GATEWAY_IMAGE_TAG:-main}
     build:
       context: .
       dockerfile: Dockerfile
