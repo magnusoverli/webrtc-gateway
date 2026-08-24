@@ -29,7 +29,7 @@ const baseChannel: Channel = {
   useAbsoluteTimestamp: false,
   applyState: "applied",
   whepPath: "/api/v1/channels/channel-id/whep",
-  viewerPath: "/view/channel-id",
+  viewerPath: "/view",
   embedPath: "/embed/channel-id",
   available: false,
   online: false,
@@ -197,7 +197,7 @@ describe("channelStateLabel", () => {
 describe("iframeEmbedCode", () => {
   it("builds a safe, useful lazy-loading player snippet", () => {
     expect(iframeEmbedCode("http://desk.local/embed/channel-id?a=1&b=2", 'Studio "A"')).toBe(
-      '<iframe src="http://desk.local/embed/channel-id?a=1&amp;b=2" allow="autoplay; fullscreen" loading="lazy" title="Studio &quot;A&quot;" style="border: 0; width: 100%; aspect-ratio: 16 / 9;" allowfullscreen></iframe>',
+      '<iframe src="http://desk.local/embed/channel-id?a=1&amp;b=2" allow="autoplay" loading="lazy" title="Studio &quot;A&quot;" style="display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; background: transparent;"></iframe>',
     );
   });
 });

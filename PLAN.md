@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a Linux application deployable with Docker Compose that accepts independently configured RTP or SRT inputs and exposes WebRTC outputs. The default media path must be robust, low latency, and free of decoding or encoding. A single-port web application provides configuration, channel switching, status, statistics, stable viewer/embed routes, and an automatic muted preview that can be disabled per channel.
+Build a Linux application deployable with Docker Compose that accepts independently configured RTP or SRT inputs and exposes WebRTC outputs. The default media path must be robust, low latency, and free of decoding or encoding. A single-port web application provides configuration, simultaneous channel multiview, status, statistics, stable viewer/embed routes, and an automatic muted preview that can be disabled per channel.
 
 ## Accepted Decisions
 
@@ -122,7 +122,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - Persisted automatic-preview control, on by default, with muted autoplay and immediate WHEP cleanup when disabled.
 - Live statistics delivered through server-sent events.
 - Global settings view and clear desired/applied state.
-- Copyable SRT publishing instructions, UUID viewer/embed routes, iframe snippets, and stable WHEP URLs.
+- Copyable SRT publishing instructions, a stable multiview route, UUID embed routes, iframe snippets, and stable WHEP URLs.
 - Masked secrets in routine responses with explicit non-cacheable retrieval on the trusted management LAN.
 - Conditional graceful Gateway restart control when an unlocked management binding has a pending change.
 
@@ -221,3 +221,4 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 | 2026-08-23 | Added packet-preserving SRT transport adaptation with automatic raw MPEG-TS and RTP/MP2T detection, SDP-described elementary RTP for SRT push and pull, structural H264/interlace probing, send-field deinterlacing, 576i and RTP browser fixtures, and MPEG-TS-only labeling for the direct stream-ID shortcut. |
 | 2026-08-23 | Added the cabled-LAN low-latency defaults: explicit 60 ms SRT ingest, 4 MiB bridge receive buffers with reusable packet storage, 512-packet writer queues, finite new-channel viewer admission, faster compatibility startup, and reserved routing CPU headroom. Retained the internal format-neutral SRT publisher after RTSP stream-copy validation rejected valid MPEG-TS AAC inputs. |
 | 2026-08-24 | Added a persisted collapsible dashboard rail, cgroup-v2 Gateway and whole-host resource telemetry, a compact resource footer with explicit isolation boundaries, and accessible technical tooltips across settings and live readouts. |
+| 2026-08-24 | Replaced channel switching in the shared viewer with simultaneous all-channel multiview and reduced per-channel embeds to transparent, muted, control-free video surfaces. |

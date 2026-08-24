@@ -1762,8 +1762,8 @@ function connectionHelp(label: string) {
   if (label === "Destination port") return "Per-channel UDP listener used by SRT push senders.";
   if (label === "SRT mode") return "Caller means the encoder initiates the SRT connection to Gateway.";
   if (label.includes("stream-ID URL")) return "Alternative shared SRT endpoint for MPEG-TS senders that support MediaMTX stream IDs.";
-  if (label.includes("Viewer URL")) return "Standalone multi-channel viewer link with this channel preselected.";
-  if (label === "Iframe embed code") return "HTML snippet for embedding the channel-specific player without dashboard navigation.";
+  if (label.includes("Viewer URL")) return "Standalone multiview link that plays every ready channel simultaneously.";
+  if (label === "Iframe embed code") return "Transparent, control-free video for placing this channel directly inside another page.";
   if (label === "WHEP API endpoint") return "Low-level WebRTC-HTTP egress endpoint used by compatible players.";
   return "";
 }

@@ -57,19 +57,18 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 1. Create a channel and select its input mode. **SRT push** is the simplest option for encoders that accept a destination IP and port.
 2. Select the channel. Its fixed workspace shows encoder connection details, listener state, stable output links, and a muted WebRTC preview without requiring a separate configuration view.
 3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the selected input show `-`.
-4. Send the viewer URL to LAN users or place the iframe snippet in another LAN application. These UUID-based routes do not change when a channel is renamed or switches between direct and compatibility output.
+4. Send the stable multiview URL to LAN users or place the channel's UUID-based iframe snippet in another LAN application. Embed URLs do not change when a channel is renamed or switches between direct and compatibility output.
 
-The shared viewer and standalone player routes are:
+The multiview and channel embed routes are:
 
 ```text
 http://HOST_IP:8080/view
-http://HOST_IP:8080/view/CHANNEL_ID
 http://HOST_IP:8080/embed/CHANNEL_ID
 ```
 
-The shared viewer shows every configured channel as a selectable button, including disabled and offline channels, and refreshes the list automatically. A `/view/CHANNEL_ID` link opens the same viewer with that channel preselected. The embed route remains channel-specific and omits viewer navigation.
+The multiview opens every ready channel simultaneously in a live grid while retaining visible offline, disabled, and error tiles. It refreshes the channel set automatically. Legacy `/view/CHANNEL_ID` links open the same multiview. The embed route remains channel-specific and renders only the muted video surface: no header, status overlay, native controls, border, or opaque page background.
 
-Viewer, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Standalone player routes always attempt playback when output is ready.
+Multiview, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Each ready channel in multiview creates an independent WebRTC reader. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Embed routes always attempt playback when output is ready.
 
 SRT passphrases remain masked in normal channel and status responses. The selected channel can explicitly retrieve and copy its current passphrase through a non-cacheable API request. The deployment is intended for a trusted internal LAN and does not add authentication to management, player, passphrase, or restart endpoints.
 

@@ -282,7 +282,7 @@ export function absolutePath(origin: string, path: string) {
 }
 
 export function iframeEmbedCode(embedURL: string, channelName: string) {
-  return `<iframe src="${escapeAttribute(embedURL)}" allow="autoplay; fullscreen" loading="lazy" title="${escapeAttribute(channelName)}" style="border: 0; width: 100%; aspect-ratio: 16 / 9;" allowfullscreen></iframe>`;
+  return `<iframe src="${escapeAttribute(embedURL)}" allow="autoplay" loading="lazy" title="${escapeAttribute(channelName)}" style="display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; background: transparent;"></iframe>`;
 }
 
 function escapeAttribute(value: string) {

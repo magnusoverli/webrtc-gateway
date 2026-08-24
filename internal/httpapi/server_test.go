@@ -260,7 +260,7 @@ func TestFocusedChannelEndpointIncludesRuntimeAndPlayerPaths(t *testing.T) {
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/channels/channel-1", nil))
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"outputReady":true`) ||
-		!strings.Contains(res.Body.String(), `"viewerPath":"/view/channel-1"`) ||
+		!strings.Contains(res.Body.String(), `"viewerPath":"/view"`) ||
 		!strings.Contains(res.Body.String(), `"automaticPreview":true`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
 	}

@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { channelPlaybackReady, resolveStandaloneRoute, selectViewerChannelID } from "./StandalonePlayer";
+import { channelPlaybackReady, resolveStandaloneRoute } from "./StandalonePlayer";
 
 describe("standalone routes", () => {
-  it("opens the shared viewer with or without an initial channel", () => {
-    expect(resolveStandaloneRoute("/view")).toEqual({ kind: "viewer", initialChannelID: "" });
-    expect(resolveStandaloneRoute("/view/")).toEqual({ kind: "viewer", initialChannelID: "" });
-    expect(resolveStandaloneRoute("/view", "?channel=channel%20id")).toEqual({ kind: "viewer", initialChannelID: "channel id" });
-    expect(resolveStandaloneRoute("/view/channel%20id")).toEqual({ kind: "viewer", initialChannelID: "channel id" });
+  it("opens one multiview route for current and legacy viewer URLs", () => {
+    expect(resolveStandaloneRoute("/view")).toEqual({ kind: "viewer" });
+    expect(resolveStandaloneRoute("/view/")).toEqual({ kind: "viewer" });
+    expect(resolveStandaloneRoute("/view/channel%20id")).toEqual({ kind: "viewer" });
   });
 
   it("keeps embeds channel-specific and rejects malformed routes", () => {
@@ -14,23 +13,6 @@ describe("standalone routes", () => {
     expect(resolveStandaloneRoute("/embed")).toBeNull();
     expect(resolveStandaloneRoute("/view/channel/extra")).toBeNull();
     expect(resolveStandaloneRoute("/view/%E0%A4%A")).toBeNull();
-  });
-});
-
-describe("viewer channel selection", () => {
-  const channels = [{ id: "offline" }, { id: "disabled" }, { id: "live" }];
-
-  it("selects the first configured channel without filtering its state", () => {
-    expect(selectViewerChannelID(channels, "")).toBe("offline");
-  });
-
-  it("retains selection across polling and ordering changes", () => {
-    expect(selectViewerChannelID([...channels].reverse(), "disabled")).toBe("disabled");
-  });
-
-  it("does not silently replace a requested or deleted channel", () => {
-    expect(selectViewerChannelID(channels, "deleted")).toBe("deleted");
-    expect(selectViewerChannelID([], "deleted")).toBe("deleted");
   });
 });
 

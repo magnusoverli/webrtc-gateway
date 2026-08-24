@@ -1,40 +1,40 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { channelHasFault, channelStateLabel, type Channel } from "./channel";
 import { startSerialPolling } from "./polling";
-import { Tooltip } from "./Tooltip";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
 export type StandaloneRoute =
-  | { kind: "viewer"; initialChannelID: string }
+  | { kind: "viewer" }
   | { kind: "embed"; channelID: string };
 
-export function resolveStandaloneRoute(pathname: string, search = ""): StandaloneRoute | null {
+export function resolveStandaloneRoute(pathname: string): StandaloneRoute | null {
   if (/^\/view\/?$/.test(pathname)) {
-    return { kind: "viewer", initialChannelID: new URLSearchParams(search).get("channel") ?? "" };
+    return { kind: "viewer" };
   }
   const match = pathname.match(/^\/(view|embed)\/([^/]+)\/?$/);
   if (!match) return null;
   try {
     const channelID = decodeURIComponent(match[2]);
     return match[1] === "view"
-      ? { kind: "viewer", initialChannelID: channelID }
+      ? { kind: "viewer" }
       : { kind: "embed", channelID };
   } catch {
     return null;
   }
 }
 
-export function selectViewerChannelID(channels: ReadonlyArray<Pick<Channel, "id">>, current: string) {
-  return current || channels[0]?.id || "";
+export function initializeStandaloneRoute(pathname: string, root = document.documentElement) {
+  const route = resolveStandaloneRoute(pathname);
+  root.classList.toggle("embed-document", route?.kind === "embed");
+  return route;
 }
 
 export function channelPlaybackReady(channel: Pick<Channel, "enabled" | "applyState" | "outputReady"> | null) {
   return Boolean(channel?.enabled && channel.applyState !== "deleting" && channel.outputReady);
 }
 
-export function ChannelViewer({ initialChannelID = "" }: { initialChannelID?: string }) {
+export function ChannelViewer() {
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [selectedID, setSelectedID] = useState(initialChannelID);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState("");
 
@@ -48,7 +48,6 @@ export function ChannelViewer({ initialChannelID = "" }: { initialChannelID?: st
         if (!Array.isArray(next.channels)) throw new Error("Gateway status did not include channels");
         if (disposed) return;
         setChannels(next.channels);
-        setSelectedID((current) => selectViewerChannelID(next.channels, current));
         setLoaded(true);
         setLoadError("");
       } catch (error) {
@@ -65,37 +64,44 @@ export function ChannelViewer({ initialChannelID = "" }: { initialChannelID?: st
     };
   }, []);
 
-  useEffect(() => {
-    if (!selectedID) return;
-    const location = `/view?channel=${encodeURIComponent(selectedID)}`;
-    if (`${window.location.pathname}${window.location.search}` !== location) {
-      window.history.replaceState(null, "", location);
-    }
-  }, [selectedID]);
-
-  const selected = channels.find((channel) => channel.id === selectedID) ?? null;
+  const liveChannels = channels.filter(channelPlaybackReady).length;
+  const summary = loadError
+    ? "Channel status unavailable · existing sessions continue"
+    : !loaded
+      ? "Loading channel status"
+      : channels.length === 0
+        ? "No channels configured"
+        : `${channels.length} ${channels.length === 1 ? "channel" : "channels"} · ${liveChannels} live`;
   return (
-    <PlayerFrame
-      channel={selected}
-      loadError={loadError}
-      empty={loaded && channels.length === 0 && !selectedID}
-      missing={loaded && Boolean(selectedID) && !selected}
-      navigation={
-        <ChannelNavigation
-          channels={channels}
-          selectedID={selectedID}
-          loaded={loaded}
-          loadError={loadError}
-          onSelect={setSelectedID}
-        />
-      }
-    />
+    <main className="standalone-player viewer-player multiview-player">
+      <header className="viewer-header">
+        <div className="viewer-brand"><span>SD</span><small>Signal Desk</small></div>
+        <div>
+          <h1>Channel multiview</h1>
+          <p>{summary}</p>
+        </div>
+      </header>
+      <div className="multiview-content">
+        {loadError && <div className="multiview-notice" role="alert">{loadError}. Status polling will retry automatically.</div>}
+        <MultiviewGrid channels={channels} loaded={loaded} />
+      </div>
+      <footer className="viewer-footer"><span className={liveChannels > 0 ? "signal online" : "signal"} />Live LAN WebRTC · {liveChannels} active</footer>
+    </main>
   );
 }
 
-export function StandalonePlayer({ channelID, embed }: { channelID: string; embed: boolean }) {
+export function MultiviewGrid({ channels, loaded }: { channels: Channel[]; loaded: boolean }) {
+  return (
+    <section className="multiview-grid" aria-label="All channels">
+      {channels.map((channel) => <MultiviewTile key={channel.id} channel={channel} />)}
+      {loaded && channels.length === 0 && <div className="multiview-empty">Create a channel in Signal Desk. It will appear here automatically.</div>}
+      {!loaded && channels.length === 0 && <div className="multiview-empty">Reading live output status.</div>}
+    </section>
+  );
+}
+
+export function StandalonePlayer({ channelID }: { channelID: string }) {
   const [channel, setChannel] = useState<Channel | null>(null);
-  const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
     let disposed = false;
@@ -117,10 +123,8 @@ export function StandalonePlayer({ channelID, embed }: { channelID: string; embe
         const next = await response.json() as Channel;
         if (disposed) return;
         setChannel(next);
-        setLoadError("");
-      } catch (error) {
+      } catch {
         if (disposed || abort.signal.aborted) return;
-        setLoadError(error instanceof Error ? error.message : "Channel status is unavailable");
         setChannel((current) => current ? { ...current, available: false, online: false, outputReady: false } : null);
       } finally {
         loading = false;
@@ -136,102 +140,46 @@ export function StandalonePlayer({ channelID, embed }: { channelID: string; embe
     };
   }, [channelID]);
 
-  return <PlayerFrame channel={channel} loadError={loadError} embed={embed} />;
+  return <EmbeddedVideo channel={channel} />;
 }
 
-function ChannelNavigation({ channels, selectedID, loaded, loadError, onSelect }: {
-  channels: Channel[];
-  selectedID: string;
-  loaded: boolean;
-  loadError: string;
-  onSelect: (channelID: string) => void;
-}) {
-  return (
-    <nav className="viewer-channel-nav" aria-label="Select channel">
-      <span className="viewer-channel-label">Channels</span>
-      <div className="viewer-channel-options">
-        {channels.map((channel) => {
-          const state = channelStateLabel(channel);
-          const signal = channelHasFault(channel) ? "signal fault" : channelPlaybackReady(channel) ? "signal online" : "signal";
-          return (
-            <Tooltip key={channel.id} content={`${channel.name} · ${state}`} placement="bottom">
-              {(tooltip) => <button
-                {...tooltip}
-                className={`viewer-channel-option${channel.id === selectedID ? " active" : ""}`}
-                type="button"
-                aria-label={`${channel.name}, ${state}`}
-                aria-pressed={channel.id === selectedID}
-                onClick={() => onSelect(channel.id)}
-              >
-                <span className={signal} />
-                <span>{channel.name}</span>
-              </button>}
-            </Tooltip>
-          );
-        })}
-        {channels.length === 0 && (
-          <span className="viewer-channel-empty">
-            {loadError || (loaded ? "No channels configured" : "Loading channels")}
-          </span>
-        )}
-      </div>
-    </nav>
-  );
-}
-
-function PlayerFrame({ channel, loadError, embed = false, empty = false, missing = false, navigation }: {
-  channel: Channel | null;
-  loadError: string;
-  embed?: boolean;
-  empty?: boolean;
-  missing?: boolean;
-  navigation?: ReactNode;
-}) {
+function MultiviewTile({ channel }: { channel: Channel }) {
   const playable = channelPlaybackReady(channel);
   const player = useWHEPPlayer({
     whepPath: channel?.whepPath ?? "",
     enabled: playable,
     retry: true,
   });
-  const stateLabel = channel
-    ? channelStateLabel(channel)
-    : loadError || (missing ? "Channel unavailable" : empty ? "No channels configured" : "Loading channel");
+  const stateLabel = channelStateLabel(channel);
   const showAudioOnly = Boolean(playable && player.state === "playing" && player.hasAudio && !player.hasVideo);
 
   return (
-    <main className={embed ? "standalone-player embed-player" : `standalone-player viewer-player${navigation ? " multi-viewer-player" : ""}`}>
-      {!embed && (
-        <header className="viewer-header">
-          <div className="viewer-brand"><span>SD</span><small>Signal Desk</small></div>
-          <div>
-            <h1>{channel?.name ?? "Signal Desk viewer"}</h1>
-            <p>{stateLabel}</p>
-          </div>
-        </header>
-      )}
-      {navigation}
-      <section className="standalone-stage" aria-label={channel ? `${channel.name} player` : "Channel player"}>
-        <video ref={player.videoRef} autoPlay playsInline muted controls />
+    <article className={`multiview-tile${playable ? " live" : ""}`}>
+      <header className="multiview-tile-header">
+        <div><span className={channelHasFault(channel) ? "signal fault" : playable ? "signal online" : "signal"} /><h2>{channel.name}</h2></div>
+        <small>{stateLabel}</small>
+      </header>
+      <section className="standalone-stage" aria-label={`${channel.name} player`}>
+        <video ref={player.videoRef} autoPlay playsInline muted controls aria-label={`${channel.name} video`} />
         {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Audio is playing. This channel does not currently include a video track." />}
-        {!channel && <PlayerMessage
-          code={loadError ? "ERR" : missing ? "MISS" : empty ? "NONE" : "..."}
-          title={loadError || (missing ? "Channel unavailable" : empty ? "No channels configured" : "Loading channel")}
-          detail={loadError
-            ? "The player will keep retrying."
-            : missing
-              ? "The selected channel does not exist. Choose another channel above."
-              : empty
-                ? "Create a channel in Signal Desk. It will appear here automatically."
-                : "Reading live output status."}
-          error={Boolean(loadError)}
-        />}
-        {channel && loadError && <PlayerMessage code="ERR" title="Status unavailable" detail={`${loadError}. The player will keep retrying.`} error />}
-        {channel && !loadError && !playable && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channelHasFault(channel)} />}
+        {!playable && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channelHasFault(channel)} />}
         {playable && player.state === "connecting" && <PlayerMessage code="ICE" title="Connecting" detail="Establishing a WebRTC media session." pulse />}
         {playable && player.state === "error" && <PlayerMessage code="ERR" title="Playback interrupted" detail={`${player.error} Retrying automatically.`} error />}
         {playable && player.state === "playing" && !player.hasVideo && !player.hasAudio && <PlayerMessage code="LIVE" title="Connected" detail="Waiting for media tracks." pulse />}
       </section>
-      {!embed && <footer className="viewer-footer"><span className={playable ? "signal online" : "signal"} />Live LAN WebRTC</footer>}
+    </article>
+  );
+}
+
+function EmbeddedVideo({ channel }: { channel: Channel | null }) {
+  const player = useWHEPPlayer({
+    whepPath: channel?.whepPath ?? "",
+    enabled: channelPlaybackReady(channel),
+    retry: true,
+  });
+  return (
+    <main className="standalone-player embed-player" aria-label={channel ? `${channel.name} embedded player` : "Embedded channel player"}>
+      <video ref={player.videoRef} autoPlay playsInline muted aria-label={channel ? `${channel.name} embedded video` : "Embedded channel video"} />
     </main>
   );
 }
