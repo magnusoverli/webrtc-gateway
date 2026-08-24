@@ -75,7 +75,7 @@ SRT passphrases remain masked in normal channel and status responses. The select
 
 ### Dashboard Navigation And Help
 
-The dashboard sidebar can collapse to a narrow rail containing the Signal Desk mark and its expand control. The desktop preference is stored in the browser; the mobile menu state is temporary and starts expanded on each page load. Technical settings, stream statistics, resource figures, status terms, and icon-only controls include compact help tooltips that work with pointer hover, keyboard focus, and touch. Operational warnings and instructions that affect connectivity or restarts remain visible inline.
+The dashboard sidebar can collapse to a narrow rail containing the Signal Desk mark and its expand control. The preference is stored in the browser and the same navigation state is used at every viewport size. Technical settings, stream statistics, resource figures, status terms, and icon-only controls include compact help tooltips that work with pointer hover, keyboard focus, and touch. Operational warnings and instructions that affect connectivity or restarts remain visible inline.
 
 ### Resource Monitoring
 

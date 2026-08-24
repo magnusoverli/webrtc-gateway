@@ -194,7 +194,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - [ ] Live statistics handle reconnects and counter resets.
 - [x] Compatibility mode affects only its channel.
 - [x] Restarting Gateway does not stop existing direct media paths.
-- [x] Dashboard navigation collapses accessibly and remembers the desktop preference.
+- [x] Dashboard navigation collapses accessibly and remembers one browser preference at every viewport size.
 - [x] Gateway-container and host CPU/RAM degrade without affecting status or health.
 - [x] Technical options and metrics provide keyboard-, pointer-, and touch-accessible help.
 - [ ] Chrome and Firefox LAN playback are covered by automated tests.

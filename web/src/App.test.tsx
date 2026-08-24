@@ -9,15 +9,6 @@ import { railCollapsedKey } from "./uiPreferences";
 describe("dashboard rail", () => {
   beforeEach(() => {
     window.localStorage.clear();
-    Object.defineProperty(window, "matchMedia", {
-      configurable: true,
-      value: vi.fn().mockImplementation(() => ({
-        matches: false,
-        media: "(max-width: 900px)",
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-      })),
-    });
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => undefined)));
   });
 
@@ -26,7 +17,7 @@ describe("dashboard rail", () => {
     vi.unstubAllGlobals();
   });
 
-  it("collapses navigation accessibly and persists the desktop preference", async () => {
+  it("collapses navigation accessibly and persists the preference", async () => {
     const user = userEvent.setup();
     render(<App />);
     const collapse = screen.getByRole("button", { name: "Collapse gateway navigation" });
@@ -38,25 +29,6 @@ describe("dashboard rail", () => {
     expect(screen.getByRole("button", { name: "Expand gateway navigation" }).getAttribute("aria-expanded")).toBe("false");
     expect(navigation?.hasAttribute("hidden")).toBe(true);
     await waitFor(() => expect(window.localStorage.getItem(railCollapsedKey)).toBe("true"));
-  });
-
-  it("starts expanded on mobile without overwriting the desktop preference", async () => {
-    const user = userEvent.setup();
-    window.localStorage.setItem(railCollapsedKey, "true");
-    Object.defineProperty(window, "matchMedia", {
-      configurable: true,
-      value: vi.fn().mockImplementation(() => ({
-        matches: true,
-        media: "(max-width: 900px)",
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-      })),
-    });
-    render(<App />);
-    expect(screen.getByRole("button", { name: "Collapse gateway navigation" })).toBeDefined();
-    await user.click(screen.getByRole("button", { name: "Collapse gateway navigation" }));
-    expect(screen.getByRole("button", { name: "Expand gateway navigation" })).toBeDefined();
-    expect(window.localStorage.getItem(railCollapsedKey)).toBe("true");
   });
 
   it("marks retained resource values stale when status polling is disconnected", () => {

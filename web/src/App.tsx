@@ -191,23 +191,11 @@ export function App() {
   const [refreshToken, setRefreshToken] = useState(0);
   const [streamRates, setStreamRates] = useState<Record<string, { inputBitrateBps: number | null; outputBitrateBps: number | null; deliveryBitrateBps: number | null }>>({});
   const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const [narrowLayout, setNarrowLayout] = useState(() => window.matchMedia("(max-width: 900px)").matches);
-  const [mobileRailOpen, setMobileRailOpen] = useState(true);
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
 
   const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
-  const railExpanded = narrowLayout ? mobileRailOpen : !railCollapsed;
-
-  useEffect(() => {
-    const media = window.matchMedia("(max-width: 900px)");
-    const update = (event: MediaQueryListEvent) => {
-      setNarrowLayout(event.matches);
-      if (event.matches) setMobileRailOpen(true);
-    };
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, []);
+  const railExpanded = !railCollapsed;
 
   useEffect(() => writeRailCollapsed(railCollapsed), [railCollapsed]);
 
@@ -541,7 +529,7 @@ export function App() {
       : status.channels.length === 0 ? "No channels configured" : "Selecting channel");
 
   return (
-    <div className={`app-shell${!narrowLayout && railCollapsed ? " rail-collapsed" : ""}`}>
+    <div className={`app-shell${railCollapsed ? " rail-collapsed" : ""}`}>
       <aside className="rail" aria-label="Gateway navigation">
         <div className="brand-block">
           <span className="brand-mark" aria-hidden="true">SD</span>
@@ -557,10 +545,9 @@ export function App() {
               aria-controls="gateway-navigation"
               aria-expanded={railExpanded}
               aria-label={railExpanded ? "Collapse gateway navigation" : "Expand gateway navigation"}
-              onClick={() => narrowLayout ? setMobileRailOpen((open) => !open) : setRailCollapsed((collapsed) => !collapsed)}
+              onClick={() => setRailCollapsed((collapsed) => !collapsed)}
             >
               <span aria-hidden="true">{railExpanded ? "‹" : "›"}</span>
-              <small>{railExpanded ? "Collapse" : "Menu"}</small>
             </button>}
           </Tooltip>
         </div>
