@@ -23,6 +23,7 @@ import (
 	"webrtc-gateway/internal/reconcile"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
+	"webrtc-gateway/internal/telemetry"
 )
 
 var version = "dev"
@@ -79,6 +80,7 @@ func main() {
 	defer compatibilityManager.Close()
 	logger.Info("compatibility capacity configured", "encoderThreads", cfg.EncoderThreads, "capacityUnits", cfg.WorkerCapacity)
 	restartRequests := make(chan struct{}, 1)
+	resourceSampler := telemetry.New(logger)
 
 	handler, err := httpapi.New(httpapi.Options{
 		Logger:          logger,
@@ -87,6 +89,7 @@ func main() {
 		Settings:        settingsService,
 		Compatibility:   compatibilityManager,
 		Relays:          relaySupervisor,
+		Resources:       resourceSampler,
 		MediaMTXWHEPURL: cfg.MediaMTXWHEPURL,
 		Version:         version,
 		StartedAt:       time.Now().UTC(),
@@ -131,6 +134,7 @@ func main() {
 	controller := reconcile.New(logger, mediaClient, 5*time.Second, settingsService, channelService)
 	go controller.Run(ctx)
 	go compatibilityManager.Run(ctx)
+	go resourceSampler.Run(ctx)
 
 	serverErr := make(chan error, 2)
 	go func() {

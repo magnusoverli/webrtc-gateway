@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { channelHasFault, channelStateLabel, type Channel } from "./channel";
 import { startSerialPolling } from "./polling";
+import { Tooltip } from "./Tooltip";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
 export type StandaloneRoute =
@@ -153,18 +154,19 @@ function ChannelNavigation({ channels, selectedID, loaded, loadError, onSelect }
           const state = channelStateLabel(channel);
           const signal = channelHasFault(channel) ? "signal fault" : channelPlaybackReady(channel) ? "signal online" : "signal";
           return (
-            <button
-              key={channel.id}
-              className={`viewer-channel-option${channel.id === selectedID ? " active" : ""}`}
-              type="button"
-              aria-label={`${channel.name}, ${state}`}
-              aria-pressed={channel.id === selectedID}
-              title={`${channel.name} - ${state}`}
-              onClick={() => onSelect(channel.id)}
-            >
-              <span className={signal} />
-              <span>{channel.name}</span>
-            </button>
+            <Tooltip key={channel.id} content={`${channel.name} · ${state}`} placement="bottom">
+              {(tooltip) => <button
+                {...tooltip}
+                className={`viewer-channel-option${channel.id === selectedID ? " active" : ""}`}
+                type="button"
+                aria-label={`${channel.name}, ${state}`}
+                aria-pressed={channel.id === selectedID}
+                onClick={() => onSelect(channel.id)}
+              >
+                <span className={signal} />
+                <span>{channel.name}</span>
+              </button>}
+            </Tooltip>
           );
         })}
         {channels.length === 0 && (

@@ -73,6 +73,21 @@ Viewer, embed, and dashboard playback start muted to satisfy desktop browser aut
 
 SRT passphrases remain masked in normal channel and status responses. The selected channel can explicitly retrieve and copy its current passphrase through a non-cacheable API request. The deployment is intended for a trusted internal LAN and does not add authentication to management, player, passphrase, or restart endpoints.
 
+### Dashboard Navigation And Help
+
+The dashboard sidebar can collapse to a narrow rail containing the Signal Desk mark and its expand control. The desktop preference is stored in the browser; the mobile menu state is temporary and starts expanded on each page load. Technical settings, stream statistics, resource figures, status terms, and icon-only controls include compact help tooltips that work with pointer hover, keyboard focus, and touch. Operational warnings and instructions that affect connectivity or restarts remain visible inline.
+
+### Resource Monitoring
+
+The sidebar footer samples CPU and RAM once per second and displays two explicitly scoped rows:
+
+- **Gateway** is the complete Gateway container cgroup, including the Go application, compatibility FFmpeg/FFprobe workers, per-channel SRT relays, and transient health-check processes. CPU is shown as a percentage of the logical CPU capacity available to the container. RAM is the cgroup working set, excluding inactive file cache, compared with its configured limit when finite.
+- **Host** is whole-host CPU busy time and Linux used memory calculated from `MemTotal - MemAvailable`. It includes every workload on the server, not only this Compose stack.
+
+MediaMTX runs in a separate PID and cgroup namespace and does not expose process CPU or resident memory through its metrics endpoint. Its CPU/RAM are therefore intentionally excluded rather than estimated. Gateway does not receive the Docker socket, host PID namespace, privileged mode, or a broad host-cgroup mount. The host row still provides overall capacity and pressure context.
+
+Resource sampling requires Linux cgroup v2 for Gateway-container figures. The sampler resolves the Gateway's own cgroup and any ancestor limits visible inside its private cgroup namespace without mounting the host cgroup tree into the container. The configured Gateway limit remains visible; limits on hidden host ancestors are intentionally not exposed. Unsupported or temporarily unreadable sources appear as unavailable or stale without failing channel status, playback, or health checks. A warming state means the current memory gauge is valid while CPU waits for a second counter sample. Each scope carries its own successful sample time and CPU window so retained stale values are not presented as newly sampled.
+
 Compatibility normalization is bounded by startup configuration:
 
 | Variable | Default | Purpose |

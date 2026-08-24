@@ -22,6 +22,7 @@ import (
 	"webrtc-gateway/internal/networkbind"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
+	"webrtc-gateway/internal/telemetry"
 	"webrtc-gateway/internal/webui"
 )
 
@@ -51,6 +52,10 @@ type relayStatusReader interface {
 	Snapshot(string) srtrelay.Status
 }
 
+type resourceReader interface {
+	Snapshot() telemetry.Snapshot
+}
+
 type Options struct {
 	Logger          *slog.Logger
 	MediaMTX        mediaStatusReader
@@ -58,6 +63,7 @@ type Options struct {
 	Settings        settingsService
 	Compatibility   compatibilityReader
 	Relays          relayStatusReader
+	Resources       resourceReader
 	MediaMTXWHEPURL string
 	Version         string
 	StartedAt       time.Time
@@ -80,6 +86,7 @@ type server struct {
 	settings    settingsService
 	compat      compatibilityReader
 	relays      relayStatusReader
+	resources   resourceReader
 	version     string
 	startedAt   time.Time
 	whepTarget  *url.URL
@@ -90,11 +97,12 @@ type server struct {
 }
 
 type statusResponse struct {
-	Gateway  gatewayStatus     `json:"gateway"`
-	Media    mediaStatus       `json:"media"`
-	Settings settings.Settings `json:"settings"`
-	Network  networkStatus     `json:"network"`
-	Channels []channelResponse `json:"channels"`
+	Gateway   gatewayStatus       `json:"gateway"`
+	Media     mediaStatus         `json:"media"`
+	Settings  settings.Settings   `json:"settings"`
+	Network   networkStatus       `json:"network"`
+	Resources *telemetry.Snapshot `json:"resources,omitempty"`
+	Channels  []channelResponse   `json:"channels"`
 }
 
 type networkStatus struct {
@@ -258,6 +266,7 @@ func New(options Options) (http.Handler, error) {
 		settings:    options.Settings,
 		compat:      options.Compatibility,
 		relays:      options.Relays,
+		resources:   options.Resources,
 		version:     options.Version,
 		startedAt:   options.StartedAt,
 		whepTarget:  whepTarget,
@@ -313,6 +322,10 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		Gateway:  gatewayStatus{Version: s.version, StartedAt: s.startedAt},
 		Media:    mediaStatus{Reachable: false},
 		Settings: globalSettings,
+	}
+	if s.resources != nil {
+		resources := s.resources.Snapshot()
+		response.Resources = &resources
 	}
 	interfaceAddresses, interfaceErr := s.interfaces()
 	if interfaceErr == nil {

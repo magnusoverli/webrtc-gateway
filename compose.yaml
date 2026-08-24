@@ -14,6 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile
     network_mode: host
+    cgroup: private
     restart: unless-stopped
     mem_limit: ${GATEWAY_MEMORY_LIMIT:-8g}
     pids_limit: ${GATEWAY_PIDS_LIMIT:-2048}

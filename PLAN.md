@@ -20,6 +20,8 @@ Build a Linux application deployable with Docker Compose that accepts independen
 - RTP, SRT, and WebRTC media continue to use their own UDP ports.
 - Preview creates a real WebRTC reader, starts muted, is enabled by default per channel, and only runs for the selected dashboard channel.
 - Always-on statistics come from MediaMTX. Browser `getStats()` augments them while preview is active.
+- Gateway-container and whole-host CPU/RAM are sampled in the background from cgroup v2 and `/proc`; MediaMTX process resources remain explicitly excluded because its container is isolated.
+- The dashboard sidebar collapses to a persisted slim desktop rail, and technical controls/readouts use accessible compact help tooltips while essential guidance stays inline.
 
 ## Architecture
 
@@ -46,6 +48,7 @@ SRT without stream ID --> per-channel SRT listener --> framing adapter --> Media
 - **Web UI:** React and TypeScript single-page application served by Gateway.
 - **Persistence:** SQLite in a Docker volume. It is the desired-state source of truth.
 - **FFmpeg:** supervised per incompatible SRT channel; no process runs for direct channels.
+- **Resource sampler:** non-blocking one-second Gateway-cgroup and whole-host CPU/RAM snapshots exposed through the existing status API.
 
 ### Network Layout
 
@@ -191,6 +194,9 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - [ ] Live statistics handle reconnects and counter resets.
 - [x] Compatibility mode affects only its channel.
 - [x] Restarting Gateway does not stop existing direct media paths.
+- [x] Dashboard navigation collapses accessibly and remembers the desktop preference.
+- [x] Gateway-container and host CPU/RAM degrade without affecting status or health.
+- [x] Technical options and metrics provide keyboard-, pointer-, and touch-accessible help.
 - [ ] Chrome and Firefox LAN playback are covered by automated tests.
 
 ## Progress Log
@@ -214,3 +220,4 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 | 2026-08-23 | Added the fixed operator connection workspace, default-on per-channel muted preview, explicit SRT passphrase reveal, stable viewer/embed routes and iframe output, focused runtime status, and conditional graceful Gateway restart through the Compose restart policy. |
 | 2026-08-23 | Added packet-preserving SRT transport adaptation with automatic raw MPEG-TS and RTP/MP2T detection, SDP-described elementary RTP for SRT push and pull, structural H264/interlace probing, send-field deinterlacing, 576i and RTP browser fixtures, and MPEG-TS-only labeling for the direct stream-ID shortcut. |
 | 2026-08-23 | Added the cabled-LAN low-latency defaults: explicit 60 ms SRT ingest, 4 MiB bridge receive buffers with reusable packet storage, 512-packet writer queues, finite new-channel viewer admission, faster compatibility startup, and reserved routing CPU headroom. Retained the internal format-neutral SRT publisher after RTSP stream-copy validation rejected valid MPEG-TS AAC inputs. |
+| 2026-08-24 | Added a persisted collapsible dashboard rail, cgroup-v2 Gateway and whole-host resource telemetry, a compact resource footer with explicit isolation boundaries, and accessible technical tooltips across settings and live readouts. |

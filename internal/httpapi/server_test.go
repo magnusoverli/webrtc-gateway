@@ -19,6 +19,7 @@ import (
 	"webrtc-gateway/internal/networkbind"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
+	"webrtc-gateway/internal/telemetry"
 )
 
 type fakeMediaMTX struct {
@@ -60,6 +61,12 @@ func (f *fakeCompatibility) Snapshot(string) compatibility.State { return f.stat
 type fakeRelays struct {
 	status srtrelay.Status
 }
+
+type fakeResources struct {
+	snapshot telemetry.Snapshot
+}
+
+func (f fakeResources) Snapshot() telemetry.Snapshot { return f.snapshot }
 
 func (f fakeRelays) Snapshot(string) srtrelay.Status { return f.status }
 
@@ -127,6 +134,39 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if body := res.Body.String(); !strings.Contains(body, `"name":"Demo"`) || !strings.Contains(body, `"version":"1.20.1"`) || !strings.Contains(body, `"management":{"activeAddress":"*","activeSelection":"*","desiredAddress":"*","resolvedAddress":"*","port":8080`) {
 		t.Fatalf("unexpected response body: %s", body)
+	}
+}
+
+func TestStatusIncludesResourceSnapshot(t *testing.T) {
+	cpuPercent := 12.5
+	usedCores := 2.5
+	memoryTotal := uint64(8 * 1024 * 1024 * 1024)
+	sampledAt := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	resources := telemetry.Snapshot{
+		SampledAt: sampledAt,
+		Gateway: telemetry.ResourceScope{
+			Status: telemetry.StatusOK, Scope: "gateway-cgroup", SampledAt: &sampledAt, WindowMS: 1000,
+			CPU:    telemetry.CPU{Percent: &cpuPercent, UsedCores: &usedCores, CapacityCores: 20},
+			Memory: telemetry.Memory{UsedBytes: 512 * 1024 * 1024, TotalBytes: &memoryTotal},
+		},
+		Host:  telemetry.ResourceScope{Status: telemetry.StatusStale, Scope: "host", ErrorCode: "sample_failed"},
+		Media: telemetry.ResourceAvailability{Status: telemetry.StatusUnavailable, Scope: "mediamtx-cgroup", ErrorCode: "isolated_scope"},
+	}
+	handler, err := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MediaMTX: fakeMediaMTX{}, Channels: fakeChannels{},
+		Settings: fakeSettings{value: settings.Defaults(time.Now())}, Resources: fakeResources{snapshot: resources},
+		MediaMTXWHEPURL: "http://127.0.0.1:1", Management: ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	body := res.Body.String()
+	for _, expected := range []string{`"resources":`, `"status":"ok"`, `"windowMs":1000`, `"percent":12.5`, `"usedBytes":536870912`, `"errorCode":"isolated_scope"`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("response missing %s: %s", expected, body)
+		}
 	}
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   absolutePath,
   channelHasFault,
@@ -24,6 +24,8 @@ import {
   type Track,
 } from "./channel";
 import { startSerialPolling } from "./polling";
+import { HelpTip, Tooltip } from "./Tooltip";
+import { railCollapsedKey, readRailCollapsed, writeRailCollapsed } from "./uiPreferences";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 import type { WHEPPlayerState } from "./useWHEPPlayer";
 import { codecWarnings, type PreviewStats, type ReceiverStats, type VideoReceiverStats } from "./webrtc";
@@ -75,7 +77,35 @@ type Status = {
     management: BindingStatus;
     media: BindingStatus;
   };
+  resources?: ResourceSnapshot;
   channels: Channel[];
+};
+
+type ResourceStatus = "ok" | "warming" | "stale" | "unavailable";
+
+type ResourceScope = {
+  status: ResourceStatus;
+  scope: string;
+  errorCode?: string;
+  sampledAt?: string;
+  windowMs?: number;
+  cpu: {
+    percent: number | null;
+    usedCores: number | null;
+    capacityCores: number;
+  };
+  memory: {
+    usedBytes: number;
+    currentBytes?: number;
+    totalBytes: number | null;
+  };
+};
+
+type ResourceSnapshot = {
+  sampledAt: string;
+  gateway: ResourceScope;
+  host: ResourceScope;
+  media: { status: ResourceStatus; scope: string; errorCode?: string };
 };
 
 type SettingsForm = Omit<GlobalSettings, "webRTCAdditionalHosts" | "applyState" | "applyError" | "updatedAt"> & {
@@ -160,10 +190,34 @@ export function App() {
   const [restartError, setRestartError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [streamRates, setStreamRates] = useState<Record<string, { inputBitrateBps: number | null; outputBitrateBps: number | null; deliveryBitrateBps: number | null }>>({});
+  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
+  const [narrowLayout, setNarrowLayout] = useState(() => window.matchMedia("(max-width: 900px)").matches);
+  const [mobileRailOpen, setMobileRailOpen] = useState(true);
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
 
   const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
+  const railExpanded = narrowLayout ? mobileRailOpen : !railCollapsed;
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 900px)");
+    const update = (event: MediaQueryListEvent) => {
+      setNarrowLayout(event.matches);
+      if (event.matches) setMobileRailOpen(true);
+    };
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => writeRailCollapsed(railCollapsed), [railCollapsed]);
+
+  useEffect(() => {
+    const synchronize = (event: StorageEvent) => {
+      if (event.key === railCollapsedKey) setRailCollapsed(event.newValue === "true");
+    };
+    window.addEventListener("storage", synchronize);
+    return () => window.removeEventListener("storage", synchronize);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -487,19 +541,34 @@ export function App() {
       : status.channels.length === 0 ? "No channels configured" : "Selecting channel");
 
   return (
-    <div className="app-shell">
-      <aside className="rail">
+    <div className={`app-shell${!narrowLayout && railCollapsed ? " rail-collapsed" : ""}`}>
+      <aside className="rail" aria-label="Gateway navigation">
         <div className="brand-block">
           <span className="brand-mark" aria-hidden="true">SD</span>
-          <div>
+          <div className="brand-copy">
             <strong>Signal Desk</strong>
             <small>WebRTC gateway</small>
           </div>
+          <Tooltip content={railExpanded ? "Hide gateway navigation and resource details." : "Show gateway navigation and resource details."} placement="right">
+            {(tooltip) => <button
+              {...tooltip}
+              className="rail-toggle"
+              type="button"
+              aria-controls="gateway-navigation"
+              aria-expanded={railExpanded}
+              aria-label={railExpanded ? "Collapse gateway navigation" : "Expand gateway navigation"}
+              onClick={() => narrowLayout ? setMobileRailOpen((open) => !open) : setRailCollapsed((collapsed) => !collapsed)}
+            >
+              <span aria-hidden="true">{railExpanded ? "‹" : "›"}</span>
+              <small>{railExpanded ? "Collapse" : "Menu"}</small>
+            </button>}
+          </Tooltip>
         </div>
 
-        <section className="rail-group gateway-rail" aria-labelledby="gateway-rail-title">
+        <div id="gateway-navigation" className="rail-content" hidden={!railExpanded}>
+          <section className="rail-group gateway-rail" aria-labelledby="gateway-rail-title">
           <div className="rail-heading">
-            <span id="gateway-rail-title">Gateway</span>
+            <span id="gateway-rail-title">Gateway <HelpTip label="Gateway status" content="Connection state between the management application and the shared MediaMTX media plane." placement="right" /></span>
           </div>
           <div className="service-state">
             <span className={status?.media.reachable ? "signal online" : status ? "signal fault" : "signal"} />
@@ -512,9 +581,9 @@ export function App() {
             <span>Global settings</span>
             <small>{gatewaySettingsState}</small>
           </button>
-        </section>
+          </section>
 
-        <section className="rail-group channels-rail" aria-labelledby="channels-rail-title">
+          <section className="rail-group channels-rail" aria-labelledby="channels-rail-title">
           <div className="rail-heading">
             <span id="channels-rail-title">Channels</span>
             <button className="rail-add" type="button" onClick={openCreate} disabled={!status}>Add</button>
@@ -531,6 +600,7 @@ export function App() {
                   key={item.id}
                   onClick={() => setSelectedID(item.id)}
                   type="button"
+                  aria-pressed={item.id === selectedID}
                 >
                   <span className={live ? "signal online" : fault ? "signal fault" : "signal"} />
                   <span>{item.name}</span>
@@ -543,7 +613,9 @@ export function App() {
               <button className="empty-rail empty-action" type="button" onClick={openCreate}>Create the first channel</button>
             )}
           </nav>
-        </section>
+          </section>
+          <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
+        </div>
       </aside>
 
       <main className="workspace">
@@ -585,6 +657,7 @@ export function App() {
             <div className={isLive ? "state-pill live" : statusError && !status ? "state-pill fault" : "state-pill"}>
               <span className={isLive ? "signal online" : selectedFault || Boolean(statusError && !status) ? "signal fault" : "signal"} />
               {selected ? channelStateLabel(selected) : status === null ? statusError ? "Unavailable" : "Loading" : status.channels.length ? "Selecting" : "Empty"}
+              <HelpTip label="channel state" content="Summarizes configuration, input, compatibility conversion, and output readiness for the selected channel." placement="left" />
             </div>
           </div>
         </header>
@@ -661,14 +734,17 @@ export function App() {
                   <span className="eyebrow">WEBRTC PREVIEW</span>
                   <h2>{previewTitle(preview.state, selected.automaticPreview, isLive)}</h2>
                 </div>
-                <button
-                  className={selected.automaticPreview ? "toggle active" : "toggle"}
-                  type="button"
-                  disabled={previewSaving || selected.applyState === "deleting"}
-                  aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
-                  aria-pressed={selected.automaticPreview}
-                  onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
-                ><span /></button>
+                <Tooltip content="Controls whether selecting this channel automatically opens one muted WebRTC preview session." placement="left">
+                  {(tooltip) => <button
+                    {...tooltip}
+                    className={selected.automaticPreview ? "toggle active" : "toggle"}
+                    type="button"
+                    disabled={previewSaving || selected.applyState === "deleting"}
+                    aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
+                    aria-pressed={selected.automaticPreview}
+                    onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
+                  ><span /></button>}
+                </Tooltip>
               </div>
               <div className="preview-stage">
                 <video ref={preview.videoRef} autoPlay playsInline muted controls />
@@ -689,10 +765,10 @@ export function App() {
             </article>
 
             <section className="metric-strip" aria-label="Live stream metrics">
-              <Metric label="Input rate" value={hasInput ? formatBitrate(selectedRates?.inputBitrateBps) : "—"} detail={hasInput ? `${formatBytes(selected.inboundBytes)} received` : "waiting for input"} />
-              <Metric label="Output rate" value={hasOutput ? formatBitrate(selectedRates?.outputBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outputInboundBytes)} published` : "no active output"} />
-              <Metric label="Delivery" value={hasOutput ? formatBitrate(selectedRates?.deliveryBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outboundBytes)} sent` : "no active output"} />
-              <Metric label="Viewers" value={hasOutput ? String(selected.readers.length) : "—"} detail={hasOutput ? "active readers" : "no active output"} />
+              <Metric label="Input rate" help="Current bitrate entering the channel, calculated from successive ingest byte counters." value={hasInput ? formatBitrate(selectedRates?.inputBitrateBps) : "—"} detail={hasInput ? `${formatBytes(selected.inboundBytes)} received` : "waiting for input"} />
+              <Metric label="Output rate" help="Current bitrate published on the browser-compatible output path before viewer fan-out." value={hasOutput ? formatBitrate(selectedRates?.outputBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outputInboundBytes)} published` : "no active output"} />
+              <Metric label="Delivery" help="Combined bitrate sent from the output path to all active readers. It can exceed output rate when multiple viewers are connected." value={hasOutput ? formatBitrate(selectedRates?.deliveryBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outboundBytes)} sent` : "no active output"} />
+              <Metric label="Viewers" help="Readers currently attached to this channel's browser-compatible output path, including the dashboard preview." value={hasOutput ? String(selected.readers.length) : "—"} detail={hasOutput ? "active readers" : "no active output"} />
             </section>
 
             <section className="stream-grid" aria-label="Input and output stream details">
@@ -706,9 +782,9 @@ export function App() {
                 </div>
                 {hasInput ? <>
                   <div className="stream-summary">
-                    <StreamFact label="Stream bitrate" value={formatBitrate(selectedRates?.inputBitrateBps)} />
-                    <StreamFact label="Received total" value={formatBytes(selected.inboundBytes)} />
-                    <StreamFact label="Input errors" value={`${selected.inboundFramesInError} frames`} warning={selected.inboundFramesInError > 0} />
+                    <StreamFact label="Stream bitrate" help="Recent ingest bitrate derived from the MediaMTX byte counter." value={formatBitrate(selectedRates?.inputBitrateBps)} />
+                    <StreamFact label="Received total" help="Cumulative bytes received during the current input generation." value={formatBytes(selected.inboundBytes)} />
+                    <StreamFact label="Input errors" help="Media frames MediaMTX could not parse correctly during the current input generation." value={`${selected.inboundFramesInError} frames`} warning={selected.inboundFramesInError > 0} />
                     <StreamFact label="Tracks" value={String(selected.tracks.length)} />
                   </div>
                   <MediaTracks direction="input" tracks={selected.tracks} />
@@ -725,10 +801,10 @@ export function App() {
                 </div>
                 {hasOutput ? <>
                   <div className="stream-summary">
-                    <StreamFact label="Stream bitrate" value={formatBitrate(selectedRates?.outputBitrateBps)} />
-                    <StreamFact label="Delivery bitrate" value={formatBitrate(selectedRates?.deliveryBitrateBps)} />
+                    <StreamFact label="Stream bitrate" help="Rate entering the output path after direct routing or compatibility conversion." value={formatBitrate(selectedRates?.outputBitrateBps)} />
+                    <StreamFact label="Delivery bitrate" help="Combined rate sent to every active output reader." value={formatBitrate(selectedRates?.deliveryBitrateBps)} />
                     <StreamFact label="Delivered total" value={formatBytes(selected.outboundBytes)} />
-                    <StreamFact label="Preview transport" value={preview.stats?.icePath ?? (selected.automaticPreview ? "Gathering" : "Preview disabled")} />
+                    <StreamFact label="Preview transport" help="ICE network path used by this browser's dashboard preview, such as UDP or TCP." value={preview.stats?.icePath ?? (selected.automaticPreview ? "Gathering" : "Preview disabled")} />
                   </div>
                   <MediaTracks direction="output" tracks={selected.outputTracks} previewStats={preview.stats} />
                 </> : <StreamIdle title="No active output" detail={hasInput ? "The input is connected while browser-compatible output is being prepared." : "Output statistics will appear after an input stream is detected."} />}
@@ -746,10 +822,10 @@ export function App() {
             </section>
 
             <section className="channel-info">
-              <InfoLine label="Input mode" value={inputModeLabel(selected.input.mode)} />
+              <InfoLine label="Input mode" help="How media enters Gateway for this channel." value={inputModeLabel(selected.input.mode)} />
               <InfoLine label="Ingest path" value={selected.path} mono />
-              <InfoLine label="WebRTC route" value={selected.compatibility.mode === "transcoded" ? "Automatic H264/Opus compatibility" : "Direct passthrough"} />
-              <InfoLine label="WHEP signaling" value={whepURL} mono />
+              <InfoLine label="WebRTC route" help="Direct passthrough avoids transcoding. Compatibility output uses an isolated FFmpeg worker when browser-safe codecs are required." value={selected.compatibility.mode === "transcoded" ? "Automatic H264/Opus compatibility" : "Direct passthrough"} />
+              <InfoLine label="WHEP signaling" help="HTTP endpoint browsers use to create and control a WebRTC receive session for this channel." value={whepURL} mono />
               <div className="danger-row">
                 <button className="button danger" type="button" disabled={selected.applyState === "deleting"} onClick={() => void deleteChannel(selected)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete channel"}</button>
               </div>
@@ -867,7 +943,7 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
             </label>
 
             <label className="field full">
-              <span>Input mode</span>
+              <FieldTitle help="Select how the source reaches Gateway. Push modes listen locally; pull mode connects outward to a source.">Input mode</FieldTitle>
               <select value={form.mode} onChange={(event) => switchMode(event.target.value as InputMode)}>
                 <option value="srt-push">SRT push into gateway</option>
                 <option value="srt-pull">SRT pull from source</option>
@@ -880,7 +956,7 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
               <>
                 {form.mode === "rtp-multicast" ? (
                   <label className="field">
-                    <span>Multicast group</span>
+                    <FieldTitle help="IPv4 multicast group that carries this RTP stream. Gateway joins the group on the selected network interface.">Multicast group</FieldTitle>
                     <input value={form.address} onChange={(event) => update("address", event.target.value)} />
                   </label>
                 ) : (
@@ -891,21 +967,21 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
                   </div>
                 )}
                 <label className="field">
-                  <span>UDP port</span>
+                  <FieldTitle help="Local UDP port used to receive RTP packets for this channel. It must be unique within the configured RTP range.">UDP port</FieldTitle>
                   <input type="number" min="1" max="65535" value={form.port} onChange={(event) => update("port", event.target.value)} />
                 </label>
                 <label className="field">
-                  <span>Source IP filter</span>
+                  <FieldTitle help="Optional sender address restriction. Packets from other source IPs are ignored.">Source IP filter</FieldTitle>
                   <input value={form.sourceIp} onChange={(event) => update("sourceIp", event.target.value)} placeholder="Optional" />
                 </label>
                 {form.mode === "rtp-multicast" && (
                   <label className="field">
-                    <span>Network interface</span>
+                    <FieldTitle help="Interface used to join the multicast group, such as eth0. Leave blank only when the operating system can choose correctly.">Network interface</FieldTitle>
                     <input value={form.networkInterface} onChange={(event) => update("networkInterface", event.target.value)} placeholder="Optional, e.g. eth0" />
                   </label>
                 )}
                 <label className="field full">
-                  <span>Session description (SDP)</span>
+                  <FieldTitle help="Describes RTP payload types, codecs, clock rates, and media layout so MediaMTX can interpret incoming packets.">Session description (SDP)</FieldTitle>
                   <textarea rows={9} value={form.sdp} onChange={(event) => update("sdp", event.target.value)} spellCheck={false} />
                   <small>Required because RTP payload types do not identify codecs by themselves.</small>
                 </label>
@@ -915,15 +991,15 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
             {isSRTPull && (
               <>
                 <label className="field">
-                  <span>Remote host</span>
+                  <FieldTitle help="Hostname or IP address of the remote SRT listener that Gateway should call.">Remote host</FieldTitle>
                   <input value={form.host} onChange={(event) => update("host", event.target.value)} placeholder="192.168.1.50" />
                 </label>
                 <label className="field">
-                  <span>Remote port</span>
+                  <FieldTitle help="UDP port exposed by the remote SRT listener.">Remote port</FieldTitle>
                   <input type="number" min="1" max="65535" value={form.port} onChange={(event) => update("port", event.target.value)} />
                 </label>
                 <label className="field">
-                  <span>Stream ID</span>
+                  <FieldTitle help="Optional SRT stream identifier sent to the remote listener for routing or authorization.">Stream ID</FieldTitle>
                   <input value={form.streamId} onChange={(event) => update("streamId", event.target.value)} placeholder="Optional" />
                 </label>
               </>
@@ -931,7 +1007,7 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
 
             {form.mode === "srt-push" && (
               <label className="field full">
-                <span>Sender destination UDP port</span>
+                <FieldTitle help="Gateway listens on this per-channel UDP port. Configure the encoder to call the Gateway media address and this port.">Sender destination UDP port</FieldTitle>
                 <input type="number" min="1024" max="65535" value={form.port} onChange={(event) => update("port", event.target.value)} />
                 <small>The sender needs only this port and the gateway IP. No stream ID is required.</small>
               </label>
@@ -939,7 +1015,7 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
 
             {!isRTP && (
               <label className="field">
-                <span>SRT latency</span>
+                <FieldTitle help="SRT retransmission buffer duration. Higher values tolerate more delay and packet loss but add end-to-end latency.">SRT latency</FieldTitle>
                 <div className="suffix-input"><input type="number" min="20" max="8000" value={form.latencyMs} onChange={(event) => update("latencyMs", event.target.value)} /><span>ms</span></div>
                 <small>60 ms is tuned for reliable cabled LANs. Increase it for lossy or long-distance links.</small>
               </label>
@@ -948,14 +1024,14 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
             {!isRTP && (
 			  <>
 				<div className="field full">
-				  <span>SRT passphrase</span>
+				  <FieldTitle help="Optional SRT encryption secret. SRT requires 10 to 79 bytes and both peers must use the same value.">SRT passphrase</FieldTitle>
 				  <input type="password" value={form.passphrase} onChange={(event) => update("passphrase", event.target.value)} placeholder={form.hasPassphrase ? "Stored; leave blank to keep" : "Optional, 10-79 bytes"} />
 				  {form.hasPassphrase && (
 					<label className="check compact"><input type="checkbox" checked={form.clearPassphrase} onChange={(event) => update("clearPassphrase", event.target.checked)} />Clear stored passphrase</label>
 				  )}
 				</div>
 				<label className="field full">
-				  <span>Elementary RTP session description (SDP)</span>
+				  <FieldTitle help="Required only when SRT carries elementary RTP. It maps dynamic RTP payload types to codecs.">Elementary RTP session description (SDP)</FieldTitle>
 				  <textarea rows={7} value={form.srtSdp} onChange={(event) => update("srtSdp", event.target.value)} spellCheck={false} placeholder="Optional; leave blank for automatic MPEG-TS or RTP/MP2T detection" />
 				  <small>Only required when SRT carries elementary RTP with dynamic payload types. Raw MPEG-TS and RTP/MP2T payload type 33 are detected automatically.</small>
 				</label>
@@ -963,15 +1039,15 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
             )}
 
             <label className="field">
-              <span>Maximum viewers</span>
+              <FieldTitle help="Maximum simultaneous readers accepted for this channel. Dashboard preview and standalone viewers each count as readers.">Maximum viewers</FieldTitle>
               <input type="number" min="0" value={form.maxReaders} onChange={(event) => update("maxReaders", event.target.value)} />
               <small>Zero means unlimited.</small>
             </label>
 
             <div className="field option-stack">
-              <label className="check"><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} />Channel enabled</label>
-              <label className="check"><input type="checkbox" checked={form.automaticPreview} onChange={(event) => update("automaticPreview", event.target.checked)} />Automatic dashboard preview</label>
-              <label className="check"><input type="checkbox" checked={form.useAbsoluteTimestamp} onChange={(event) => update("useAbsoluteTimestamp", event.target.checked)} />Preserve absolute timestamps</label>
+              <label className="check"><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} /><span className="check-copy">Channel enabled <HelpTip label="Channel enabled" content="Starts the configured input and makes output available. Disabling stops listeners and playback without deleting configuration." placement="left" /></span></label>
+              <label className="check"><input type="checkbox" checked={form.automaticPreview} onChange={(event) => update("automaticPreview", event.target.checked)} /><span className="check-copy">Automatic dashboard preview <HelpTip label="Automatic dashboard preview" content="Creates one muted WebRTC reader when this channel is selected and output is ready." placement="left" /></span></label>
+              <label className="check"><input type="checkbox" checked={form.useAbsoluteTimestamp} onChange={(event) => update("useAbsoluteTimestamp", event.target.checked)} /><span className="check-copy">Preserve absolute timestamps <HelpTip label="Preserve absolute timestamps" content="Keeps source timing information through MediaMTX and compatibility output when the source provides usable timestamps." placement="left" /></span></label>
             </div>
           </div>
         </div>
@@ -1041,7 +1117,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
                 {network.management.locked && <small>ENV LOCKED</small>}
               </div>
               <label className="field">
-                <span>Web UI &amp; API interface</span>
+                <FieldTitle help="Address or interface used by the dashboard, API, viewer pages, and WHEP signaling. Changing it requires a Gateway restart.">Web UI &amp; API interface</FieldTitle>
                 <select
                   value={form.managementBindAddress}
                   disabled={network.management.locked}
@@ -1070,7 +1146,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
                 <small>LIVE APPLY</small>
               </div>
               <label className="field">
-                <span>Media interface</span>
+                <FieldTitle help="Address or interface used for SRT, RTP, and WebRTC media listeners. Changes apply live and briefly interrupt streams.">Media interface</FieldTitle>
                 <select value={form.mediaBindAddress} onChange={(event) => changeMediaBinding(event.target.value)}>
                   <BindingOptions
                     value={form.mediaBindAddress}
@@ -1096,17 +1172,17 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
                   if (event.target.checked) onChange({ ...form, mediaBindAddress: form.managementBindAddress });
                 }}
               />
-              Use the same interface for management and media
+              <span className="check-copy">Use the same interface for management and media <HelpTip label="Use the same interface" content="Keeps both interface selections synchronized. This is convenient on a single-LAN host but not required." placement="left" /></span>
             </label>
 
             <h3 className="settings-section">Dashboard and new channels</h3>
             <p className="settings-section-note">Dashboard polling changes immediately. Viewer defaults apply only when a new channel is created.</p>
             <label className="field">
-              <span>Dashboard statistics interval</span>
+              <FieldTitle help="How often the dashboard refreshes channel, transport, and resource counters. Shorter intervals create more API traffic.">Dashboard statistics interval</FieldTitle>
               <div className="suffix-input"><input type="number" min="500" max="10000" value={form.statisticsIntervalMs} onChange={(event) => updateNumber("statisticsIntervalMs", event.target.value)} /><span>ms</span></div>
             </label>
             <label className="field">
-              <span>New-channel maximum viewers</span>
+              <FieldTitle help="Default reader limit copied into newly created channels. Existing channels keep their own limits.">New-channel maximum viewers</FieldTitle>
               <input type="number" min="0" value={form.defaultMaxReaders} onChange={(event) => updateNumber("defaultMaxReaders", event.target.value)} />
               <small>Zero means unlimited.</small>
             </label>
@@ -1114,7 +1190,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
             <h3 className="settings-section">Media plane runtime</h3>
             <p className="settings-section-note">Saving changes below live-applies the shared media service and can briefly interrupt active channels.</p>
             <label className="field">
-              <span>Media server log level</span>
+              <FieldTitle help="Controls MediaMTX log verbosity. Debug is useful temporarily but produces substantially more output.">Media server log level</FieldTitle>
               <select value={form.logLevel} onChange={(event) => update("logLevel", event.target.value as GlobalSettings["logLevel"])}>
                 <option value="error">Error</option>
                 <option value="warn">Warning</option>
@@ -1123,49 +1199,49 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
               </select>
             </label>
             <label className="field">
-              <span>Media read timeout</span>
+              <FieldTitle help="Maximum time MediaMTX waits for incoming media activity before treating a connection as stalled.">Media read timeout</FieldTitle>
               <input value={form.readTimeout} onChange={(event) => update("readTimeout", event.target.value)} placeholder="5s" />
             </label>
             <label className="field">
-              <span>Media write timeout</span>
+              <FieldTitle help="Maximum time MediaMTX waits while sending media before treating a reader or publisher as stalled.">Media write timeout</FieldTitle>
               <input value={form.writeTimeout} onChange={(event) => update("writeTimeout", event.target.value)} placeholder="5s" />
             </label>
             <label className="field">
-              <span>Media write queue size</span>
+              <FieldTitle help="Number of outbound media packets buffered per connection. Larger queues absorb bursts but consume more memory and can add delay.">Media write queue size</FieldTitle>
               <input type="number" min="1" value={form.writeQueueSize} onChange={(event) => updateNumber("writeQueueSize", event.target.value)} />
               <small>Must be a power of two.</small>
             </label>
 
             <h3 className="settings-section">Media plane · UDP transport</h3>
             <label className="field">
-              <span>Maximum payload size</span>
+              <FieldTitle help="Largest UDP payload MediaMTX emits. Keep it below the network MTU after protocol headers to avoid fragmentation.">Maximum payload size</FieldTitle>
               <div className="suffix-input"><input type="number" min="576" max="65507" value={form.udpMaxPayloadSize} onChange={(event) => updateNumber("udpMaxPayloadSize", event.target.value)} /><span>bytes</span></div>
             </label>
             <label className="field">
-              <span>Receive buffer</span>
+              <FieldTitle help="Requested operating-system UDP receive buffer. The host kernel limit can cap the effective value.">Receive buffer</FieldTitle>
               <div className="suffix-input"><input type="number" min="0" max="1073741824" value={form.udpReadBufferSize} onChange={(event) => updateNumber("udpReadBufferSize", event.target.value)} /><span>bytes</span></div>
             </label>
             <label className="field">
-              <span>RTP port start</span>
+              <FieldTitle help="First UDP port available for RTP channels. Existing channel ports must remain within the configured range.">RTP port start</FieldTitle>
               <input type="number" min="1" max="65535" value={form.rtpPortMin} onChange={(event) => updateNumber("rtpPortMin", event.target.value)} />
             </label>
             <label className="field">
-              <span>RTP port end</span>
+              <FieldTitle help="Last UDP port available for RTP channels. The range must not overlap shared listener ports.">RTP port end</FieldTitle>
               <input type="number" min="1" max="65535" value={form.rtpPortMax} onChange={(event) => updateNumber("rtpPortMax", event.target.value)} />
             </label>
 
             <h3 className="settings-section">Media plane · Shared listeners</h3>
             <label className="field">
-              <span>Stream-ID SRT UDP port</span>
+              <FieldTitle help="Shared MediaMTX SRT listener for senders that publish using a channel stream ID.">Stream-ID SRT UDP port</FieldTitle>
               <input type="number" min="1" max="65535" value={listenerPort(form.srtAddress)} onChange={(event) => updateListenerPort("srtAddress", event.target.value)} placeholder="8890" />
               <small>Direct listener for senders that use stream IDs.</small>
             </label>
             <label className="field">
-              <span>WebRTC UDP port</span>
+              <FieldTitle help="Preferred ICE media port used by browsers. Allow this UDP port through the host firewall on the selected media interface.">WebRTC UDP port</FieldTitle>
               <input type="number" min="1" max="65535" value={listenerPort(form.webRTCLocalUDPAddress)} onChange={(event) => updateListenerPort("webRTCLocalUDPAddress", event.target.value)} placeholder="8189" />
             </label>
             <label className="field">
-              <span>WebRTC TCP fallback port</span>
+              <FieldTitle help="Optional ICE-over-TCP fallback for networks where UDP is blocked. UDP remains preferred for lower latency.">WebRTC TCP fallback port</FieldTitle>
               <input type="number" min="1" max="65535" value={listenerPort(form.webRTCLocalTCPAddress)} onChange={(event) => updateListenerPort("webRTCLocalTCPAddress", event.target.value, true)} placeholder="Blank disables" />
               <small>Leave blank to disable TCP fallback.</small>
             </label>
@@ -1176,15 +1252,15 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
                 <p>These listeners use different legacy hosts. Selecting a unified Media interface exits legacy mode.</p>
                 <div className="legacy-address-grid">
                   <label className="field full">
-                    <span>MediaMTX SRT address</span>
+                    <FieldTitle help="Legacy full SRT listener address retained from an older configuration with separate listener hosts.">MediaMTX SRT address</FieldTitle>
                     <input value={form.srtAddress} onChange={(event) => update("srtAddress", event.target.value)} placeholder=":8890" />
                   </label>
                   <label className="field">
-                    <span>WebRTC UDP address</span>
+                    <FieldTitle help="Legacy full WebRTC UDP listener address retained from an older configuration.">WebRTC UDP address</FieldTitle>
                     <input value={form.webRTCLocalUDPAddress} onChange={(event) => update("webRTCLocalUDPAddress", event.target.value)} placeholder=":8189" />
                   </label>
                   <label className="field">
-                    <span>WebRTC TCP fallback</span>
+                    <FieldTitle help="Legacy full WebRTC TCP listener address retained from an older configuration.">WebRTC TCP fallback</FieldTitle>
                     <input value={form.webRTCLocalTCPAddress} onChange={(event) => update("webRTCLocalTCPAddress", event.target.value)} placeholder="Disabled" />
                   </label>
                 </div>
@@ -1193,17 +1269,17 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
 
             <h3 className="settings-section">Media plane · WebRTC discovery</h3>
             <label className="field full">
-              <span>Additional advertised hosts</span>
+              <FieldTitle help="Extra IP addresses or hostnames placed in WebRTC ICE candidates when automatic interface discovery is insufficient.">Additional advertised hosts</FieldTitle>
               <input value={form.webRTCAdditionalHosts} onChange={(event) => update("webRTCAdditionalHosts", event.target.value)} placeholder="192.168.1.10, gateway.local" />
               <small>Comma-separated LAN hostnames or IP addresses.</small>
             </label>
-            <label className="check settings-check full"><input type="checkbox" checked={form.webRTCIPsFromInterfaces} onChange={(event) => update("webRTCIPsFromInterfaces", event.target.checked)} />Advertise addresses discovered from network interfaces</label>
+            <label className="check settings-check full"><input type="checkbox" checked={form.webRTCIPsFromInterfaces} onChange={(event) => update("webRTCIPsFromInterfaces", event.target.checked)} /><span className="check-copy">Advertise addresses discovered from network interfaces <HelpTip label="Advertise discovered addresses" content="Adds suitable local interface addresses to WebRTC ICE candidates. Interface-following media bindings restrict discovery to that interface." placement="left" /></span></label>
             <label className="field">
-              <span>Handshake timeout</span>
+              <FieldTitle help="Maximum time allowed to establish the WebRTC signaling and ICE session before it fails.">Handshake timeout</FieldTitle>
               <input value={form.webRTCHandshakeTimeout} onChange={(event) => update("webRTCHandshakeTimeout", event.target.value)} placeholder="10s" />
             </label>
             <label className="field">
-              <span>Track gather timeout</span>
+              <FieldTitle help="How long MediaMTX waits for source tracks to appear before completing WebRTC session setup.">Track gather timeout</FieldTitle>
               <input value={form.webRTCTrackGatherTimeout} onChange={(event) => update("webRTCTrackGatherTimeout", event.target.value)} placeholder="2s" />
             </label>
           </div>
@@ -1354,6 +1430,99 @@ function BindingContext({ state, activeLabel, desiredLabel, scope, error }: {
   );
 }
 
+export function ResourceFooter({ resources, disconnected = false }: { resources?: ResourceSnapshot; disconnected?: boolean }) {
+  return (
+    <footer className="resource-footer" aria-label="Resource usage">
+      <div className="resource-footer-heading">
+        <span>Resources <HelpTip label="resource scope" content="Gateway measures its own container and the whole host. MediaMTX is isolated and excluded. Warming means CPU needs another sample; stale means the last good values are retained." placement="right" /></span>
+        <small>{disconnected ? resources ? "STALE" : "UNAVAILABLE" : resources ? "LIVE" : "LOADING"}</small>
+      </div>
+      <ResourceRow label="Gateway" scope={resources?.gateway} disconnected={disconnected} />
+      <ResourceRow label="Host" scope={resources?.host} disconnected={disconnected} />
+      <p>Gateway includes compatibility and relay workers. MediaMTX is isolated.</p>
+    </footer>
+  );
+}
+
+function ResourceRow({ label, scope, disconnected }: { label: string; scope?: ResourceScope; disconnected: boolean }) {
+  const available = scope && scope.status !== "unavailable";
+  const displayStatus = disconnected ? available ? "stale" : "unavailable" : scope?.status;
+  const cpuPercent = scope?.cpu.percent ?? null;
+  const memoryPercent = scope?.memory.totalBytes
+    ? scope.memory.usedBytes / scope.memory.totalBytes * 100
+    : null;
+  return (
+    <div className={`resource-row ${displayStatus ?? "unavailable"}`}>
+      <div className="resource-row-heading">
+        <strong>{label}</strong>
+        <small>{resourceStatusLabel(displayStatus)}</small>
+      </div>
+      <div className="resource-metrics">
+        <ResourceMetric
+          label="CPU"
+          scopeLabel={label}
+          help={label === "Gateway"
+            ? `Share of the Gateway container's ${scope ? scope.cpu.capacityCores : "available"} logical CPU cores. Includes FFmpeg and relay workers.`
+            : "CPU busy time across every process on the host."}
+          value={available ? formatResourcePercent(cpuPercent) : "—"}
+          percent={cpuPercent}
+        />
+        <ResourceMetric
+          label="RAM"
+          scopeLabel={label}
+          help={label === "Gateway"
+            ? "Gateway container working memory, excluding inactive file cache, compared with its configured memory limit."
+            : "Memory used across the whole host, calculated from Linux available memory."}
+          value={available ? formatResourceMemory(scope.memory.usedBytes, scope.memory.totalBytes) : "—"}
+          percent={memoryPercent}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ResourceMetric({ label, scopeLabel, help, value, percent }: { label: string; scopeLabel: string; help: string; value: string; percent: number | null }) {
+  const bounded = percent === null ? null : Math.max(0, Math.min(percent, 100));
+  return (
+    <div className="resource-metric">
+      <div><span>{label} <HelpTip label={`${label} resource metric`} content={help} placement="right" /></span><strong>{value}</strong></div>
+      <span
+        className="resource-meter"
+        role={bounded === null ? undefined : "progressbar"}
+        aria-label={bounded === null ? undefined : `${scopeLabel} ${label} utilization`}
+        aria-valuemin={bounded === null ? undefined : 0}
+        aria-valuemax={bounded === null ? undefined : 100}
+        aria-valuenow={bounded === null ? undefined : Math.round(bounded)}
+      ><i style={{ width: `${bounded ?? 0}%` }} /></span>
+    </div>
+  );
+}
+
+export function resourceStatusLabel(status?: ResourceStatus) {
+  if (status === "ok") return "CURRENT";
+  if (status === "warming") return "WARMING";
+  if (status === "stale") return "STALE";
+  return status ? "UNAVAILABLE" : "LOADING";
+}
+
+export function formatResourcePercent(value: number | null) {
+  if (value === null) return "Warming";
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)}%`;
+}
+
+export function formatResourceMemory(used: number, total: number | null) {
+  const usedText = formatCompactBytes(used);
+  return total ? `${usedText} / ${formatCompactBytes(total)}` : usedText;
+}
+
+export function formatCompactBytes(value: number) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  if (value <= 0) return "0 B";
+  const unit = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const amount = value / 1024 ** unit;
+  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
+}
+
 function ConnectionRow({ label, value, secondary = false, openURL = false }: {
   label: string;
   value: string;
@@ -1361,9 +1530,10 @@ function ConnectionRow({ label, value, secondary = false, openURL = false }: {
   openURL?: boolean;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const help = connectionHelp(label);
   return (
     <div className={`connection-row${secondary ? " secondary-row" : ""}`}>
-      <label htmlFor={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}>{label}</label>
+      <label htmlFor={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}>{label}{help && <HelpTip label={label} content={help} placement="right" />}</label>
       <div className="connection-value">
         <input
           id={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}
@@ -1455,27 +1625,31 @@ function CopyButton({ label, value, input }: {
   return <button className="copy-action" type="button" disabled={!value} onClick={() => void copy()} aria-label={`Copy ${label}`}>{feedback || "Copy"}</button>;
 }
 
-function Metric({ label, value, detail, warning = false }: { label: string; value: string; detail: string; warning?: boolean }) {
+function Metric({ label, help, value, detail, warning = false }: { label: string; help?: string; value: string; detail: string; warning?: boolean }) {
   return (
     <div className={warning ? "metric warning" : "metric"}>
-      <span>{label}</span><strong>{value}</strong><small>{detail}</small>
+      <span>{label}{help && <HelpTip label={label} content={help} />}</span><strong>{value}</strong><small>{detail}</small>
     </div>
   );
 }
 
-function InfoLine({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function InfoLine({ label, help, value, mono = false }: { label: string; help?: string; value: string; mono?: boolean }) {
   return (
-    <div className="info-line"><span>{label}</span><code className={mono ? "" : "plain"}>{value}</code></div>
+    <div className="info-line"><span>{label}{help && <HelpTip label={label} content={help} placement="right" />}</span><code className={mono ? "" : "plain"}>{value}</code></div>
   );
 }
 
-function StreamFact({ label, value, warning = false }: { label: string; value: string; warning?: boolean }) {
+function StreamFact({ label, help, value, warning = false }: { label: string; help?: string; value: string; warning?: boolean }) {
   return (
     <div className={warning ? "stream-fact warning" : "stream-fact"}>
-      <span>{label}</span>
+      <span>{label}{help && <HelpTip label={label} content={help} />}</span>
       <strong>{value}</strong>
     </div>
   );
+}
+
+function FieldTitle({ children, help }: { children: ReactNode; help: string }) {
+  return <span className="field-title">{children}<HelpTip label={String(children)} content={help} placement="left" /></span>;
 }
 
 function StreamIdle({ title, detail }: { title: string; detail: string }) {
@@ -1591,7 +1765,30 @@ function ReceiverDetails({ kind, receiver }: {
 }
 
 function MediaFact({ label, value }: { label: string; value: string }) {
-  return <div className="media-fact"><span>{label}</span><strong>{value}</strong></div>;
+  const help = mediaFactHelp(label);
+  return <div className="media-fact"><span>{label}{help && <HelpTip label={label} content={help} />}</span><strong>{value}</strong></div>;
+}
+
+function connectionHelp(label: string) {
+  if (label.includes("SRT URL")) return "Complete SRT caller URL for the encoder, including the selected Gateway host, channel port, and latency.";
+  if (label === "Destination IP") return "Gateway media address the encoder should send to. It follows the active global media interface.";
+  if (label === "Destination port") return "Per-channel UDP listener used by SRT push senders.";
+  if (label === "SRT mode") return "Caller means the encoder initiates the SRT connection to Gateway.";
+  if (label.includes("stream-ID URL")) return "Alternative shared SRT endpoint for MPEG-TS senders that support MediaMTX stream IDs.";
+  if (label.includes("Viewer URL")) return "Standalone multi-channel viewer link with this channel preselected.";
+  if (label === "Iframe embed code") return "HTML snippet for embedding the channel-specific player without dashboard navigation.";
+  if (label === "WHEP API endpoint") return "Low-level WebRTC-HTTP egress endpoint used by compatible players.";
+  return "";
+}
+
+function mediaFactHelp(label: string) {
+  if (label.includes("bitrate")) return "Recent media rate calculated from successive byte counters.";
+  if (label === "Network") return "Packet loss and jitter reported by this browser's WebRTC receiver.";
+  if (label.includes("frame rate")) return "Frames decoded or reported per second for the video track.";
+  if (label === "Frames") return "Cumulative frames decoded and dropped by this browser during the current preview session.";
+  if (label === "Profile" || label === "Level") return "H264 compatibility parameters reported by the source track.";
+  if (label === "Primary codec") return "Codec negotiated for this browser's active receiver.";
+  return "";
 }
 
 function formatTrack(track: Track) {
