@@ -13,6 +13,9 @@ env:
   GATEWAY_IMAGE: webrtc-gateway
   MEDIAMTX_IMAGE: bluenviron/mediamtx:1.20.1
   IMAGE_ARCHIVE: images-linux-amd64.tar.gz
+  RELEASE_TAG: main-latest
+  RELEASE_ARCHIVE: webrtc-gateway-offline-linux-amd64.tar
+  RELEASE_CHECKSUM: webrtc-gateway-offline-linux-amd64.tar.sha256
 
 jobs:
   build:
@@ -108,3 +111,62 @@ jobs:
           path: offline-bundle/
           if-no-files-found: error
           compression-level: 0
+
+  publish:
+    name: Publish anonymous download
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download offline bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: webrtc-gateway-offline-linux-amd64-${{ github.sha }}
+          path: offline-bundle
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --create --file "${RELEASE_ARCHIVE}" --directory offline-bundle .
+          sha256sum "${RELEASE_ARCHIVE}" > "${RELEASE_CHECKSUM}"
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [[ "${main_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "Skipping release because main has advanced to ${main_sha}."
+            exit 0
+          fi
+
+          if gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
+              --raw-field sha="${GITHUB_SHA}" \
+              --field force=true
+            gh release edit "${RELEASE_TAG}" \
+              --title "Latest main offline deployment" \
+              --notes "Automated offline deployment bundle for main commit ${GITHUB_SHA}." \
+              --prerelease
+            gh release upload "${RELEASE_TAG}" \
+              "${RELEASE_ARCHIVE}" \
+              "${RELEASE_CHECKSUM}" \
+              --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              "${RELEASE_ARCHIVE}" \
+              "${RELEASE_CHECKSUM}" \
+              --target "${GITHUB_SHA}" \
+              --title "Latest main offline deployment" \
+              --notes "Automated offline deployment bundle for main commit ${GITHUB_SHA}." \
+              --prerelease
+          fi

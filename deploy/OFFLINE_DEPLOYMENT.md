@@ -4,6 +4,13 @@ This bundle contains the Linux AMD64 Gateway and MediaMTX images required by the
 
 The target server needs Linux on x86-64, Docker Engine, and the Docker Compose plugin. It does not need internet access.
 
+The latest bundle and its checksum can be downloaded without authentication from:
+
+```text
+https://github.com/magnusoverli/webrtc-gateway/releases/download/main-latest/webrtc-gateway-offline-linux-amd64.tar
+https://github.com/magnusoverli/webrtc-gateway/releases/download/main-latest/webrtc-gateway-offline-linux-amd64.tar.sha256
+```
+
 ## Install Or Upgrade
 
 Copy the complete extracted bundle to the target server, enter its directory, and run:

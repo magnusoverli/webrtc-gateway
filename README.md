@@ -27,9 +27,22 @@ Open `http://HOST_IP:8080`. The UI, management API, status endpoints, and WHEP s
 
 ### Offline Deployment
 
-Every push to `main` runs the `CI and offline image` GitHub Actions workflow. After its checks pass, the workflow uploads an artifact named `webrtc-gateway-offline-linux-amd64-COMMIT_SHA`. Download it from the workflow run's **Artifacts** section on a connected machine, extract it, and copy the complete directory to the offline server.
+Every push to `main` runs the `CI and offline image` GitHub Actions workflow. After its checks pass, the workflow updates the public `main-latest` prerelease. Its bundle can be downloaded without a GitHub account. The per-commit Actions artifact remains available as an authenticated backup.
 
-The bundle contains the Gateway image, the pinned MediaMTX image, the Compose configuration, the exact source commit, checksums, and deployment instructions. On the offline Linux AMD64 server, run these commands from the extracted directory:
+Download, verify, and extract the bundle on a connected machine:
+
+```sh
+curl --fail --location --remote-name \
+  https://github.com/magnusoverli/webrtc-gateway/releases/download/main-latest/webrtc-gateway-offline-linux-amd64.tar
+curl --fail --location --remote-name \
+  https://github.com/magnusoverli/webrtc-gateway/releases/download/main-latest/webrtc-gateway-offline-linux-amd64.tar.sha256
+sha256sum --check webrtc-gateway-offline-linux-amd64.tar.sha256
+mkdir webrtc-gateway-offline
+tar --extract --file webrtc-gateway-offline-linux-amd64.tar \
+  --directory webrtc-gateway-offline
+```
+
+The bundle contains the Gateway image, the pinned MediaMTX image, the Compose configuration, the exact source commit, checksums, and deployment instructions. Copy the extracted directory to the offline Linux AMD64 server, enter it, and run:
 
 ```sh
 sha256sum --check SHA256SUMS
@@ -37,7 +50,7 @@ docker load --input images-linux-amd64.tar.gz
 docker compose up -d --no-build --pull never
 ```
 
-The `--no-build --pull never` options guarantee that deployment uses only the transferred images. Loading a newer bundle updates the local `webrtc-gateway:main` tag; running the same Compose command recreates the Gateway container while preserving its named state volume.
+The `--no-build --pull never` options guarantee that deployment uses only the transferred images. Loading a newer bundle updates the local `webrtc-gateway:main` tag; running the same Compose command recreates the Gateway container while preserving its named state volume. The exact build is recorded in `GATEWAY_COMMIT`.
 
 ### Operator Workflow
 
