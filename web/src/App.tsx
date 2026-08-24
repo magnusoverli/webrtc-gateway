@@ -3,13 +3,22 @@ import {
   absolutePath,
   channelHasFault,
   channelStateLabel,
+  hasInputStream,
+  hasOutputStream,
   iframeEmbedCode,
+  interfaceBindingSelector,
   listenerPort,
   managementOrigin,
   mediaHost,
+  parseInterfaceBinding,
   resolveBinding,
+  resolveInterfaceBinding,
+  sampleChannelRates,
   srtListenerURL,
   srtPublishURL,
+  trackKind,
+  type ChannelRateSample,
+  type BindingInterface,
   type Channel,
   type InputMode,
   type Track,
@@ -17,7 +26,7 @@ import {
 import { startSerialPolling } from "./polling";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 import type { WHEPPlayerState } from "./useWHEPPlayer";
-import { codecWarnings } from "./webrtc";
+import { codecWarnings, type PreviewStats, type ReceiverStats, type VideoReceiverStats } from "./webrtc";
 
 type GlobalSettings = {
   managementBindAddress: string;
@@ -44,16 +53,14 @@ type GlobalSettings = {
   updatedAt: string;
 };
 
-type NetworkInterface = {
-  name: string;
-  address: string;
-  family: "IPv4" | "IPv6";
-  loopback: boolean;
-};
+type NetworkInterface = BindingInterface;
 
 type BindingStatus = {
   activeAddress?: string;
+  activeSelection?: string;
   desiredAddress: string;
+  resolvedAddress?: string;
+  resolutionError?: string;
   port?: number;
   restartRequired: boolean;
   locked?: boolean;
@@ -152,7 +159,9 @@ export function App() {
   const [restarting, setRestarting] = useState(false);
   const [restartError, setRestartError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
+  const [streamRates, setStreamRates] = useState<Record<string, { inputBitrateBps: number | null; outputBitrateBps: number | null; deliveryBitrateBps: number | null }>>({});
   const passphraseRequestRef = useRef<AbortController | null>(null);
+  const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
 
   const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
 
@@ -165,6 +174,9 @@ export function App() {
         if (!response.ok) throw new Error(`status ${response.status}`);
         const nextStatus = (await response.json()) as Status;
         if (disposed) return;
+        const sampledRates = sampleChannelRates(nextStatus.channels, rateSamplesRef.current, performance.now());
+        rateSamplesRef.current = sampledRates.samples;
+        setStreamRates(sampledRates.rates);
         setStatus(nextStatus);
         setStatusError("");
         setSelectedID((current) =>
@@ -187,9 +199,12 @@ export function App() {
   useEffect(() => setDeleteError(""), [selectedID]);
 
   const selected = status?.channels.find((item) => item.id === selectedID) ?? null;
+  const selectedRates = selected ? streamRates[selected.id] : undefined;
   const selectedFault = Boolean(selected && channelHasFault(selected));
   const inputLive = Boolean(selected?.available && selected.online);
   const isLive = Boolean(selected?.outputReady);
+  const hasInput = Boolean(selected && hasInputStream(selected));
+  const hasOutput = Boolean(selected && hasOutputStream(selected));
   const preview = useWHEPPlayer({
     whepPath: selected?.whepPath ?? "",
     enabled: Boolean(selected?.automaticPreview && selected.outputReady),
@@ -201,25 +216,28 @@ export function App() {
       : selected.input.mode.startsWith("rtp-") ? codecWarnings(selected.tracks) : []
     : [];
   const selectedIsSRTPush = selected?.input.mode === "srt-push";
+  const managementDesiredAddress = bindingAddress(status?.network.management, status?.network.interfaces ?? []);
+  const mediaDesiredAddress = bindingAddress(status?.network.media, status?.network.interfaces ?? []);
   const managementBinding = resolveBinding(
     status?.network.management.activeAddress,
-    status?.network.management.desiredAddress ?? status?.settings.managementBindAddress ?? "*",
+    managementDesiredAddress || "*",
     status?.network.management.restartRequired ?? false,
     status?.settings.applyState ?? "pending",
   );
   const mediaBinding = resolveBinding(
     status?.network.media.activeAddress,
-    status?.network.media.desiredAddress ?? status?.settings.mediaBindAddress ?? "*",
+    mediaDesiredAddress || "*",
     false,
     status?.settings.applyState ?? "pending",
   );
-  const selectedMediaHost = selectedIsSRTPush
+  const mediaBindingAvailable = !status?.network.media.resolutionError && status?.network.media.activeAddress !== undefined;
+  const selectedMediaHost = selectedIsSRTPush && mediaBindingAvailable
     ? mediaHost(mediaBinding.address, window.location.hostname)
     : "";
-  const selectedSRTURL = selectedIsSRTPush
+  const selectedSRTURL = selectedIsSRTPush && mediaBindingAvailable
     ? srtListenerURL(selected?.input.srt?.port, mediaBinding.address, window.location.hostname, selected?.input.srt?.latencyMs)
     : "";
-  const selectedSRTAdvancedURL = selectedIsSRTPush && selected && !selected.input.srt?.sdp
+  const selectedSRTAdvancedURL = selectedIsSRTPush && selected && !selected.input.srt?.sdp && mediaBindingAvailable
     ? srtPublishURL(selected.path, status?.settings.srtAddress ?? "", mediaBinding.address, window.location.hostname)
     : "";
   const outputOrigin = managementOrigin(
@@ -257,8 +275,13 @@ export function App() {
 
   const restartGateway = async () => {
     if (!status?.gateway.restartRequired || restarting) return;
+    const desiredAddress = status.network.management.resolvedAddress ?? resolveInterfaceBinding(status.settings.managementBindAddress, status.network.interfaces);
+    if (!desiredAddress) {
+      setRestartError(status.network.management.resolutionError ?? "The selected interface has no usable address");
+      return;
+    }
     const desiredOrigin = managementOrigin(
-      status.settings.managementBindAddress,
+      desiredAddress,
       status.network.management.port,
       window.location,
     );
@@ -527,6 +550,8 @@ export function App() {
         <div className="gateway-notices" aria-label="Gateway notices">
           {statusError && <ScopedNotice scope="Gateway" message={`${statusError}. Gateway will retry automatically.`} />}
           {status?.settings.applyState === "error" && <ScopedNotice scope="Gateway" message={`Global settings saved but not applied: ${status.settings.applyError ?? "Media plane apply failed"}`} />}
+          {status?.network.management.resolutionError && <ScopedNotice scope="Gateway" message={`Management interface unavailable: ${status.network.management.resolutionError}`} />}
+          {status?.network.media.resolutionError && <ScopedNotice scope="Gateway" message={`Media interface unavailable: ${status.network.media.resolutionError}`} />}
           {(status?.network.management.restartRequired || status?.gateway.restartRequired) && (
             <div className="restart-banner">
               <div className="restart-banner-content">
@@ -539,7 +564,7 @@ export function App() {
                   </p>
                 </div>
                 {status.gateway.restartRequired && (
-                  <button className="button restart-button" type="button" disabled={restarting} onClick={() => void restartGateway()}>
+                  <button className="button restart-button" type="button" disabled={restarting || Boolean(status.network.management.resolutionError)} onClick={() => void restartGateway()}>
                     {restarting ? "Restarting..." : "Restart Gateway"}
                   </button>
                 )}
@@ -618,7 +643,7 @@ export function App() {
                 <BindingContext
                   state={managementBinding.state}
                   activeLabel={bindingLabel(managementBinding.address, status?.network.interfaces ?? [])}
-                  desiredLabel={managementBinding.desiredAddress ? bindingLabel(managementBinding.desiredAddress, status?.network.interfaces ?? []) : undefined}
+                  desiredLabel={managementBinding.desiredAddress ? bindingLabel(status?.network.management.desiredAddress ?? managementBinding.desiredAddress, status?.network.interfaces ?? []) : undefined}
                   scope="Gateway › Web UI & API interface"
                 />
                 <div className="connection-rows">
@@ -630,75 +655,83 @@ export function App() {
               </article>
             </section>
 
-            <section className="metric-strip" aria-label="Channel metrics">
-              <Metric label="Input" value={formatBytes(selected.inboundBytes)} detail="received total" />
-              <Metric label="Output" value={formatBytes(selected.outboundBytes)} detail="sent total" />
-              <Metric label="Viewers" value={String(selected.readers.length)} detail="active readers" />
-              <Metric label="Input errors" value={String(selected.inboundFramesInError)} detail="frames" warning={selected.inboundFramesInError > 0} />
+            <article className="panel preview-panel">
+              <div className="panel-heading">
+                <div>
+                  <span className="eyebrow">WEBRTC PREVIEW</span>
+                  <h2>{previewTitle(preview.state, selected.automaticPreview, isLive)}</h2>
+                </div>
+                <button
+                  className={selected.automaticPreview ? "toggle active" : "toggle"}
+                  type="button"
+                  disabled={previewSaving || selected.applyState === "deleting"}
+                  aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
+                  aria-pressed={selected.automaticPreview}
+                  onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
+                ><span /></button>
+              </div>
+              <div className="preview-stage">
+                <video ref={preview.videoRef} autoPlay playsInline muted controls />
+                {!selected.automaticPreview && <div className="preview-message overlay-message">
+                  <span className="preview-icon">OFF</span>
+                  <strong>Automatic preview disabled for this channel</strong>
+                  <p>Enable the persisted setting to create a dashboard WHEP reader when output is ready.</p>
+                </div>}
+                {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`}>
+                  <span className="preview-icon">{channelHasFault(selected) ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
+                  <strong>{channelStateLabel(selected)}</strong>
+                  <p>{previewOfflineDetail(selected)}</p>
+                </div>}
+                {selected.automaticPreview && isLive && preview.state === "connecting" && <div className="preview-message overlay-message"><span className="preview-icon pulse">ICE</span><strong>Establishing WHEP session</strong><p>Gathering LAN candidates and waiting for media.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>{preview.error} Retrying automatically.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "playing" && preview.hasAudio && !preview.hasVideo && <div className="preview-message audio-message"><span className="preview-icon">AUD</span><strong>Audio-only stream</strong><p>Audio is playing without a video track.</p></div>}
+              </div>
+            </article>
+
+            <section className="metric-strip" aria-label="Live stream metrics">
+              <Metric label="Input rate" value={hasInput ? formatBitrate(selectedRates?.inputBitrateBps) : "—"} detail={hasInput ? `${formatBytes(selected.inboundBytes)} received` : "waiting for input"} />
+              <Metric label="Output rate" value={hasOutput ? formatBitrate(selectedRates?.outputBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outputInboundBytes)} published` : "no active output"} />
+              <Metric label="Delivery" value={hasOutput ? formatBitrate(selectedRates?.deliveryBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outboundBytes)} sent` : "no active output"} />
+              <Metric label="Viewers" value={hasOutput ? String(selected.readers.length) : "—"} detail={hasOutput ? "active readers" : "no active output"} />
             </section>
 
-            <section className="content-grid">
-              <article className="panel preview-panel">
+            <section className="stream-grid" aria-label="Input and output stream details">
+              <article className="panel stream-panel input-stream-panel">
                 <div className="panel-heading">
                   <div>
-                    <span className="eyebrow">WEBRTC PREVIEW</span>
-                    <h2>{previewTitle(preview.state, selected.automaticPreview, isLive)}</h2>
+                    <span className="eyebrow">INPUT STREAM</span>
+                    <h2>Source media</h2>
                   </div>
-                  <button
-                    className={selected.automaticPreview ? "toggle active" : "toggle"}
-                    type="button"
-                    disabled={previewSaving || selected.applyState === "deleting"}
-                    aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
-                    aria-pressed={selected.automaticPreview}
-                    onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
-                  ><span /></button>
+                  <span className={inputLive ? "stream-state live" : "stream-state"}>{inputLive ? "ONLINE" : "OFFLINE"}</span>
                 </div>
-                <div className="preview-stage">
-                  <video ref={preview.videoRef} autoPlay playsInline muted controls />
-                  {!selected.automaticPreview && <div className="preview-message overlay-message">
-                    <span className="preview-icon">OFF</span>
-                    <strong>Automatic preview disabled for this channel</strong>
-                    <p>Enable the persisted setting to create a dashboard WHEP reader when output is ready.</p>
-                  </div>}
-                  {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`}>
-                    <span className="preview-icon">{channelHasFault(selected) ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
-                    <strong>{channelStateLabel(selected)}</strong>
-                    <p>{previewOfflineDetail(selected)}</p>
-                  </div>}
-                  {selected.automaticPreview && isLive && preview.state === "connecting" && <div className="preview-message overlay-message"><span className="preview-icon pulse">ICE</span><strong>Establishing WHEP session</strong><p>Gathering LAN candidates and waiting for media.</p></div>}
-                  {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>{preview.error} Retrying automatically.</p></div>}
-                  {selected.automaticPreview && isLive && preview.state === "playing" && preview.hasAudio && !preview.hasVideo && <div className="preview-message audio-message"><span className="preview-icon">AUD</span><strong>Audio-only stream</strong><p>Audio is playing without a video track.</p></div>}
-                </div>
-                {preview.state !== "off" && <div className="preview-stat-grid">
-                  <PreviewMetric label="Receive" value={formatBitrate(preview.stats?.bitrateBps ?? 0)} />
-                  <PreviewMetric label="Codec" value={preview.stats?.codec ?? "gathering"} />
-                  <PreviewMetric label="Video" value={preview.stats?.width ? `${preview.stats.width}×${preview.stats.height} · ${Math.round(preview.stats.framesPerSecond)} fps` : "waiting"} />
-                  <PreviewMetric label="Network" value={`${preview.stats?.packetsLost ?? 0} lost · ${(preview.stats?.jitterMs ?? 0).toFixed(1)} ms jitter`} />
-                  <PreviewMetric label="ICE path" value={preview.stats?.icePath ?? "gathering"} wide />
-                  <PreviewMetric label="Frames" value={`${preview.stats?.framesDecoded ?? 0} decoded · ${preview.stats?.framesDropped ?? 0} dropped`} wide />
-                </div>}
+                {hasInput ? <>
+                  <div className="stream-summary">
+                    <StreamFact label="Stream bitrate" value={formatBitrate(selectedRates?.inputBitrateBps)} />
+                    <StreamFact label="Received total" value={formatBytes(selected.inboundBytes)} />
+                    <StreamFact label="Input errors" value={`${selected.inboundFramesInError} frames`} warning={selected.inboundFramesInError > 0} />
+                    <StreamFact label="Tracks" value={String(selected.tracks.length)} />
+                  </div>
+                  <MediaTracks direction="input" tracks={selected.tracks} />
+                </> : <StreamIdle title="No active input" detail="Stream statistics and media details will appear when the source connects." />}
               </article>
 
-              <article className="panel details-panel">
+              <article className="panel stream-panel output-stream-panel">
                 <div className="panel-heading">
                   <div>
-                    <span className="eyebrow">SIGNAL DETAIL</span>
-                    <h2>Tracks</h2>
+                    <span className="eyebrow">OUTPUT STREAM</span>
+                    <h2>Viewer media</h2>
                   </div>
-                  <span className="count">{selected.tracks.length}</span>
+                  <span className={isLive ? "stream-state live" : "stream-state"}>{isLive ? "READY" : "WAITING"}</span>
                 </div>
-                <div className="track-list">
-                  {selected.tracks.map((track, index) => (
-                    <div className="track" key={`${track.codec}-${index}`}>
-                      <span>{index + 1}</span>
-                      <div>
-                        <strong>{track.codec}</strong>
-                        <small>{formatTrack(track)}</small>
-                      </div>
-                    </div>
-                  ))}
-                  {!selected.tracks.length && <div className="empty-state">Track details appear when an input is online.</div>}
-                </div>
+                {hasOutput ? <>
+                  <div className="stream-summary">
+                    <StreamFact label="Stream bitrate" value={formatBitrate(selectedRates?.outputBitrateBps)} />
+                    <StreamFact label="Delivery bitrate" value={formatBitrate(selectedRates?.deliveryBitrateBps)} />
+                    <StreamFact label="Delivered total" value={formatBytes(selected.outboundBytes)} />
+                    <StreamFact label="Preview transport" value={preview.stats?.icePath ?? (selected.automaticPreview ? "Gathering" : "Preview disabled")} />
+                  </div>
+                  <MediaTracks direction="output" tracks={selected.outputTracks} previewStats={preview.stats} />
+                </> : <StreamIdle title="No active output" detail={hasInput ? "The input is connected while browser-compatible output is being prepared." : "Output statistics will appear after an input stream is detected."} />}
                 {selected.tracks.length > 0 && <div className={selected.compatibility.state === "error" ? "compatibility warning" : "compatibility compatible"}>
                   <span>{compatibilityTitle(selected)}</span>
                   {compatibility.map((message) => <p key={message}>{message}</p>)}
@@ -970,7 +1003,8 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
   };
   const managementRestartRequired = network.management.activeAddress === undefined
     ? network.management.restartRequired
-    : network.management.activeAddress !== form.managementBindAddress;
+    : network.management.activeAddress !== resolveInterfaceBinding(form.managementBindAddress, network.interfaces) ||
+      network.management.activeSelection !== form.managementBindAddress;
 
   const changeManagementBinding = (managementBindAddress: string) => {
     onChange({
@@ -1000,7 +1034,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
           {error && <div className="alert editor-alert">{error}</div>}
           <div className="form-grid">
             <h3 className="settings-section">Control and media planes</h3>
-            <p className="settings-section-note">These shared bindings determine where every channel is managed, ingested, and delivered.</p>
+            <p className="settings-section-note">Follow an interface to keep using its current address after DHCP changes, or retain an existing fixed address.</p>
             <div className="binding-card">
               <div className="binding-card-heading">
                 <span>CONTROL PLANE</span>
@@ -1189,12 +1223,34 @@ function BindingOptions({ value, interfaces, includeCustom = false }: {
   interfaces: NetworkInterface[];
   includeCustom?: boolean;
 }) {
-  const available = value === "*" || value === "custom" || interfaces.some((item) => item.address === value);
+  const selectedInterface = parseInterfaceBinding(value);
+  const selectorCounts = new Map<string, number>();
+  for (const item of interfaces) {
+    const selector = interfaceBindingSelector(item);
+    selectorCounts.set(selector, (selectorCounts.get(selector) ?? 0) + 1);
+  }
+  const interfaceOptions = interfaces.filter((item) => selectorCounts.get(interfaceBindingSelector(item)) === 1);
+  const fixedOptions = interfaces.filter((item, index, all) =>
+    all.findIndex((candidate) => candidate.address === item.address) === index,
+  );
+  const fixedAddress = value !== "*" && value !== "custom" && selectedInterface === null;
+  const fixedAvailable = fixedAddress && fixedOptions.some((item) => item.address === value);
+  const available = value === "*" || value === "custom" || fixedAddress ||
+    selectedInterface !== null && interfaceOptions.some((item) => interfaceBindingSelector(item) === value);
   return (
     <>
       <option value="*">All interfaces</option>
       {(includeCustom || value === "custom") && <option value="custom">Legacy custom addresses</option>}
-      {interfaces.map((item) => <option key={item.address} value={item.address}>{interfaceLabel(item)}</option>)}
+      {fixedAddress && !fixedAvailable && <option value={value}>Fixed address - {value} (unavailable)</option>}
+      {interfaceOptions.length > 0 && <optgroup label="Follow interface">
+        {interfaceOptions.map((item) => {
+          const selector = interfaceBindingSelector(item);
+          return <option key={selector} value={selector}>{interfaceLabel(item)}</option>;
+        })}
+      </optgroup>}
+      {fixedOptions.length > 0 && <optgroup label="Fixed address">
+        {fixedOptions.map((item) => <option key={item.address} value={item.address}>{interfaceLabel(item)}</option>)}
+      </optgroup>}
       {!available && <option value={value}>{value} (current, unavailable)</option>}
     </>
   );
@@ -1407,14 +1463,135 @@ function Metric({ label, value, detail, warning = false }: { label: string; valu
   );
 }
 
-function PreviewMetric({ label, value, wide = false }: { label: string; value: string; wide?: boolean }) {
-  return <div className={wide ? "preview-stat wide" : "preview-stat"}><span>{label}</span><strong>{value}</strong></div>;
-}
-
 function InfoLine({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="info-line"><span>{label}</span><code className={mono ? "" : "plain"}>{value}</code></div>
   );
+}
+
+function StreamFact({ label, value, warning = false }: { label: string; value: string; warning?: boolean }) {
+  return (
+    <div className={warning ? "stream-fact warning" : "stream-fact"}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function StreamIdle({ title, detail }: { title: string; detail: string }) {
+  return <div className="stream-idle"><strong>{title}</strong><p>{detail}</p></div>;
+}
+
+function MediaTracks({ direction, tracks, previewStats }: {
+  direction: "input" | "output";
+  tracks: Track[];
+  previewStats?: PreviewStats | null;
+}) {
+  if (!tracks.length) {
+    return <div className="empty-state stream-empty">{direction === "input" ? "Track details appear when an input is online." : "Output track details appear when browser-ready media is published."}</div>;
+  }
+
+  const groups = (["video", "audio", "unknown"] as const).map((kind) => ({
+    kind,
+    tracks: tracks.filter((track) => trackKind(track) === kind),
+  })).filter((group) => group.tracks.length > 0);
+
+  return (
+    <div className="media-domains">
+      {groups.map((group) => (
+        <section className="media-domain" key={group.kind}>
+          <div className="media-domain-heading">
+            <span>{group.kind === "unknown" ? "OTHER" : group.kind.toUpperCase()}</span>
+            <small>{group.tracks.length} {group.tracks.length === 1 ? "track" : "tracks"}</small>
+          </div>
+          {direction === "output" && group.kind !== "unknown" && <ReceiverDetails
+            kind={group.kind}
+            receiver={group.kind === "video" ? previewStats?.video : previewStats?.audio}
+          />}
+          {group.tracks.map((track, index) => (
+            <MediaTrack
+              key={`${track.codec}-${index}`}
+              track={track}
+              kind={group.kind}
+              direction={direction}
+            />
+          ))}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function MediaTrack({ track, kind, direction }: {
+  track: Track;
+  kind: "video" | "audio" | "unknown";
+  direction: "input" | "output";
+}) {
+  const facts: Array<{ label: string; value: string }> = [];
+  if (kind === "video") {
+    facts.push(
+      { label: "Resolution", value: formatResolution(undefined, undefined, track) },
+      { label: "Frame rate", value: formatFrameRate(undefined, track) },
+      { label: "Profile", value: stringTrackProperty(track, "profile") || "Not reported" },
+    );
+    const level = stringTrackProperty(track, "level");
+    if (level) facts.push({ label: "Level", value: level });
+  } else if (kind === "audio") {
+    facts.push(
+      { label: "Sample rate", value: formatSampleRate(numberTrackProperty(track, "sampleRate")) },
+      { label: "Channels", value: formatChannels(numberTrackProperty(track, "channelCount")) },
+    );
+  } else {
+    facts.push({ label: "Metadata", value: formatTrack(track) });
+  }
+
+  return (
+    <div className="media-track">
+      <div className="media-track-heading">
+        <span>{kind === "video" ? "VID" : kind === "audio" ? "AUD" : "DAT"}</span>
+        <div><strong>{track.codec}</strong><small>{direction === "input" ? "Detected at ingest" : "Published to viewers"}</small></div>
+      </div>
+      <div className="media-fact-grid">
+        {facts.map((fact) => <MediaFact key={fact.label} label={fact.label} value={fact.value} />)}
+      </div>
+    </div>
+  );
+}
+
+function ReceiverDetails({ kind, receiver }: {
+  kind: "video" | "audio";
+  receiver?: ReceiverStats | VideoReceiverStats;
+}) {
+  if (!receiver) {
+    return <div className="media-receiver idle"><span>BROWSER RECEIVER</span><p>Preview telemetry is waiting for this media track.</p></div>;
+  }
+
+  const facts = [
+    { label: "Primary codec", value: receiver.codec },
+    { label: "Receive bitrate", value: formatBitrate(receiver.bitrateBps) },
+    { label: "Network", value: `${receiver.packetsLost} lost · ${receiver.jitterMs.toFixed(1)} ms jitter` },
+  ];
+  if (kind === "video") {
+    const video = receiver as VideoReceiverStats;
+    facts.splice(1, 0,
+      { label: "Decoded resolution", value: video.width && video.height ? `${video.width} × ${video.height}` : "Not reported" },
+      { label: "Decoded frame rate", value: video.framesPerSecond ? `${video.framesPerSecond.toFixed(video.framesPerSecond % 1 === 0 ? 0 : 1)} fps` : "Not reported" },
+    );
+    facts.push({ label: "Frames", value: `${video.framesDecoded} decoded · ${video.framesDropped} dropped` });
+  }
+
+  return (
+    <div className="media-receiver">
+      <span>BROWSER RECEIVER · {kind === "video" ? "VIDEO" : "AUDIO"} AGGREGATE</span>
+      <div className="media-fact-grid">
+        {facts.map((fact) => <MediaFact key={fact.label} label={fact.label} value={fact.value} />)}
+      </div>
+    </div>
+  );
+}
+
+function MediaFact({ label, value }: { label: string; value: string }) {
+  return <div className="media-fact"><span>{label}</span><strong>{value}</strong></div>;
 }
 
 function formatTrack(track: Track) {
@@ -1423,6 +1600,40 @@ function formatTrack(track: Track) {
     .filter(([, value]) => value !== null && value !== "" && value !== 0)
     .map(([key, value]) => `${key} ${value}`);
   return props.join(" · ") || "media track";
+}
+
+function numberTrackProperty(track: Track, key: string) {
+  const value = track.codecProps?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function stringTrackProperty(track: Track, key: string) {
+  const value = track.codecProps?.[key];
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function formatResolution(width: number | undefined, height: number | undefined, track: Track) {
+  const resolvedWidth = width || numberTrackProperty(track, "width");
+  const resolvedHeight = height || numberTrackProperty(track, "height");
+  return resolvedWidth && resolvedHeight ? `${resolvedWidth} × ${resolvedHeight}` : "Not reported";
+}
+
+function formatFrameRate(value: number | undefined, track: Track) {
+  const resolved = value || numberTrackProperty(track, "frameRate") || numberTrackProperty(track, "fps");
+  if (resolved) return `${resolved.toFixed(resolved % 1 === 0 ? 0 : 1)} fps`;
+  return "Not reported";
+}
+
+function formatSampleRate(value: number) {
+  if (!value) return "Not reported";
+  return value >= 1000 ? `${value / 1000} kHz` : `${value} Hz`;
+}
+
+function formatChannels(value: number) {
+  if (!value) return "Not reported";
+  if (value === 1) return "1 · mono";
+  if (value === 2) return "2 · stereo";
+  return String(value);
 }
 
 function inputModeLabel(mode: InputMode) {
@@ -1460,7 +1671,8 @@ function compatibilityTitle(item: Channel) {
   return item.input.mode.startsWith("rtp-") && codecWarnings(item.tracks).length ? "CHECK PLAYBACK" : "DIRECT PLAYBACK";
 }
 
-function formatBitrate(bitsPerSecond: number) {
+function formatBitrate(bitsPerSecond: number | null | undefined) {
+  if (bitsPerSecond === null || bitsPerSecond === undefined) return "Measuring";
   if (bitsPerSecond < 1000) return `${Math.round(bitsPerSecond)} bps`;
   if (bitsPerSecond < 1_000_000) return `${(bitsPerSecond / 1000).toFixed(1)} kbps`;
   return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
@@ -1473,8 +1685,16 @@ function interfaceLabel(item: NetworkInterface) {
 function bindingLabel(value: string, interfaces: NetworkInterface[]) {
   if (value === "*") return "All interfaces";
   if (value === "custom") return "Legacy custom addresses";
+  const selected = parseInterfaceBinding(value);
+  if (selected) {
+    const matches = interfaces.filter((candidate) => candidate.name === selected.name && candidate.family === selected.family);
+    if (matches.length > 1) return `Follow ${selected.name} ${selected.family} (multiple addresses; select a fixed address)`;
+    return matches[0]
+      ? `Follow ${selected.name} ${selected.family} - current ${matches[0].address}`
+      : `Follow ${selected.name} ${selected.family} (unavailable)`;
+  }
   const item = interfaces.find((candidate) => candidate.address === value);
-  return item ? interfaceLabel(item) : `${value} (unavailable)`;
+  return item ? `Fixed ${value} (${item.name}, ${item.family})` : `Fixed ${value} (unavailable)`;
 }
 
 function listenerAddress(bindAddress: string, currentAddress: string, port: string, disableWhenBlank = false) {
@@ -1484,10 +1704,15 @@ function listenerAddress(bindAddress: string, currentAddress: string, port: stri
   const currentHost = currentAddress.match(/^(.*):\d*$/)?.[1] ?? "";
   const host = bindAddress === "custom"
     ? currentHost
-    : bindAddress === "*"
+    : bindAddress === "*" || parseInterfaceBinding(bindAddress)
       ? ""
       : bindAddress.includes(":") ? `[${bindAddress.replace(/^\[|\]$/g, "")}]` : bindAddress;
   return `${host}:${port}`;
+}
+
+function bindingAddress(binding: BindingStatus | undefined, interfaces: NetworkInterface[]) {
+  if (!binding) return "";
+  return binding.resolvedAddress ?? resolveInterfaceBinding(binding.desiredAddress, interfaces);
 }
 
 function nextSRTListenPort(status: Status | null) {

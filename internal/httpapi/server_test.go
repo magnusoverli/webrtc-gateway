@@ -16,17 +16,23 @@ import (
 	"webrtc-gateway/internal/channel"
 	"webrtc-gateway/internal/compatibility"
 	"webrtc-gateway/internal/mediamtx"
+	"webrtc-gateway/internal/networkbind"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
 )
 
 type fakeMediaMTX struct {
 	status mediamtx.Status
+	global mediamtx.GlobalConfig
 	err    error
 }
 
 func (f fakeMediaMTX) Status(context.Context) (mediamtx.Status, error) {
 	return f.status, f.err
+}
+
+func (f fakeMediaMTX) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) {
+	return f.global, f.err
 }
 
 type fakeChannels struct {
@@ -119,8 +125,86 @@ func TestStatusEndpoint(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", res.Code)
 	}
-	if body := res.Body.String(); !strings.Contains(body, `"name":"Demo"`) || !strings.Contains(body, `"version":"1.20.1"`) || !strings.Contains(body, `"management":{"activeAddress":"*","desiredAddress":"*","port":8080`) {
+	if body := res.Body.String(); !strings.Contains(body, `"name":"Demo"`) || !strings.Contains(body, `"version":"1.20.1"`) || !strings.Contains(body, `"management":{"activeAddress":"*","activeSelection":"*","desiredAddress":"*","resolvedAddress":"*","port":8080`) {
 		t.Fatalf("unexpected response body: %s", body)
+	}
+}
+
+func TestStatusResolvesInterfaceFollowingBindings(t *testing.T) {
+	value := settings.Defaults(time.Now())
+	value.ManagementBindAddress = "interface:ipv4:eth0"
+	value.MediaBindAddress = "interface:ipv4:eth0"
+	value.ApplyState = settings.ApplyApplied
+	handler, err := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MediaMTX: fakeMediaMTX{global: mediamtx.GlobalConfig{
+			SRTAddress: "192.0.2.20:8890", WebRTCLocalUDPAddress: "192.0.2.20:8189", WebRTCLocalTCPAddress: "192.0.2.20:8189",
+		}},
+		Channels:        fakeChannels{},
+		Settings:        fakeSettings{value: value},
+		MediaMTXWHEPURL: "http://127.0.0.1:1",
+		Management:      ManagementBinding{ActiveAddress: "192.0.2.20", Selection: "interface:ipv4:eth0", Port: 8080},
+		Interfaces: func() ([]networkbind.InterfaceAddress, error) {
+			return []networkbind.InterfaceAddress{{Name: "eth0", Address: "192.0.2.20", Family: networkbind.IPv4}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	body := res.Body.String()
+	if res.Code != http.StatusOK || !strings.Contains(body, `"desiredAddress":"interface:ipv4:eth0","resolvedAddress":"192.0.2.20"`) ||
+		!strings.Contains(body, `"media":{"activeAddress":"192.0.2.20","desiredAddress":"interface:ipv4:eth0","resolvedAddress":"192.0.2.20"`) {
+		t.Fatalf("response = %d %s", res.Code, body)
+	}
+}
+
+func TestStatusKeepsAppliedMediaAddressUntilReconciliation(t *testing.T) {
+	value := settings.Defaults(time.Now())
+	value.MediaBindAddress = "interface:ipv4:eth0"
+	value.ApplyState = settings.ApplyApplied
+	handler, err := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MediaMTX: fakeMediaMTX{global: mediamtx.GlobalConfig{
+			SRTAddress: "192.0.2.20:8890", WebRTCLocalUDPAddress: "192.0.2.20:8189", WebRTCLocalTCPAddress: "192.0.2.20:8189",
+		}},
+		Channels: fakeChannels{}, Settings: fakeSettings{value: value}, MediaMTXWHEPURL: "http://127.0.0.1:1",
+		Management: ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
+		Interfaces: func() ([]networkbind.InterfaceAddress, error) {
+			return []networkbind.InterfaceAddress{{Name: "eth0", Address: "192.0.2.30", Family: networkbind.IPv4}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	body := res.Body.String()
+	if res.Code != http.StatusOK || !strings.Contains(body,
+		`"media":{"activeAddress":"192.0.2.20","desiredAddress":"interface:ipv4:eth0","resolvedAddress":"192.0.2.30"`) {
+		t.Fatalf("response = %d %s", res.Code, body)
+	}
+}
+
+func TestStatusRequiresRestartWhenBindingModeChangesAtSameAddress(t *testing.T) {
+	value := settings.Defaults(time.Now())
+	value.ManagementBindAddress = "interface:ipv4:eth0"
+	handler, err := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MediaMTX: fakeMediaMTX{},
+		Channels: fakeChannels{}, Settings: fakeSettings{value: value}, MediaMTXWHEPURL: "http://127.0.0.1:1",
+		Management: ManagementBinding{ActiveAddress: "192.0.2.20", Selection: "192.0.2.20", Port: 8080},
+		Interfaces: func() ([]networkbind.InterfaceAddress, error) {
+			return []networkbind.InterfaceAddress{{Name: "eth0", Address: "192.0.2.20", Family: networkbind.IPv4}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"restartRequired":true`) {
+		t.Fatalf("response = %d %s", res.Code, res.Body.String())
 	}
 }
 
@@ -139,6 +223,34 @@ func TestFocusedChannelEndpointIncludesRuntimeAndPlayerPaths(t *testing.T) {
 		!strings.Contains(res.Body.String(), `"viewerPath":"/view/channel-1"`) ||
 		!strings.Contains(res.Body.String(), `"automaticPreview":true`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+}
+
+func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
+	inputTime := "2026-08-23T20:00:00Z"
+	outputTime := "2026-08-23T20:00:01Z"
+	channels := fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Name: "Demo", Path: "demo", Enabled: true,
+	}}}
+	router := &fakeCompatibility{state: compatibility.State{
+		State: compatibility.StateReady, Mode: compatibility.ModeTranscoded,
+		OutputPath: "compat-channel-1", Reasons: []string{},
+	}}
+	handler := newTestHandlerWithCompatibility(t, fakeMediaMTX{status: mediamtx.Status{
+		Channels: []mediamtx.Channel{
+			{Name: "demo", Available: true, Online: true, AvailableTime: &inputTime, InboundBytes: 1000},
+			{Name: "compat-channel-1", Available: true, Online: true, AvailableTime: &outputTime, InboundBytes: 700, OutboundBytes: 1400},
+		},
+	}}, channels, "http://127.0.0.1:1", router)
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	body := res.Body.String()
+	if res.Code != http.StatusOK || !strings.Contains(body, `"inboundBytes":1000`) ||
+		!strings.Contains(body, `"outputInboundBytes":700`) ||
+		!strings.Contains(body, `"outputAvailableTime":"2026-08-23T20:00:01Z"`) ||
+		!strings.Contains(body, `"outboundBytes":1400`) {
+		t.Fatalf("response = %d %s", res.Code, body)
 	}
 }
 
@@ -170,7 +282,7 @@ func TestRestartEndpointSignalsAndReportsPendingRestart(t *testing.T) {
 	handler, err := New(Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MediaMTX: fakeMediaMTX{},
 		Channels: fakeChannels{}, Settings: fakeSettings{value: value},
-		MediaMTXWHEPURL: "http://127.0.0.1:1", Management: ManagementBinding{ActiveAddress: "*", Port: 8080},
+		MediaMTXWHEPURL: "http://127.0.0.1:1", Management: ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
 		Restart: func() { restarted <- struct{}{} },
 	})
 	if err != nil {
@@ -335,9 +447,10 @@ func TestStatusDoesNotReuseCompatibilityDecisionForNewSource(t *testing.T) {
 		Tracks: []mediamtx.Track{{Codec: "H264"}},
 	}
 	newRuntime := mediamtx.Channel{
-		Name: "demo", Available: true, Online: true,
-		Source: &mediamtx.PathSource{Type: "srtConn", ID: "new"},
-		Tracks: []mediamtx.Track{{Codec: "H265"}},
+		Name: "demo", Available: true, Online: true, InboundBytes: 1000, OutboundBytes: 900,
+		Source:  &mediamtx.PathSource{Type: "srtConn", ID: "new"},
+		Readers: []mediamtx.PathReader{{Type: "webRTCSession", ID: "reader-1"}},
+		Tracks:  []mediamtx.Track{{Codec: "H265"}},
 	}
 	router := &fakeCompatibility{state: compatibility.State{
 		State: compatibility.StateReady, Mode: compatibility.ModeDirect, OutputPath: "demo",
@@ -350,7 +463,13 @@ func TestStatusDoesNotReuseCompatibilityDecisionForNewSource(t *testing.T) {
 
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"state":"probing"`) || !strings.Contains(res.Body.String(), `"outputReady":false`) {
+	body := res.Body.String()
+	if res.Code != http.StatusOK || !strings.Contains(body, `"state":"probing"`) ||
+		!strings.Contains(body, `"outputReady":false`) ||
+		!strings.Contains(body, `"outputInboundBytes":0`) ||
+		!strings.Contains(body, `"outboundBytes":0`) ||
+		!strings.Contains(body, `"readers":[]`) ||
+		!strings.Contains(body, `"outputTracks":[]`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
 	}
 }
@@ -440,7 +559,7 @@ func TestStatusDoesNotRequireRestartWhenManagementBindingLocked(t *testing.T) {
 		MediaMTXWHEPURL: "http://127.0.0.1:1",
 		Version:         "test",
 		StartedAt:       time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC),
-		Management:      ManagementBinding{ActiveAddress: "192.0.2.10", Port: 8080, Locked: true},
+		Management:      ManagementBinding{ActiveAddress: "192.0.2.10", Selection: "192.0.2.10", Port: 8080, Locked: true},
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -505,7 +624,7 @@ func newTestHandlerWithCompatibility(t *testing.T, media mediaStatusReader, chan
 		MediaMTXWHEPURL: whepURL,
 		Version:         "test",
 		StartedAt:       time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC),
-		Management:      ManagementBinding{ActiveAddress: "*", Port: 8080},
+		Management:      ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

@@ -106,28 +106,35 @@ func (s *SQLiteStore) Get(ctx context.Context) (Settings, error) {
 	return value, nil
 }
 
-func (s *SQLiteStore) ChannelPortPolicy(ctx context.Context) (int, int, string, []int, error) {
+func (s *SQLiteStore) MediaPolicy(ctx context.Context) (int, int, string, string, []int, error) {
 	value, err := s.Get(ctx)
 	if err != nil {
-		return 0, 0, "", nil, err
+		return 0, 0, "", "", nil, err
 	}
-	srtPort, err := listenerPort("srtAddress", value.SRTAddress, false)
+	interfaces, err := interfacesFor(value.MediaBindAddress)
 	if err != nil {
-		return 0, 0, "", nil, err
+		return 0, 0, "", "", nil, err
 	}
-	webrtcPort, err := listenerPort("webRTCLocalUDPAddress", value.WebRTCLocalUDPAddress, false)
+	effective, resolved, _, err := ResolveMedia(value, interfaces)
 	if err != nil {
-		return 0, 0, "", nil, err
+		return 0, 0, "", "", nil, err
 	}
-	return value.RTPPortMin, value.RTPPortMax, value.SRTAddress, []int{srtPort, webrtcPort}, nil
+	srtPort, err := listenerPort("srtAddress", effective.SRTAddress, false)
+	if err != nil {
+		return 0, 0, "", "", nil, err
+	}
+	webrtcPort, err := listenerPort("webRTCLocalUDPAddress", effective.WebRTCLocalUDPAddress, false)
+	if err != nil {
+		return 0, 0, "", "", nil, err
+	}
+	return value.RTPPortMin, value.RTPPortMax, effective.SRTAddress, resolved, []int{srtPort, webrtcPort}, nil
 }
 
-func (s *SQLiteStore) MediaBindAddress(ctx context.Context) (string, error) {
-	value, err := s.Get(ctx)
-	if err != nil {
-		return "", err
+func interfacesFor(selector string) ([]networkbind.InterfaceAddress, error) {
+	if !networkbind.IsInterfaceSelector(selector) {
+		return nil, nil
 	}
-	return value.MediaBindAddress, nil
+	return networkbind.Interfaces()
 }
 
 func (s *SQLiteStore) Update(ctx context.Context, value Settings) error {

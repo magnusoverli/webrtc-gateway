@@ -21,8 +21,7 @@ type PathManager interface {
 }
 
 type PortPolicy interface {
-	ChannelPortPolicy(context.Context) (rtpMinimum, rtpMaximum int, srtAddress string, reservedUDPPorts []int, err error)
-	MediaBindAddress(context.Context) (string, error)
+	MediaPolicy(context.Context) (rtpMinimum, rtpMaximum int, srtAddress, mediaBind string, reservedUDPPorts []int, err error)
 }
 
 type SRTListener struct {
@@ -161,7 +160,7 @@ func (s *Service) validateUDPPort(ctx context.Context, draft Draft, excludeID st
 		port = draft.Input.SRT.Port
 	}
 	if s.portPolicy != nil {
-		minimum, maximum, _, reserved, err := s.portPolicy.ChannelPortPolicy(ctx)
+		minimum, maximum, _, _, reserved, err := s.portPolicy.MediaPolicy(ctx)
 		if err != nil {
 			return err
 		}
@@ -293,6 +292,24 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
+	return s.reconcileWithMedia(ctx, items, "", "")
+}
+
+func (s *Service) ReconcileMedia(ctx context.Context, mediaBind, srtAddress string) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	items, err := s.store.List(ctx)
+	if err != nil {
+		return err
+	}
+	return s.reconcileWithMedia(ctx, items, mediaBind, srtAddress)
+}
+
+func (s *Service) reconcileWithMedia(ctx context.Context, items []Channel, mediaBind, srtAddress string) error {
 	var failures []error
 	for _, item := range items {
 		if item.ApplyState == ApplyDeleting {
@@ -301,7 +318,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 			continue
 		}
-		if _, err := s.apply(ctx, item); err != nil {
+		var err error
+		if mediaBind == "" {
+			_, err = s.apply(ctx, item)
+		} else {
+			_, err = s.applyWithMedia(ctx, item, mediaBind, srtAddress)
+		}
+		if err != nil {
 			failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
 		}
 	}
@@ -365,18 +388,30 @@ func (s *Service) ReconcileSRTListeners(ctx context.Context) error {
 }
 
 func (s *Service) apply(ctx context.Context, item Channel) (Channel, error) {
+	if !item.Enabled {
+		return s.applyWithMedia(ctx, item, networkbind.Custom, "")
+	}
+	mediaBind := networkbind.Custom
+	srtAddress := ""
+	var err error
+	if s.portPolicy != nil {
+		_, _, srtAddress, mediaBind, _, err = s.portPolicy.MediaPolicy(ctx)
+	}
+	if err != nil {
+		return s.applyResult(ctx, item, err)
+	}
+	return s.applyWithMedia(ctx, item, mediaBind, srtAddress)
+}
+
+func (s *Service) applyWithMedia(ctx context.Context, item Channel, mediaBind, srtAddress string) (Channel, error) {
 	var applyErr error
 	if item.Enabled {
-		mediaBind := networkbind.Custom
-		if s.portPolicy != nil {
-			mediaBind, applyErr = s.portPolicy.MediaBindAddress(ctx)
-		}
 		if !isSRTMode(item.Input.Mode) && s.srt != nil {
 			applyErr = errors.Join(applyErr, s.srt.Stop(ctx, item.ID))
 		}
 		var ingestPlan *SRTIngestPlan
 		if applyErr == nil && isSRTMode(item.Input.Mode) && s.srt != nil {
-			plan, err := s.prepareSRTIngest(ctx, item, mediaBind)
+			plan, err := s.prepareSRTIngest(ctx, item, mediaBind, srtAddress)
 			applyErr = errors.Join(applyErr, err)
 			ingestPlan = &plan
 		}
@@ -399,6 +434,10 @@ func (s *Service) apply(ctx context.Context, item Channel) (Channel, error) {
 		applyErr = errors.Join(applyErr, s.media.DeletePath(ctx, item.Path))
 	}
 
+	return s.applyResult(ctx, item, applyErr)
+}
+
+func (s *Service) applyResult(ctx context.Context, item Channel, applyErr error) (Channel, error) {
 	if applyErr != nil {
 		item.ApplyState = ApplyError
 		item.ApplyError = applyErr.Error()
@@ -418,37 +457,34 @@ func (s *Service) apply(ctx context.Context, item Channel) (Channel, error) {
 
 func (s *Service) applySRTListener(ctx context.Context, item Channel) error {
 	mediaBind := networkbind.Custom
+	srtAddress := ""
 	if s.portPolicy != nil {
 		var err error
-		mediaBind, err = s.portPolicy.MediaBindAddress(ctx)
+		_, _, srtAddress, mediaBind, _, err = s.portPolicy.MediaPolicy(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	return s.applySRTListenerWithBind(ctx, item, mediaBind)
+	return s.applySRTListenerWithBind(ctx, item, mediaBind, srtAddress)
 }
 
-func (s *Service) applySRTListenerWithBind(ctx context.Context, item Channel, mediaBind string) error {
+func (s *Service) applySRTListenerWithBind(ctx context.Context, item Channel, mediaBind, srtAddress string) error {
 	if s.srt == nil {
 		return nil
 	}
 	if !item.Enabled || !isSRTMode(item.Input.Mode) {
 		return s.srt.Stop(ctx, item.ID)
 	}
-	plan, err := s.prepareSRTIngest(ctx, item, mediaBind)
+	plan, err := s.prepareSRTIngest(ctx, item, mediaBind, srtAddress)
 	if err != nil {
 		return err
 	}
 	return s.srt.Ensure(ctx, plan)
 }
 
-func (s *Service) prepareSRTIngest(ctx context.Context, item Channel, mediaBind string) (SRTIngestPlan, error) {
+func (s *Service) prepareSRTIngest(ctx context.Context, item Channel, mediaBind, destination string) (SRTIngestPlan, error) {
 	if s.portPolicy == nil {
 		return SRTIngestPlan{}, errors.New("SRT ingest destination is unavailable")
-	}
-	_, _, destination, _, err := s.portPolicy.ChannelPortPolicy(ctx)
-	if err != nil {
-		return SRTIngestPlan{}, err
 	}
 	srt := item.Input.SRT
 	return s.srt.Prepare(ctx, SRTListener{

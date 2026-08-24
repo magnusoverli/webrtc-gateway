@@ -92,6 +92,7 @@ func main() {
 		StartedAt:       time.Now().UTC(),
 		Management: httpapi.ManagementBinding{
 			ActiveAddress: activeManagementBind,
+			Selection:     globalSettings.ManagementBindAddress,
 			Port:          managementPort,
 			Locked:        managementLocked,
 		},
@@ -124,6 +125,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if !managementLocked && networkbind.IsInterfaceSelector(globalSettings.ManagementBindAddress) {
+		go watchManagementBinding(ctx, logger, globalSettings.ManagementBindAddress, activeManagementBind, 5*time.Second, restartRequests)
+	}
 	controller := reconcile.New(logger, mediaClient, 5*time.Second, settingsService, channelService)
 	go controller.Run(ctx)
 	go compatibilityManager.Run(ctx)
@@ -163,7 +167,64 @@ func main() {
 	}
 }
 
+func watchManagementBinding(
+	ctx context.Context,
+	logger *slog.Logger,
+	selector string,
+	activeAddress string,
+	interval time.Duration,
+	restartRequests chan<- struct{},
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			resolved, changed, err := managementBindingChanged(selector, activeAddress, networkbind.Interfaces)
+			if err != nil {
+				logger.Warn("management interface check deferred", "error", err)
+				continue
+			}
+			if !changed {
+				continue
+			}
+			logger.Info("management interface address changed; restarting Gateway", "from", activeAddress, "to", resolved)
+			select {
+			case restartRequests <- struct{}{}:
+			default:
+			}
+			return
+		}
+	}
+}
+
+func managementBindingChanged(
+	selector string,
+	activeAddress string,
+	interfaces func() ([]networkbind.InterfaceAddress, error),
+) (resolved string, changed bool, err error) {
+	addresses, err := interfaces()
+	if err != nil {
+		return "", false, err
+	}
+	resolved, err = networkbind.Resolve(selector, addresses, false)
+	if err != nil {
+		return "", false, err
+	}
+	return resolved, resolved != activeAddress, nil
+}
+
 func managementListener(configured, desired string) (address, activeBind string, port int, locked bool, err error) {
+	return managementListenerWithInterfaces(configured, desired, networkbind.Interfaces)
+}
+
+func managementListenerWithInterfaces(
+	configured string,
+	desired string,
+	interfaces func() ([]networkbind.InterfaceAddress, error),
+) (address, activeBind string, port int, locked bool, err error) {
 	host, portText, err := net.SplitHostPort(configured)
 	if err != nil {
 		return "", "", 0, false, err
@@ -177,6 +238,16 @@ func managementListener(configured, desired string) (address, activeBind string,
 		activeBind, err = networkbind.Normalize(desired, false)
 		if err != nil {
 			return "", "", 0, false, fmt.Errorf("saved management bind address: %w", err)
+		}
+		if networkbind.IsInterfaceSelector(activeBind) {
+			addresses, listErr := interfaces()
+			if listErr != nil {
+				return "", "", 0, false, fmt.Errorf("list interfaces for saved management binding: %w", listErr)
+			}
+			activeBind, err = networkbind.Resolve(activeBind, addresses, false)
+			if err != nil {
+				return "", "", 0, false, fmt.Errorf("resolve saved management binding: %w", err)
+			}
 		}
 	}
 	port, err = strconv.Atoi(portText)

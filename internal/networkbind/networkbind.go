@@ -8,8 +8,11 @@ import (
 )
 
 const (
-	All    = "*"
-	Custom = "custom"
+	All             = "*"
+	Custom          = "custom"
+	interfacePrefix = "interface:"
+	IPv4            = "IPv4"
+	IPv6            = "IPv6"
 )
 
 type InterfaceAddress struct {
@@ -27,18 +30,78 @@ func Normalize(value string, allowCustom bool) (string, error) {
 	if allowCustom && value == Custom {
 		return Custom, nil
 	}
+	if strings.HasPrefix(value, interfacePrefix) {
+		name, family, ok := InterfaceSelector(value)
+		if !ok {
+			return "", fmt.Errorf("must be All interfaces, an IP address, or an interface IPv4/IPv6 selection")
+		}
+		return FormatInterfaceSelector(name, family), nil
+	}
 	ip := net.ParseIP(strings.Trim(value, "[]"))
 	if ip == nil || ip.IsUnspecified() {
-		return "", fmt.Errorf("must be All interfaces or an IP address")
+		return "", fmt.Errorf("must be All interfaces, an IP address, or an interface IPv4/IPv6 selection")
 	}
 	return ip.String(), nil
 }
 
 func Host(value string) string {
-	if value == All || value == Custom {
+	if value == All || value == Custom || IsInterfaceSelector(value) {
 		return ""
 	}
 	return value
+}
+
+func FormatInterfaceSelector(name, family string) string {
+	family = strings.ToLower(family)
+	return interfacePrefix + family + ":" + name
+}
+
+func InterfaceSelector(value string) (name, family string, ok bool) {
+	if !strings.HasPrefix(value, interfacePrefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(value, interfacePrefix)
+	familyToken, name, found := strings.Cut(rest, ":")
+	if !found || name == "" || strings.TrimSpace(name) != name || strings.ContainsAny(name, " \t\r\n") {
+		return "", "", false
+	}
+	switch strings.ToLower(familyToken) {
+	case "ipv4":
+		return name, IPv4, true
+	case "ipv6":
+		return name, IPv6, true
+	default:
+		return "", "", false
+	}
+}
+
+func IsInterfaceSelector(value string) bool {
+	_, _, ok := InterfaceSelector(value)
+	return ok
+}
+
+func Resolve(value string, interfaces []InterfaceAddress, allowCustom bool) (string, error) {
+	normalized, err := Normalize(value, allowCustom)
+	if err != nil {
+		return "", err
+	}
+	name, family, followsInterface := InterfaceSelector(normalized)
+	if !followsInterface {
+		return normalized, nil
+	}
+	resolved := ""
+	for _, item := range interfaces {
+		if item.Name == name && item.Family == family {
+			if resolved != "" && resolved != item.Address {
+				return "", fmt.Errorf("interface %s has multiple usable %s addresses; select a fixed address", name, family)
+			}
+			resolved = item.Address
+		}
+	}
+	if resolved != "" {
+		return resolved, nil
+	}
+	return "", fmt.Errorf("interface %s has no usable %s address", name, family)
 }
 
 func FromListenerAddress(value string) (string, error) {
@@ -91,13 +154,14 @@ func Interfaces() ([]InterfaceAddress, error) {
 				continue
 			}
 			text := ip.String()
-			if _, exists := seen[text]; exists {
+			key := item.Name + "\x00" + text
+			if _, exists := seen[key]; exists {
 				continue
 			}
-			seen[text] = struct{}{}
-			family := "IPv6"
+			seen[key] = struct{}{}
+			family := IPv6
 			if ip.To4() != nil {
-				family = "IPv4"
+				family = IPv4
 			}
 			result = append(result, InterfaceAddress{
 				Name: item.Name, Address: text, Family: family, Loopback: item.Flags&net.FlagLoopback != 0,

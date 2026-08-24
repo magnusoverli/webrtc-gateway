@@ -34,19 +34,20 @@ type PathConfig struct {
 }
 
 type GlobalConfig struct {
-	LogLevel                 string   `json:"logLevel"`
-	ReadTimeout              string   `json:"readTimeout"`
-	WriteTimeout             string   `json:"writeTimeout"`
-	WriteQueueSize           int      `json:"writeQueueSize"`
-	UDPMaxPayloadSize        int      `json:"udpMaxPayloadSize"`
-	UDPReadBufferSize        uint64   `json:"udpReadBufferSize"`
-	SRTAddress               string   `json:"srtAddress"`
-	WebRTCLocalUDPAddress    string   `json:"webrtcLocalUDPAddress"`
-	WebRTCLocalTCPAddress    string   `json:"webrtcLocalTCPAddress"`
-	WebRTCIPsFromInterfaces  bool     `json:"webrtcIPsFromInterfaces"`
-	WebRTCAdditionalHosts    []string `json:"webrtcAdditionalHosts"`
-	WebRTCHandshakeTimeout   string   `json:"webrtcHandshakeTimeout"`
-	WebRTCTrackGatherTimeout string   `json:"webrtcTrackGatherTimeout"`
+	LogLevel                    string   `json:"logLevel"`
+	ReadTimeout                 string   `json:"readTimeout"`
+	WriteTimeout                string   `json:"writeTimeout"`
+	WriteQueueSize              int      `json:"writeQueueSize"`
+	UDPMaxPayloadSize           int      `json:"udpMaxPayloadSize"`
+	UDPReadBufferSize           uint64   `json:"udpReadBufferSize"`
+	SRTAddress                  string   `json:"srtAddress"`
+	WebRTCLocalUDPAddress       string   `json:"webrtcLocalUDPAddress"`
+	WebRTCLocalTCPAddress       string   `json:"webrtcLocalTCPAddress"`
+	WebRTCIPsFromInterfaces     bool     `json:"webrtcIPsFromInterfaces"`
+	WebRTCIPsFromInterfacesList []string `json:"webrtcIPsFromInterfacesList"`
+	WebRTCAdditionalHosts       []string `json:"webrtcAdditionalHosts"`
+	WebRTCHandshakeTimeout      string   `json:"webrtcHandshakeTimeout"`
+	WebRTCTrackGatherTimeout    string   `json:"webrtcTrackGatherTimeout"`
 }
 
 type PathConfigList struct {

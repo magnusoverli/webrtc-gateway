@@ -38,6 +38,22 @@ func TestValidateAppliesUnifiedMediaBinding(t *testing.T) {
 	}
 }
 
+func TestValidatePreservesInterfaceSelectorAndListenerPorts(t *testing.T) {
+	value := Defaults(time.Now())
+	value.ManagementBindAddress = "interface:ipv4:eth0"
+	value.MediaBindAddress = "interface:ipv4:eth0"
+	validated, err := Validate(value, time.Now())
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if validated.ManagementBindAddress != value.ManagementBindAddress || validated.MediaBindAddress != value.MediaBindAddress {
+		t.Fatalf("selectors changed: %#v", validated)
+	}
+	if validated.SRTAddress != ":8890" || validated.WebRTCLocalUDPAddress != ":8189" || validated.WebRTCLocalTCPAddress != ":8189" {
+		t.Fatalf("listener ports were not preserved: %#v", validated)
+	}
+}
+
 func TestValidatePreservesLegacyCustomMediaAddresses(t *testing.T) {
 	value := Defaults(time.Now())
 	value.MediaBindAddress = "custom"

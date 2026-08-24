@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"webrtc-gateway/internal/mediamtx"
+	"webrtc-gateway/internal/networkbind"
 )
 
 type fakeGlobalManager struct {
@@ -20,12 +21,21 @@ type fakeGlobalManager struct {
 type fakeChannelReconciler struct {
 	channels      int
 	srt           int
+	mediaBind     string
+	srtAddress    string
 	err           error
 	validationErr error
 }
 
 func (f *fakeChannelReconciler) Reconcile(context.Context) error {
 	f.channels++
+	return f.err
+}
+
+func (f *fakeChannelReconciler) ReconcileMedia(_ context.Context, mediaBind, srtAddress string) error {
+	f.channels++
+	f.mediaBind = mediaBind
+	f.srtAddress = srtAddress
 	return f.err
 }
 
@@ -158,6 +168,66 @@ func TestServiceReconcilesEveryChannelWhenMediaBindingChanges(t *testing.T) {
 	}
 }
 
+func TestServiceReconcilesAppliedInterfaceBindingAfterAddressChange(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	value, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	media := &fakeGlobalManager{config: globalConfig(value)}
+	channels := &fakeChannelReconciler{}
+	service := NewService(store, media, channels, nil)
+	currentAddress := "192.0.2.20"
+	service.interfaces = func() ([]networkbind.InterfaceAddress, error) {
+		if currentAddress == "" {
+			return []networkbind.InterfaceAddress{}, nil
+		}
+		return []networkbind.InterfaceAddress{{Name: "eth0", Address: currentAddress, Family: networkbind.IPv4}}, nil
+	}
+	value.MediaBindAddress = "interface:ipv4:eth0"
+	if _, err := service.Update(context.Background(), value); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if media.config.SRTAddress != "192.0.2.20:8890" || len(media.config.WebRTCIPsFromInterfacesList) != 1 || media.config.WebRTCIPsFromInterfacesList[0] != "eth0" {
+		t.Fatalf("initial effective config = %#v", media.config)
+	}
+	initialPatches := media.patches
+	initialReconciles := channels.channels
+
+	currentAddress = ""
+	if err := service.ReconcilePending(context.Background()); err == nil {
+		t.Fatal("ReconcilePending() error = nil with unavailable interface")
+	}
+	if media.patches != initialPatches || channels.channels != initialReconciles {
+		t.Fatalf("unavailable interface changed runtime: patches %d, channels %d", media.patches, channels.channels)
+	}
+
+	currentAddress = "192.0.2.30"
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatalf("ReconcilePending() error = %v", err)
+	}
+	if media.patches != initialPatches+1 || media.config.WebRTCLocalUDPAddress != "192.0.2.30:8189" {
+		t.Fatalf("reconciled config = %#v, patches %d", media.config, media.patches)
+	}
+	if channels.channels != initialReconciles+1 {
+		t.Fatalf("channel reconciles = %d, want %d", channels.channels, initialReconciles+1)
+	}
+	if channels.mediaBind != "192.0.2.30" || channels.srtAddress != "192.0.2.30:8890" {
+		t.Fatalf("channel snapshot = bind %q, SRT %q", channels.mediaBind, channels.srtAddress)
+	}
+
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatalf("stable ReconcilePending() error = %v", err)
+	}
+	if media.patches != initialPatches+1 || channels.channels != initialReconciles+1 {
+		t.Fatalf("stable reconcile repeated work: patches %d, channels %d", media.patches, channels.channels)
+	}
+}
+
 func TestServiceReconcilesEveryChannelWhenSRTPortChanges(t *testing.T) {
 	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -219,7 +289,7 @@ func globalConfig(value Settings) mediamtx.GlobalConfig {
 		WriteQueueSize: value.WriteQueueSize, UDPMaxPayloadSize: value.UDPMaxPayloadSize,
 		UDPReadBufferSize: value.UDPReadBufferSize, SRTAddress: value.SRTAddress,
 		WebRTCLocalUDPAddress: value.WebRTCLocalUDPAddress, WebRTCLocalTCPAddress: value.WebRTCLocalTCPAddress,
-		WebRTCIPsFromInterfaces: value.WebRTCIPsFromInterfaces, WebRTCAdditionalHosts: value.WebRTCAdditionalHosts,
+		WebRTCIPsFromInterfaces: value.WebRTCIPsFromInterfaces, WebRTCIPsFromInterfacesList: []string{}, WebRTCAdditionalHosts: value.WebRTCAdditionalHosts,
 		WebRTCHandshakeTimeout: value.WebRTCHandshakeTimeout, WebRTCTrackGatherTimeout: value.WebRTCTrackGatherTimeout,
 	}
 }

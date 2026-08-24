@@ -144,7 +144,7 @@ func TestReplaceAndDeletePath(t *testing.T) {
 	var global GlobalConfig
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v3/config/global/get", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"logLevel":"info","writeQueueSize":1024}`)
+		fmt.Fprint(w, `{"logLevel":"info","writeQueueSize":1024,"webrtcIPsFromInterfacesList":["eth0"]}`)
 	})
 	mux.HandleFunc("POST /v3/config/paths/replace/test-path", func(w http.ResponseWriter, r *http.Request) {
 		if contentType := r.Header.Get("Content-Type"); contentType != "application/json" {
@@ -173,7 +173,7 @@ func TestReplaceAndDeletePath(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	current, err := client.GetGlobal(context.Background())
-	if err != nil || current.LogLevel != "info" || current.WriteQueueSize != 1024 {
+	if err != nil || current.LogLevel != "info" || current.WriteQueueSize != 1024 || len(current.WebRTCIPsFromInterfacesList) != 1 || current.WebRTCIPsFromInterfacesList[0] != "eth0" {
 		t.Fatalf("GetGlobal() = %#v, %v", current, err)
 	}
 	config := PathConfig{
@@ -190,11 +190,11 @@ func TestReplaceAndDeletePath(t *testing.T) {
 		t.Fatalf("DeletePath() error = %v, want ignored not found", err)
 	}
 	if err := client.PatchGlobal(context.Background(), GlobalConfig{
-		LogLevel: "debug", WriteQueueSize: 1024, WebRTCLocalUDPAddress: ":8189",
+		LogLevel: "debug", WriteQueueSize: 1024, WebRTCLocalUDPAddress: ":8189", WebRTCIPsFromInterfacesList: []string{"wlan0"},
 	}); err != nil {
 		t.Fatalf("PatchGlobal() error = %v", err)
 	}
-	if global.LogLevel != "debug" || global.WriteQueueSize != 1024 || global.WebRTCLocalUDPAddress != ":8189" {
+	if global.LogLevel != "debug" || global.WriteQueueSize != 1024 || global.WebRTCLocalUDPAddress != ":8189" || len(global.WebRTCIPsFromInterfacesList) != 1 || global.WebRTCIPsFromInterfacesList[0] != "wlan0" {
 		t.Fatalf("global config = %#v", global)
 	}
 }

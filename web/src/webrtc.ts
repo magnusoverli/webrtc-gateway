@@ -1,18 +1,29 @@
 export type StatsSample = {
   timestamp: number;
   bytesReceived: number;
+  videoBytesReceived: number;
+  audioBytesReceived: number;
 };
 
-export type PreviewStats = {
-  bitrateBps: number;
+export type ReceiverStats = {
+  bitrateBps: number | null;
   codec: string;
+  packetsLost: number;
+  jitterMs: number;
+};
+
+export type VideoReceiverStats = ReceiverStats & {
   framesPerSecond: number;
   width: number;
   height: number;
-  packetsLost: number;
-  jitterMs: number;
   framesDecoded: number;
   framesDropped: number;
+};
+
+export type PreviewStats = {
+  bitrateBps: number | null;
+  video?: VideoReceiverStats;
+  audio?: ReceiverStats;
   icePath: string;
 };
 
@@ -39,16 +50,18 @@ export function summarizeRTCStats(report: RTCStatsReport, previous?: StatsSample
   report.forEach((entry) => entries.set(entry.id, entry as RawStats));
 
   const inbound = [...entries.values()].filter((entry) => entry.type === "inbound-rtp" && entry.isRemote !== true);
-  const video = inbound.find((entry) => entry.kind === "video" || entry.mediaType === "video");
-  const primary = video ?? inbound[0];
+  const videoEntries = inbound.filter((entry) => entry.kind === "video" || entry.mediaType === "video");
+  const audioEntries = inbound.filter((entry) => entry.kind === "audio" || entry.mediaType === "audio");
+  const video = videoEntries[0];
+  const audio = audioEntries[0];
   const bytesReceived = inbound.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
-  const timestamp = Math.max(0, ...inbound.map((entry) => numberValue(entry.timestamp)), performance.now());
+  const videoBytesReceived = videoEntries.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
+  const audioBytesReceived = audioEntries.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
+  const reportedTimestamp = Math.max(0, ...inbound.map((entry) => numberValue(entry.timestamp)));
+  const timestamp = reportedTimestamp || performance.now();
   const elapsedMs = previous ? timestamp - previous.timestamp : 0;
-  const bitrateBps = previous && elapsedMs > 0
-    ? Math.max(0, ((bytesReceived - previous.bytesReceived) * 8000) / elapsedMs)
-    : 0;
+  const bitrateBps = receiverBitrate(previous?.bytesReceived, bytesReceived, elapsedMs);
 
-  const codec = primary?.codecId ? entries.get(String(primary.codecId)) : undefined;
   const transport = [...entries.values()].find((entry) => entry.type === "transport" && entry.selectedCandidatePairId);
   const selectedPairID = String(transport?.selectedCandidatePairId ?? "");
   const pair = selectedPairID
@@ -63,21 +76,47 @@ export function summarizeRTCStats(report: RTCStatsReport, previous?: StatsSample
   return {
     stats: {
       bitrateBps,
-      codec: String(codec?.mimeType ?? "").replace(/^\w+\//, "") || "unknown",
-      framesPerSecond: numberValue(video?.framesPerSecond),
-      width: numberValue(video?.frameWidth),
-      height: numberValue(video?.frameHeight),
-      packetsLost: inbound.reduce((total, entry) => total + numberValue(entry.packetsLost), 0),
-      jitterMs: Math.max(0, ...inbound.map((entry) => numberValue(entry.jitter) * 1000)),
-      framesDecoded: numberValue(video?.framesDecoded),
-      framesDropped: numberValue(video?.framesDropped),
+      video: video ? {
+        ...receiverStats(videoEntries, entries, previous?.videoBytesReceived, videoBytesReceived, elapsedMs),
+        framesPerSecond: numberValue(video.framesPerSecond),
+        width: numberValue(video.frameWidth),
+        height: numberValue(video.frameHeight),
+        framesDecoded: numberValue(video.framesDecoded),
+        framesDropped: numberValue(video.framesDropped),
+      } : undefined,
+      audio: audio
+        ? receiverStats(audioEntries, entries, previous?.audioBytesReceived, audioBytesReceived, elapsedMs)
+        : undefined,
       icePath,
     },
-    sample: { timestamp, bytesReceived },
+    sample: { timestamp, bytesReceived, videoBytesReceived, audioBytesReceived },
   };
 }
 
-export function codecWarnings(tracks: Array<{ codec: string; codecProps?: Record<string, string | number | boolean> }>) {
+function receiverStats(
+  inbound: RawStats[],
+  entries: Map<string, RawStats>,
+  previousBytes: number | undefined,
+  bytesReceived: number,
+  elapsedMs: number,
+): ReceiverStats {
+  const primary = inbound[0];
+  const codec = primary?.codecId ? entries.get(String(primary.codecId)) : undefined;
+  return {
+    bitrateBps: receiverBitrate(previousBytes, bytesReceived, elapsedMs),
+    codec: String(codec?.mimeType ?? "").replace(/^\w+\//, "") || "unknown",
+    packetsLost: inbound.reduce((total, entry) => total + numberValue(entry.packetsLost), 0),
+    jitterMs: Math.max(0, ...inbound.map((entry) => numberValue(entry.jitter) * 1000)),
+  };
+}
+
+function receiverBitrate(previous: number | undefined, current: number, elapsedMs: number) {
+  return previous !== undefined && current >= previous && elapsedMs > 0
+    ? ((current - previous) * 8000) / elapsedMs
+    : null;
+}
+
+export function codecWarnings(tracks: Array<{ codec: string; codecProps?: Record<string, string | number | boolean | null> }>) {
   const supported = new Set(["av1", "vp9", "vp8", "h264", "opus", "g722", "g711", "pcma", "pcmu"]);
   const warnings = new Set<string>();
   for (const track of tracks) {

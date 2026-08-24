@@ -12,16 +12,35 @@ function report(entries: Array<Record<string, unknown>>) {
 describe("summarizeRTCStats", () => {
   it("calculates bitrate and video details", () => {
     const result = summarizeRTCStats(report([
-      { id: "video", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 3000, packetsLost: 2, jitter: 0.004, framesPerSecond: 30, frameWidth: 1280, frameHeight: 720, framesDecoded: 80, framesDropped: 1, codecId: "codec" },
-      { id: "audio", type: "inbound-rtp", kind: "audio", timestamp: 2000, bytesReceived: 1000, packetsLost: 1, jitter: 0.002 },
-      { id: "codec", type: "codec", mimeType: "video/H264" },
-    ]), { timestamp: 1000, bytesReceived: 2000 });
+      { id: "video", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 3000, packetsLost: 2, jitter: 0.004, framesPerSecond: 30, frameWidth: 1280, frameHeight: 720, framesDecoded: 80, framesDropped: 1, codecId: "video-codec" },
+      { id: "audio", type: "inbound-rtp", kind: "audio", timestamp: 2000, bytesReceived: 1000, packetsLost: 1, jitter: 0.002, codecId: "audio-codec" },
+      { id: "video-codec", type: "codec", mimeType: "video/H264" },
+      { id: "audio-codec", type: "codec", mimeType: "audio/opus" },
+    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 1500, audioBytesReceived: 500 });
 
     expect(result.stats.bitrateBps).toBe(16000);
-    expect(result.stats.codec).toBe("H264");
-    expect(result.stats.width).toBe(1280);
-    expect(result.stats.packetsLost).toBe(3);
-    expect(result.stats.jitterMs).toBe(4);
+    expect(result.stats.video).toMatchObject({ codec: "H264", bitrateBps: 12000, width: 1280, height: 720, framesPerSecond: 30, packetsLost: 2, jitterMs: 4 });
+    expect(result.stats.audio).toMatchObject({ codec: "opus", bitrateBps: 4000, packetsLost: 1, jitterMs: 2 });
+    expect(result.sample).toEqual({ timestamp: 2000, bytesReceived: 4000, videoBytesReceived: 3000, audioBytesReceived: 1000 });
+  });
+
+  it("reports audio-only receiver details", () => {
+    const result = summarizeRTCStats(report([
+      { id: "audio", type: "inbound-rtp", kind: "audio", timestamp: 2000, bytesReceived: 2000, codecId: "codec" },
+      { id: "codec", type: "codec", mimeType: "audio/opus" },
+    ]));
+    expect(result.stats.video).toBeUndefined();
+    expect(result.stats.audio?.codec).toBe("opus");
+    expect(result.stats.audio?.bitrateBps).toBeNull();
+  });
+
+  it("aggregates multiple inbound streams of the same media kind", () => {
+    const result = summarizeRTCStats(report([
+      { id: "video-1", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 3000, packetsLost: 1, codecId: "codec" },
+      { id: "video-2", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 2000, packetsLost: 2, codecId: "codec" },
+      { id: "codec", type: "codec", mimeType: "video/H264" },
+    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 2000, audioBytesReceived: 0 });
+    expect(result.stats.video).toMatchObject({ codec: "H264", bitrateBps: 24000, packetsLost: 3 });
   });
 });
 

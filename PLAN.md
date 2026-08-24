@@ -16,7 +16,7 @@ Build a Linux application deployable with Docker Compose that accepts independen
 - The deployment target is Linux using Docker host networking.
 - The deployment is LAN-only. Internet TLS, STUN, and TURN are out of scope.
 - The web UI, application API, WHEP signaling proxy, and live statistics use one HTTP port.
-- Management and media listeners can bind to the same or different host interfaces through persisted global settings.
+- Management and media listeners can bind to all interfaces, a fixed IP, or the current IPv4/IPv6 address of a persisted host interface selection.
 - RTP, SRT, and WebRTC media continue to use their own UDP ports.
 - Preview creates a real WebRTC reader, starts muted, is enabled by default per channel, and only runs for the selected dashboard channel.
 - Always-on statistics come from MediaMTX. Browser `getStats()` augments them while preview is active.
@@ -57,7 +57,7 @@ SRT without stream ID --> per-channel SRT listener --> framing adapter --> Media
 - MediaMTX API, metrics, WHEP HTTP, and internal RTSP bind to loopback and are not exposed to the LAN.
 - Gateway health uses a separate private loopback listener on `127.0.0.1:18080` so management can bind only to a LAN interface without failing container health checks.
 
-The management binding is loaded when Gateway starts, and its UI exposes active versus desired state until a required restart. The media binding applies live to direct SRT, per-channel SRT, RTP unicast, and WebRTC ICE listeners. RTP multicast retains channel-specific group/interface semantics, and SRT pull remains outbound.
+The management binding is loaded when Gateway starts, and its UI exposes active, desired, and resolved state until a required restart. A followed management interface triggers a graceful Gateway restart when its address changes. The media binding applies live to direct SRT, per-channel SRT, RTP unicast, and WebRTC ICE listeners; followed media interfaces are re-resolved during reconciliation and constrain interface-derived ICE candidates. RTP multicast retains channel-specific group/interface semantics, and SRT pull remains outbound.
 
 The Gateway reverse-proxies WHEP `OPTIONS`, `POST`, `PATCH`, and `DELETE` requests. Consumers use one stable application URL regardless of whether a channel is direct or transcoded.
 
@@ -210,6 +210,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 | 2026-08-22 | Added automatic SRT compatibility classification, bounded H264 B-frame probing, isolated FFmpeg workers, per-track copy/transcode selection, stable WHEP route affinity, worker/output status, and automatic cleanup. Verified H264 Main/AAC conversion to H264 Baseline/Opus and zero-worker passthrough for compatible H264/Opus. |
 | 2026-08-22 | Added browser-backed SRT payload and resilience suites. Verified 19 supported payload/transport cases, encrypted SRT pull, codec changes across reconnects, four concurrent viewers, worker recovery and isolation, Gateway/MediaMTX restart recovery, stable direct media across a Gateway restart, and explicit timeout handling for MediaMTX's 192 kb/s AC-3 framing boundary. Documented measured resource use. |
 | 2026-08-23 | Added persisted management/media interface selectors, live host interface discovery, restart-aware management state, live SRT/RTP/WebRTC rebinding, loopback-only health, legacy listener migration, and responsive binding controls. |
+| 2026-08-24 | Changed interface selections from fixed IP persistence to interface-and-family following, with DHCP reconciliation, automatic management restart, resolved binding status, and MediaMTX ICE interface filtering. |
 | 2026-08-23 | Added the fixed operator connection workspace, default-on per-channel muted preview, explicit SRT passphrase reveal, stable viewer/embed routes and iframe output, focused runtime status, and conditional graceful Gateway restart through the Compose restart policy. |
 | 2026-08-23 | Added packet-preserving SRT transport adaptation with automatic raw MPEG-TS and RTP/MP2T detection, SDP-described elementary RTP for SRT push and pull, structural H264/interlace probing, send-field deinterlacing, 576i and RTP browser fixtures, and MPEG-TS-only labeling for the direct stream-ID shortcut. |
 | 2026-08-23 | Added the cabled-LAN low-latency defaults: explicit 60 ms SRT ingest, 4 MiB bridge receive buffers with reusable packet storage, 512-packet writer queues, finite new-channel viewer admission, faster compatibility startup, and reserved routing CPU headroom. Retained the internal format-neutral SRT publisher after RTSP stream-copy validation rejected valid MPEG-TS AAC inputs. |

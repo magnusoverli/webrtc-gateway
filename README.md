@@ -71,12 +71,14 @@ MediaMTX API, metrics, WHEP HTTP, and internal RTSP bind to host loopback and ar
 
 ### Network Bindings
 
-Open **Global settings** to select interfaces independently for the management and media planes. Each selector lists the live host interface name, IP address, and address family, with **All interfaces** as the default. The **Use the same interface** control keeps both selections together when that is appropriate.
+Open **Global settings** to select bindings independently for the management and media planes. Each live address is offered as a **Follow interface** option containing the interface name, current IP address, and address family. Following an interface persists its name and address family instead of freezing its current DHCP address. Existing concrete-IP settings remain available as **Fixed address** selections, and **All interfaces** remains the default. The **Use the same interface** control keeps both selections together when that is appropriate.
 
-- **Web UI & API interface** controls the Gateway UI, API, status, and WHEP signaling listener on port `8080`. The desired value is persisted, but changing it requires a Gateway container restart. The UI continues to report both the active and desired interfaces until restart.
-- **Media interface** controls direct SRT, per-channel SRT push listeners, RTP unicast, and WebRTC ICE UDP/TCP. Changes apply immediately, restart affected listeners, and can briefly interrupt active channels.
+Following is offered only when an interface has one usable address in the selected family. When aliases or multiple IPv6 addresses make the choice ambiguous, select the required fixed address instead of allowing Gateway to switch addresses implicitly.
+
+- **Web UI & API interface** controls the Gateway UI, API, status, and WHEP signaling listener on port `8080`. Changing the selection requires a Gateway container restart. When a followed interface receives a different address, Gateway detects it and restarts gracefully so Docker can bring it back on the new address.
+- **Media interface** controls direct SRT, per-channel SRT push listeners, RTP unicast, and WebRTC ICE UDP/TCP. Changes apply immediately, restart affected listeners, and can briefly interrupt active channels. A followed interface is resolved during reconciliation, so a DHCP address change automatically reapplies MediaMTX and channel listeners.
 - RTP multicast keeps its per-channel multicast group and multicast interface. SRT pull is outbound and is not affected by the listener binding.
-- WebRTC advertised hosts remain separate discovery settings. Binding selects the local socket; advertised hosts determine which ICE addresses clients receive.
+- Following a media interface also limits interface-derived WebRTC ICE candidates to that interface, preventing Docker bridge addresses from being advertised. Explicit additional advertised hosts remain separate and are not filtered.
 
 An explicit host in `GATEWAY_LISTEN_ADDR`, such as `127.0.0.1:8080`, overrides and locks the management selector. The default `:8080` leaves the port under startup configuration while allowing the persisted interface selection to supply its host. MediaMTX control services and Gateway health remain on loopback regardless of either public selection.
 

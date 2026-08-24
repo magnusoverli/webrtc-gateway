@@ -27,15 +27,12 @@ type fakeRTPPolicy struct {
 	mediaBind  string
 }
 
-func (f fakeRTPPolicy) ChannelPortPolicy(context.Context) (int, int, string, []int, error) {
-	return f.minimum, f.maximum, f.srtAddress, f.reserved, nil
-}
-
-func (f fakeRTPPolicy) MediaBindAddress(context.Context) (string, error) {
-	if f.mediaBind == "" {
-		return "custom", nil
+func (f fakeRTPPolicy) MediaPolicy(context.Context) (int, int, string, string, []int, error) {
+	mediaBind := f.mediaBind
+	if mediaBind == "" {
+		mediaBind = "custom"
 	}
-	return f.mediaBind, nil
+	return f.minimum, f.maximum, f.srtAddress, mediaBind, f.reserved, nil
 }
 
 type fakeSRTListenerManager struct {

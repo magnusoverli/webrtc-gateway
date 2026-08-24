@@ -2,12 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   channelStateLabel,
   channelHasFault,
+  hasInputStream,
+  hasOutputStream,
   iframeEmbedCode,
+  interfaceBindingSelector,
   managementOrigin,
   mediaHost,
+  parseInterfaceBinding,
   resolveBinding,
+  resolveInterfaceBinding,
+  sampleChannelRates,
   srtListenerURL,
   srtPublishURL,
+  trackKind,
   type Channel,
 } from "./channel";
 
@@ -27,6 +34,7 @@ const baseChannel: Channel = {
   available: false,
   online: false,
   inboundBytes: 0,
+  outputInboundBytes: 0,
   outboundBytes: 0,
   inboundFramesInError: 0,
   readers: [],
@@ -61,7 +69,81 @@ describe("connection URLs", () => {
   });
 });
 
+describe("stream telemetry", () => {
+  it("requires active paths with detected tracks", () => {
+    const input = { ...baseChannel, available: true, online: true, tracks: [{ codec: "H264" }] };
+    expect(hasInputStream(input)).toBe(true);
+    expect(hasInputStream({ ...input, tracks: [] })).toBe(false);
+    expect(hasInputStream({ ...input, online: false })).toBe(false);
+
+    const output = { ...input, outputReady: true, outputTracks: [{ codec: "H264" }] };
+    expect(hasOutputStream(output)).toBe(true);
+    expect(hasOutputStream({ ...output, outputTracks: [] })).toBe(false);
+    expect(hasOutputStream({ ...output, outputReady: false })).toBe(false);
+  });
+
+  it("calculates distinct input, output, and delivery rates", () => {
+    const online = {
+      ...baseChannel,
+      available: true,
+      online: true,
+      outputReady: true,
+      availableTime: "input-generation",
+      outputAvailableTime: "output-generation",
+    };
+    const first = sampleChannelRates([
+      { ...online, inboundBytes: 1000, outputInboundBytes: 700, outboundBytes: 1400 },
+    ], new Map(), 1000);
+    const second = sampleChannelRates([
+      { ...online, inboundBytes: 2000, outputInboundBytes: 1400, outboundBytes: 3400 },
+    ], first.samples, 2000);
+
+    expect(first.rates[online.id]).toEqual({ inputBitrateBps: null, outputBitrateBps: null, deliveryBitrateBps: null });
+    expect(second.rates[online.id]).toEqual({ inputBitrateBps: 8000, outputBitrateBps: 5600, deliveryBitrateBps: 16000 });
+  });
+
+  it("resets rates when a stream generation changes", () => {
+    const online = { ...baseChannel, available: true, online: true, outputReady: true, availableTime: "one", outputAvailableTime: "out-one" };
+    const first = sampleChannelRates([{ ...online, inboundBytes: 1000, outputInboundBytes: 1000 }], new Map(), 1000);
+    const second = sampleChannelRates([{ ...online, availableTime: "two", outputAvailableTime: "out-two", inboundBytes: 2000, outputInboundBytes: 2000 }], first.samples, 2000);
+    expect(second.rates[online.id]?.inputBitrateBps).toBeNull();
+    expect(second.rates[online.id]?.outputBitrateBps).toBeNull();
+  });
+
+  it("resets rates when counters decrease", () => {
+    const online = { ...baseChannel, available: true, online: true, outputReady: true };
+    const first = sampleChannelRates([{ ...online, inboundBytes: 2000, outputInboundBytes: 2000, outboundBytes: 2000 }], new Map(), 1000);
+    const second = sampleChannelRates([{ ...online, inboundBytes: 1000, outputInboundBytes: 1000, outboundBytes: 1000 }], first.samples, 2000);
+    expect(second.rates[online.id]).toEqual({ inputBitrateBps: null, outputBitrateBps: null, deliveryBitrateBps: null });
+  });
+
+  it("classifies video and audio tracks", () => {
+    expect(trackKind({ codec: "H264" })).toBe("video");
+    expect(trackKind({ codec: "MPEG-4 Audio" })).toBe("audio");
+    expect(trackKind({ codec: "MPEG-4 Audio LATM" })).toBe("audio");
+    expect(trackKind({ codec: "Speex" })).toBe("audio");
+    expect(trackKind({ codec: "G726" })).toBe("audio");
+    expect(trackKind({ codec: "custom", codecProps: { width: 1920 } })).toBe("video");
+    expect(trackKind({ codec: "custom" })).toBe("unknown");
+  });
+});
+
 describe("binding lifecycle", () => {
+  const interfaces = [
+    { name: "eth0", address: "192.0.2.20", family: "IPv4" as const, loopback: false },
+    { name: "eth0", address: "2001:db8::20", family: "IPv6" as const, loopback: false },
+  ];
+
+  it("formats, parses, and resolves interface-following selectors", () => {
+    expect(interfaceBindingSelector(interfaces[0])).toBe("interface:ipv4:eth0");
+    expect(parseInterfaceBinding("interface:ipv6:eth0")).toEqual({ name: "eth0", family: "IPv6" });
+    expect(resolveInterfaceBinding("interface:ipv4:eth0", interfaces)).toBe("192.0.2.20");
+    expect(resolveInterfaceBinding("interface:ipv6:eth0", interfaces)).toBe("2001:db8::20");
+    expect(resolveInterfaceBinding("interface:ipv4:missing", interfaces)).toBe("");
+    expect(resolveInterfaceBinding("interface:ipv4:eth0", [...interfaces, { ...interfaces[0], address: "192.0.2.21" }])).toBe("");
+    expect(resolveInterfaceBinding("192.0.2.30", interfaces)).toBe("192.0.2.30");
+  });
+
   it("uses a confirmed active binding without a pending destination", () => {
     expect(resolveBinding("192.0.2.10", "192.0.2.10", false, "applied")).toEqual({
       address: "192.0.2.10",

@@ -27,6 +27,7 @@ import (
 
 type mediaStatusReader interface {
 	Status(context.Context) (mediamtx.Status, error)
+	GetGlobal(context.Context) (mediamtx.GlobalConfig, error)
 }
 
 type channelService interface {
@@ -62,10 +63,12 @@ type Options struct {
 	StartedAt       time.Time
 	Management      ManagementBinding
 	Restart         func()
+	Interfaces      func() ([]networkbind.InterfaceAddress, error)
 }
 
 type ManagementBinding struct {
 	ActiveAddress string
+	Selection     string
 	Port          int
 	Locked        bool
 }
@@ -83,6 +86,7 @@ type server struct {
 	staticFiles fs.FS
 	management  ManagementBinding
 	restart     func()
+	interfaces  func() ([]networkbind.InterfaceAddress, error)
 }
 
 type statusResponse struct {
@@ -101,7 +105,10 @@ type networkStatus struct {
 
 type bindingStatus struct {
 	ActiveAddress   string `json:"activeAddress,omitempty"`
+	ActiveSelection string `json:"activeSelection,omitempty"`
 	DesiredAddress  string `json:"desiredAddress"`
+	ResolvedAddress string `json:"resolvedAddress,omitempty"`
+	ResolutionError string `json:"resolutionError,omitempty"`
 	Port            int    `json:"port,omitempty"`
 	RestartRequired bool   `json:"restartRequired"`
 	Locked          bool   `json:"locked,omitempty"`
@@ -166,6 +173,8 @@ type channelResponse struct {
 	Online               bool                  `json:"online"`
 	OnlineTime           *string               `json:"onlineTime,omitempty"`
 	InboundBytes         uint64                `json:"inboundBytes"`
+	OutputInboundBytes   uint64                `json:"outputInboundBytes"`
+	OutputAvailableTime  *string               `json:"outputAvailableTime,omitempty"`
 	OutboundBytes        uint64                `json:"outboundBytes"`
 	InboundFramesInError uint64                `json:"inboundFramesInError"`
 	Source               *mediamtx.PathSource  `json:"source,omitempty"`
@@ -238,6 +247,10 @@ func New(options Options) (http.Handler, error) {
 		return nil, fmt.Errorf("load web assets: %w", err)
 	}
 
+	interfaces := options.Interfaces
+	if interfaces == nil {
+		interfaces = networkbind.Interfaces
+	}
 	s := &server{
 		logger:      options.Logger,
 		mediaMTX:    options.MediaMTX,
@@ -251,6 +264,7 @@ func New(options Options) (http.Handler, error) {
 		staticFiles: staticFiles,
 		management:  options.Management,
 		restart:     options.Restart,
+		interfaces:  interfaces,
 	}
 
 	mux := http.NewServeMux()
@@ -300,16 +314,36 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		Media:    mediaStatus{Reachable: false},
 		Settings: globalSettings,
 	}
-	response.Network.Interfaces, _ = networkbind.Interfaces()
+	interfaceAddresses, interfaceErr := s.interfaces()
+	if interfaceErr == nil {
+		response.Network.Interfaces = interfaceAddresses
+	}
 	response.Network.Management = bindingStatus{
-		ActiveAddress: s.management.ActiveAddress, DesiredAddress: globalSettings.ManagementBindAddress,
-		Port: s.management.Port, Locked: s.management.Locked,
-		RestartRequired: !s.management.Locked && s.management.ActiveAddress != globalSettings.ManagementBindAddress,
+		ActiveAddress: s.management.ActiveAddress, ActiveSelection: s.management.Selection,
+		DesiredAddress: globalSettings.ManagementBindAddress,
+		Port:           s.management.Port, Locked: s.management.Locked,
+	}
+	if s.management.Locked {
+		response.Network.Management.ResolvedAddress = s.management.ActiveAddress
+	} else if resolved, resolveErr := resolveBinding(globalSettings.ManagementBindAddress, interfaceAddresses, interfaceErr, false); resolveErr != nil {
+		response.Network.Management.ResolutionError = resolveErr.Error()
+		response.Network.Management.RestartRequired = true
+	} else {
+		response.Network.Management.ResolvedAddress = resolved
+		response.Network.Management.RestartRequired = s.management.ActiveAddress != resolved ||
+			s.management.Selection != globalSettings.ManagementBindAddress
 	}
 	response.Gateway.RestartRequired = response.Network.Management.RestartRequired
 	response.Network.Media = bindingStatus{DesiredAddress: globalSettings.MediaBindAddress}
-	if globalSettings.ApplyState == settings.ApplyApplied {
-		response.Network.Media.ActiveAddress = globalSettings.MediaBindAddress
+	if _, resolved, _, resolveErr := resolveMedia(globalSettings, interfaceAddresses, interfaceErr); resolveErr != nil {
+		response.Network.Media.ResolutionError = resolveErr.Error()
+	} else {
+		response.Network.Media.ResolvedAddress = resolved
+	}
+	if mediaGlobal, globalErr := s.mediaMTX.GetGlobal(r.Context()); globalErr == nil {
+		response.Network.Media.ActiveAddress = networkbind.LegacyMediaBinding(
+			mediaGlobal.SRTAddress, mediaGlobal.WebRTCLocalUDPAddress, mediaGlobal.WebRTCLocalTCPAddress,
+		)
 	}
 	mediaRuntime, mediaErr := s.mediaMTX.Status(r.Context())
 	if mediaErr != nil {
@@ -364,7 +398,23 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	value = validated
-	if s.management.Port > 0 && addressPort(value.WebRTCLocalTCPAddress) == s.management.Port && managementMediaOverlap(value) {
+	interfaceAddresses, interfaceErr := s.interfaces()
+	resolvedManagement := s.management.ActiveAddress
+	if !s.management.Locked {
+		resolvedManagement, err = resolveBinding(value.ManagementBindAddress, interfaceAddresses, interfaceErr, false)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	effective, resolvedMedia, _, err := resolveMedia(value, interfaceAddresses, interfaceErr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.management.Port > 0 && addressPort(effective.WebRTCLocalTCPAddress) == s.management.Port &&
+		(bindingsOverlap(s.management.ActiveAddress, mediaTCPBinding(effective, resolvedMedia)) ||
+			(!s.management.Locked && bindingsOverlap(resolvedManagement, mediaTCPBinding(effective, resolvedMedia)))) {
 		writeError(w, http.StatusBadRequest, "WebRTC TCP fallback cannot use the management listener port on the same interface")
 		return
 	}
@@ -416,17 +466,42 @@ func addressPort(address string) int {
 	return value
 }
 
-func managementMediaOverlap(value settings.Settings) bool {
-	management := value.ManagementBindAddress
-	media := value.MediaBindAddress
-	if media == networkbind.Custom {
+func mediaTCPBinding(value settings.Settings, resolvedMedia string) string {
+	if resolvedMedia == networkbind.Custom {
 		var err error
-		media, err = networkbind.FromListenerAddress(value.WebRTCLocalTCPAddress)
+		resolvedMedia, err = networkbind.FromListenerAddress(value.WebRTCLocalTCPAddress)
 		if err != nil {
-			return false
+			return ""
 		}
 	}
-	return management == networkbind.All || media == networkbind.All || management == media
+	return resolvedMedia
+}
+
+func bindingsOverlap(left, right string) bool {
+	return left != "" && right != "" && (left == networkbind.All || right == networkbind.All || left == right)
+}
+
+func resolveBinding(
+	selector string,
+	interfaces []networkbind.InterfaceAddress,
+	interfaceErr error,
+	allowCustom bool,
+) (string, error) {
+	if interfaceErr != nil && networkbind.IsInterfaceSelector(selector) {
+		return "", interfaceErr
+	}
+	return networkbind.Resolve(selector, interfaces, allowCustom)
+}
+
+func resolveMedia(
+	value settings.Settings,
+	interfaces []networkbind.InterfaceAddress,
+	interfaceErr error,
+) (settings.Settings, string, []string, error) {
+	if interfaceErr != nil && networkbind.IsInterfaceSelector(value.MediaBindAddress) {
+		return settings.Settings{}, "", nil, interfaceErr
+	}
+	return settings.ResolveMedia(value, interfaces)
 }
 
 func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
@@ -841,6 +916,18 @@ func (s *server) attachRelayStatus(item channel.Channel, view *channelResponse) 
 }
 
 func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, compatibilityState compatibility.State) channelResponse {
+	outputReady := compatibilityState.State == compatibility.StateReady && output.Available && output.Online
+	var outputInboundBytes, outboundBytes uint64
+	var outputAvailableTime *string
+	var readers []mediamtx.PathReader
+	var outputTracks []mediamtx.Track
+	if outputReady {
+		outputInboundBytes = output.InboundBytes
+		outputAvailableTime = output.AvailableTime
+		outboundBytes = output.OutboundBytes
+		readers = output.Readers
+		outputTracks = output.Tracks
+	}
 	view := channelResponse{
 		ID:                   item.ID,
 		Name:                 item.Name,
@@ -862,13 +949,15 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		Online:               runtime.Online,
 		OnlineTime:           runtime.OnlineTime,
 		InboundBytes:         runtime.InboundBytes,
-		OutboundBytes:        output.OutboundBytes,
+		OutputInboundBytes:   outputInboundBytes,
+		OutputAvailableTime:  outputAvailableTime,
+		OutboundBytes:        outboundBytes,
 		InboundFramesInError: runtime.InboundFramesInError,
 		Source:               runtime.Source,
-		Readers:              output.Readers,
+		Readers:              readers,
 		Tracks:               runtime.Tracks,
-		OutputReady:          compatibilityState.State == compatibility.StateReady && output.Available && output.Online,
-		OutputTracks:         output.Tracks,
+		OutputReady:          outputReady,
+		OutputTracks:         outputTracks,
 		Compatibility:        compatibilityState,
 	}
 	if view.Readers == nil {

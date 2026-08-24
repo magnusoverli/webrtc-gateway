@@ -19,6 +19,8 @@ func TestSQLiteStoreInitializesAndPersistsSettings(t *testing.T) {
 		t.Fatalf("Get() error = %v", err)
 	}
 	value.LogLevel = "debug"
+	value.ManagementBindAddress = "interface:ipv4:eth0"
+	value.MediaBindAddress = "interface:ipv4:eth0"
 	value.ApplyState = ApplyApplied
 	if err := store.Update(context.Background(), value); err != nil {
 		t.Fatalf("Update() error = %v", err)
@@ -31,7 +33,8 @@ func TestSQLiteStoreInitializesAndPersistsSettings(t *testing.T) {
 	}
 	defer reopened.Close()
 	loaded, err := reopened.Get(context.Background())
-	if err != nil || loaded.LogLevel != "debug" || loaded.ApplyState != ApplyApplied {
+	if err != nil || loaded.LogLevel != "debug" || loaded.ApplyState != ApplyApplied ||
+		loaded.ManagementBindAddress != "interface:ipv4:eth0" || loaded.MediaBindAddress != "interface:ipv4:eth0" {
 		t.Fatalf("persisted settings = %#v, %v", loaded, err)
 	}
 }

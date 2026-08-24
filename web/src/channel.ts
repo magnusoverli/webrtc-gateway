@@ -2,7 +2,24 @@ export type InputMode = "srt-push" | "srt-pull" | "rtp-unicast" | "rtp-multicast
 
 export type Track = {
   codec: string;
-  codecProps?: Record<string, string | number | boolean>;
+  codecProps?: Record<string, string | number | boolean | null>;
+};
+
+export type TrackKind = "video" | "audio" | "unknown";
+
+export type ChannelStreamRates = {
+  inputBitrateBps: number | null;
+  outputBitrateBps: number | null;
+  deliveryBitrateBps: number | null;
+};
+
+export type ChannelRateSample = {
+  sampledAt: number;
+  inputGeneration: string;
+  outputGeneration: string;
+  inputBytes?: number;
+  outputBytes?: number;
+  deliveryBytes?: number;
 };
 
 export type Channel = {
@@ -37,10 +54,15 @@ export type Channel = {
   viewerPath: string;
   embedPath: string;
   available: boolean;
+  availableTime?: string;
   online: boolean;
+  onlineTime?: string;
   inboundBytes: number;
+  outputInboundBytes: number;
+  outputAvailableTime?: string;
   outboundBytes: number;
   inboundFramesInError: number;
+  source?: { type: string; id: string };
   readers: Array<{ type: string; id: string }>;
   tracks: Track[];
   outputReady: boolean;
@@ -65,6 +87,18 @@ export type BrowserLocation = {
   protocol: string;
   hostname: string;
   origin: string;
+};
+
+export type BindingInterface = {
+  name: string;
+  address: string;
+  family: "IPv4" | "IPv6";
+  loopback: boolean;
+};
+
+export type InterfaceBinding = {
+  name: string;
+  family: "IPv4" | "IPv6";
 };
 
 export type BindingApplyState = "pending" | "applied" | "error";
@@ -92,6 +126,23 @@ export function resolveBinding(
     address: desiredAddress,
     state: applyState === "applied" ? "active" : "unconfirmed",
   };
+}
+
+export function interfaceBindingSelector(item: Pick<BindingInterface, "name" | "family">) {
+  return `interface:${item.family.toLowerCase()}:${item.name}`;
+}
+
+export function parseInterfaceBinding(value: string): InterfaceBinding | null {
+  const match = value.match(/^interface:(ipv4|ipv6):(.+)$/);
+  if (!match || !match[2] || /\s/.test(match[2])) return null;
+  return { name: match[2], family: match[1] === "ipv4" ? "IPv4" : "IPv6" };
+}
+
+export function resolveInterfaceBinding(value: string, interfaces: BindingInterface[]) {
+  const selected = parseInterfaceBinding(value);
+  if (!selected) return value;
+  const matches = interfaces.filter((item) => item.name === selected.name && item.family === selected.family);
+  return matches.length === 1 ? matches[0].address : "";
 }
 
 export function channelStateLabel(item: Channel) {
@@ -125,6 +176,71 @@ export function channelHasFault(item: Channel) {
     item.enabled && item.applyState !== "deleting" &&
     (item.relay?.state === "retrying" || item.relay?.state === "stopped");
 }
+
+export function hasInputStream(item: Channel) {
+  return item.available && item.online && item.tracks.length > 0;
+}
+
+export function hasOutputStream(item: Channel) {
+  return item.outputReady && item.outputTracks.length > 0;
+}
+
+export function sampleChannelRates(
+  channels: Channel[],
+  previous: ReadonlyMap<string, ChannelRateSample>,
+  sampledAt: number,
+) {
+  const samples = new Map<string, ChannelRateSample>();
+  const rates: Record<string, ChannelStreamRates> = {};
+
+  for (const item of channels) {
+    const inputGeneration = `${item.availableTime ?? item.onlineTime ?? ""}:${item.source?.id ?? ""}`;
+    const outputGeneration = `${item.outputAvailableTime ?? ""}:${item.compatibility.mode ?? ""}`;
+    const sample: ChannelRateSample = { sampledAt, inputGeneration, outputGeneration };
+    if (item.available && item.online) sample.inputBytes = item.inboundBytes;
+    if (item.outputReady) {
+      sample.outputBytes = item.outputInboundBytes;
+      sample.deliveryBytes = item.outboundBytes;
+    }
+
+    const prior = previous.get(item.id);
+    const elapsedMs = prior ? sampledAt - prior.sampledAt : 0;
+    rates[item.id] = {
+      inputBitrateBps: inputGeneration === prior?.inputGeneration
+        ? counterBitrate(prior.inputBytes, sample.inputBytes, elapsedMs)
+        : null,
+      outputBitrateBps: outputGeneration === prior?.outputGeneration
+        ? counterBitrate(prior.outputBytes, sample.outputBytes, elapsedMs)
+        : null,
+      deliveryBitrateBps: outputGeneration === prior?.outputGeneration
+        ? counterBitrate(prior.deliveryBytes, sample.deliveryBytes, elapsedMs)
+        : null,
+    };
+    samples.set(item.id, sample);
+  }
+
+  return { rates, samples };
+}
+
+export function trackKind(track: Track): TrackKind {
+  const codec = track.codec.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (numberProperty(track, "width") > 0 || numberProperty(track, "height") > 0 || videoCodecs.has(codec)) return "video";
+  if (numberProperty(track, "sampleRate") > 0 || numberProperty(track, "channelCount") > 0 || audioCodecs.has(codec)) return "audio";
+  return "unknown";
+}
+
+function counterBitrate(previous: number | undefined, current: number | undefined, elapsedMs: number) {
+  if (previous === undefined || current === undefined || current < previous || elapsedMs < 250) return null;
+  return ((current - previous) * 8000) / elapsedMs;
+}
+
+function numberProperty(track: Track, key: string) {
+  const value = track.codecProps?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+const videoCodecs = new Set(["h264", "h265", "hevc", "vp8", "vp9", "av1", "mpeg1video", "mpeg2video", "mpeg12video", "mpeg4video", "mjpeg", "jpeg"]);
+const audioCodecs = new Set(["opus", "aac", "mpeg4audio", "mpeg4audiolatm", "mp2", "mp3", "mpeg1audio", "mpeg2audio", "mpeg12audio", "ac3", "eac3", "vorbis", "flac", "lpcm", "speex", "g726", "g722", "g711", "pcma", "pcmu"]);
 
 export function listenerPort(address: string) {
   return address.match(/:(\d+)$/)?.[1] ?? "";
