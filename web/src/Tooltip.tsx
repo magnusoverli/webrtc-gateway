@@ -108,6 +108,7 @@ export function Tooltip({ content, children, placement = "top", clickToOpen = fa
     },
     onKeyDown: (event) => {
       if (event.key === "Escape") {
+        if (open) event.stopPropagation();
         hide();
       } else if (clickToOpen && (event.key === "Enter" || event.key === " ")) {
         event.preventDefault();

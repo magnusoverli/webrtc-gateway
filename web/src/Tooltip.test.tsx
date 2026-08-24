@@ -10,7 +10,8 @@ describe("Tooltip", () => {
 
   it("opens from keyboard focus and closes with Escape", async () => {
     const user = userEvent.setup();
-    render(<HelpTip label="CPU" content="Share of available CPU capacity." />);
+    const parentKeyDown = vi.fn();
+    render(<div onKeyDown={parentKeyDown}><HelpTip label="CPU" content="Share of available CPU capacity." /></div>);
     const trigger = screen.getByRole("button", { name: "Help: CPU" });
     await user.tab();
     expect(document.activeElement).toBe(trigger);
@@ -19,6 +20,9 @@ describe("Tooltip", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("tooltip")).toBeNull();
     expect(document.activeElement).toBe(trigger);
+    expect(parentKeyDown).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    expect(parentKeyDown).toHaveBeenCalledOnce();
   });
 
   it("supports pointer hover and delayed dismissal", async () => {

@@ -1,18 +1,20 @@
-export const railCollapsedKey = "signal-desk.rail-collapsed.v1";
+export const overviewLayoutKey = "signal-desk.overview-layout.v1";
 
 type StorageLike = Pick<Storage, "getItem" | "setItem">;
+type OverviewLayout = "grid" | "list";
 
-export function readRailCollapsed(storage: StorageLike = window.localStorage) {
+export function readOverviewLayout(storage?: StorageLike): OverviewLayout {
   try {
-    return storage.getItem(railCollapsedKey) === "true";
+    const layout = (storage ?? window.localStorage).getItem(overviewLayoutKey);
+    return layout === "list" ? "list" : "grid";
   } catch {
-    return false;
+    return "grid";
   }
 }
 
-export function writeRailCollapsed(collapsed: boolean, storage: StorageLike = window.localStorage) {
+export function writeOverviewLayout(layout: OverviewLayout, storage?: StorageLike) {
   try {
-    storage.setItem(railCollapsedKey, String(collapsed));
+    (storage ?? window.localStorage).setItem(overviewLayoutKey, layout);
   } catch {
     // Storage can be unavailable in restricted browser contexts.
   }

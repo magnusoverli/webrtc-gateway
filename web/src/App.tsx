@@ -17,6 +17,7 @@ import {
   srtListenerURL,
   srtPublishURL,
   trackKind,
+  urlHost,
   type ChannelRateSample,
   type BindingInterface,
   type Channel,
@@ -25,7 +26,12 @@ import {
 } from "./channel";
 import { startSerialPolling } from "./polling";
 import { HelpTip, Tooltip } from "./Tooltip";
-import { railCollapsedKey, readRailCollapsed, writeRailCollapsed } from "./uiPreferences";
+import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
+import { ArrowLeftIcon, ChevronLeftIcon, ChevronRightIcon } from "./Icons";
+import { ModalShell } from "./Modal";
+import { formatBitrate, inputModeLabel } from "./presentation";
+import { ToastProvider, useOptionalToast, useToast } from "./Toast";
+import { readOverviewLayout, writeOverviewLayout } from "./uiPreferences";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 import type { WHEPPlayerState } from "./useWHEPPlayer";
 import { codecWarnings, type PreviewStats, type ReceiverStats, type VideoReceiverStats } from "./webrtc";
@@ -170,9 +176,24 @@ const formatBytes = (value: number) => {
   return `${(value / 1000 ** unit).toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 };
 
-export function App() {
+type DashboardHistoryMode = "push" | "replace";
+
+export function dashboardChannelID(search: string) {
+  return new URLSearchParams(search).get("channel") ?? "";
+}
+
+export function dashboardURL(href: string, channelID = "") {
+  const url = new URL(href);
+  if (channelID) url.searchParams.set("channel", channelID);
+  else url.searchParams.delete("channel");
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function Dashboard() {
+  const { showToast } = useToast();
+  const initialChannelID = useRef(dashboardChannelID(window.location.search)).current;
   const [status, setStatus] = useState<Status | null>(null);
-  const [selectedID, setSelectedID] = useState("");
+  const [selectedID, setSelectedID] = useState(initialChannelID);
   const [statusError, setStatusError] = useState("");
   const [deleteError, setDeleteError] = useState("");
   const [editingID, setEditingID] = useState<string | null>(null);
@@ -181,7 +202,7 @@ export function App() {
   const [saving, setSaving] = useState(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
   const [settingsError, setSettingsError] = useState("");
-  const [previewSaving, setPreviewSaving] = useState(false);
+  const [previewSavingIDs, setPreviewSavingIDs] = useState<ReadonlySet<string>>(() => new Set());
   const [previewSettingError, setPreviewSettingError] = useState("");
   const [revealedPassphrase, setRevealedPassphrase] = useState<string | null>(null);
   const [passphraseError, setPassphraseError] = useState("");
@@ -190,22 +211,41 @@ export function App() {
   const [restartError, setRestartError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [streamRates, setStreamRates] = useState<Record<string, { inputBitrateBps: number | null; outputBitrateBps: number | null; deliveryBitrateBps: number | null }>>({});
-  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
+  const [view, setView] = useState<"overview" | "detail">(initialChannelID ? "detail" : "overview");
+  const [overviewQuery, setOverviewQuery] = useState("");
+  const [overviewFilter, setOverviewFilter] = useState<OverviewFilter>("all");
+  const [overviewLayout, setOverviewLayout] = useState<OverviewLayout>(readOverviewLayout);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
 
   const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
-  const railExpanded = !railCollapsed;
 
-  useEffect(() => writeRailCollapsed(railCollapsed), [railCollapsed]);
+  useEffect(() => writeOverviewLayout(overviewLayout), [overviewLayout]);
 
   useEffect(() => {
-    const synchronize = (event: StorageEvent) => {
-      if (event.key === railCollapsedKey) setRailCollapsed(event.newValue === "true");
+    const synchronizeRoute = () => {
+      const channelID = dashboardChannelID(window.location.search);
+      setView(channelID ? "detail" : "overview");
+      if (channelID) setSelectedID(channelID);
+      setForm(null);
+      setSettingsForm(null);
     };
-    window.addEventListener("storage", synchronize);
-    return () => window.removeEventListener("storage", synchronize);
+    window.addEventListener("popstate", synchronizeRoute);
+    return () => window.removeEventListener("popstate", synchronizeRoute);
   }, []);
+
+  useEffect(() => {
+    if (view !== "detail") return;
+    if (!selectedID) {
+      if (status) showOverview("replace");
+      return;
+    }
+    if (dashboardChannelID(window.location.search) !== selectedID) {
+      window.history.replaceState(null, "", dashboardURL(window.location.href, selectedID));
+    }
+  }, [selectedID, status, view]);
 
   useEffect(() => {
     let disposed = false;
@@ -240,16 +280,35 @@ export function App() {
 
   useEffect(() => setDeleteError(""), [selectedID]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT";
+      const interactive = target?.closest("button, a, [contenteditable='true']");
+      if (typing || interactive || form || settingsForm || view !== "detail") return;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        stepChannel(-1);
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        stepChannel(1);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   const selected = status?.channels.find((item) => item.id === selectedID) ?? null;
   const selectedRates = selected ? streamRates[selected.id] : undefined;
   const selectedFault = Boolean(selected && channelHasFault(selected));
   const inputLive = Boolean(selected?.available && selected.online);
-  const isLive = Boolean(selected?.outputReady);
+  const isLive = Boolean(selected?.enabled && selected?.outputReady && !selectedFault);
   const hasInput = Boolean(selected && hasInputStream(selected));
   const hasOutput = Boolean(selected && hasOutputStream(selected));
   const preview = useWHEPPlayer({
     whepPath: selected?.whepPath ?? "",
-    enabled: Boolean(selected?.automaticPreview && selected.outputReady),
+    enabled: Boolean(view === "detail" && selected?.automaticPreview && selected.outputReady),
     retry: true,
   });
   const compatibility = selected
@@ -273,7 +332,7 @@ export function App() {
     status?.settings.applyState ?? "pending",
   );
   const mediaBindingAvailable = !status?.network.media.resolutionError && status?.network.media.activeAddress !== undefined;
-  const selectedMediaHost = selectedIsSRTPush && mediaBindingAvailable
+  const selectedMediaHost = mediaBindingAvailable
     ? mediaHost(mediaBinding.address, window.location.hostname)
     : "";
   const selectedSRTURL = selectedIsSRTPush && mediaBindingAvailable
@@ -304,11 +363,32 @@ export function App() {
     setPassphraseError("");
     setRevealingPassphrase(false);
     setPreviewSettingError("");
+    setConfirmingDelete(false);
+    setDeleting(false);
     return () => {
       passphraseRequestRef.current?.abort();
       passphraseRequestRef.current = null;
     };
   }, [selectedID]);
+
+  const stepChannel = (delta: number) => {
+    const list = status?.channels ?? [];
+    if (list.length < 2) return;
+    const index = list.findIndex((item) => item.id === selectedID);
+    const next = list[(index + delta + list.length) % list.length];
+    if (next) showChannel(next.id, "replace");
+  };
+
+  const showOverview = (historyMode: DashboardHistoryMode = "push") => {
+    setView("overview");
+    window.history[`${historyMode}State`](null, "", dashboardURL(window.location.href));
+  };
+
+  const showChannel = (channelID: string, historyMode: DashboardHistoryMode = "push") => {
+    setSelectedID(channelID);
+    setView("detail");
+    window.history[`${historyMode}State`](null, "", dashboardURL(window.location.href, channelID));
+  };
 
   const openCreate = () => {
     setEditingID(null);
@@ -321,6 +401,7 @@ export function App() {
     const desiredAddress = status.network.management.resolvedAddress ?? resolveInterfaceBinding(status.settings.managementBindAddress, status.network.interfaces);
     if (!desiredAddress) {
       setRestartError(status.network.management.resolutionError ?? "The selected interface has no usable address");
+      showToast({ kind: "error", message: "Gateway restart is blocked by the selected interface." });
       return;
     }
     const desiredOrigin = managementOrigin(
@@ -337,6 +418,7 @@ export function App() {
       if (response.status !== 202) {
         throw new Error(result.error ?? `Request failed with ${response.status}`);
       }
+      showToast({ kind: "info", message: "Gateway restart requested." });
       window.setTimeout(() => {
         if (destination.origin === window.location.origin && window.location.pathname === "/" && !window.location.search && !window.location.hash) {
           window.location.reload();
@@ -346,6 +428,7 @@ export function App() {
       }, 1_000);
     } catch (error) {
       setRestartError(`${error instanceof Error ? error.message : "The restart request failed"}. Verify the Docker restart policy and try again.`);
+      showToast({ kind: "error", message: "Gateway restart failed." });
       setRestarting(false);
     }
   };
@@ -407,19 +490,22 @@ export function App() {
         const failed = result as GlobalSettings;
         setSettingsError(`Settings saved, but the media plane rejected them: ${failed.applyError ?? "apply failed"}`);
         setRefreshToken((current) => current + 1);
+        showToast({ kind: "error", message: "Settings saved, but the media plane rejected them." });
         return;
       }
       setSettingsForm(null);
       setRefreshToken((current) => current + 1);
+      showToast({ kind: "success", message: "Settings saved." });
     } catch (error) {
       setSettingsError(error instanceof Error ? error.message : "Unable to save settings");
+      showToast({ kind: "error", message: "Settings were not saved." });
     } finally {
       setSaving(false);
     }
   };
 
   const updateAutomaticPreview = async (item: Channel, automaticPreview: boolean) => {
-    setPreviewSaving(true);
+    setPreviewSavingIDs((current) => new Set(current).add(item.id));
     setPreviewSettingError("");
     setStatus((current) => current ? {
       ...current,
@@ -439,9 +525,14 @@ export function App() {
         ...current,
         channels: current.channels.map((channel) => channel.id === item.id ? { ...channel, automaticPreview: item.automaticPreview } : channel),
       } : current);
-      setPreviewSettingError(error instanceof Error ? error.message : "Unable to update automatic preview");
+      setPreviewSettingError(error instanceof Error ? error.message : "Unable to update preview");
+      showToast({ kind: "error", message: "Preview was not updated." });
     } finally {
-      setPreviewSaving(false);
+      setPreviewSavingIDs((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
     }
   };
 
@@ -492,16 +583,23 @@ export function App() {
       setSelectedID(saved.id);
       setForm(null);
       setRefreshToken((current) => current + 1);
+      showToast({
+        kind: saved.applyState === "error" ? "error" : "success",
+        message: saved.applyState === "error"
+          ? "Channel saved, but its configuration was not applied."
+          : editingID ? "Channel updated." : "Channel created.",
+      });
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to save channel");
+      showToast({ kind: "error", message: "Channel was not saved." });
     } finally {
       setSaving(false);
     }
   };
 
   const deleteChannel = async (item: Channel) => {
-    if (!window.confirm(`Delete ${item.name}? Existing viewers will be disconnected.`)) return;
     setDeleteError("");
+    setDeleting(true);
     try {
       const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}`, { method: "DELETE" });
       if (!response.ok) {
@@ -510,10 +608,16 @@ export function App() {
       }
       if (response.status !== 202) {
         setSelectedID(status?.channels.find((channel) => channel.id !== item.id)?.id ?? "");
+        showOverview("replace");
       }
       setRefreshToken((current) => current + 1);
+      setConfirmingDelete(false);
+      showToast({ kind: "success", message: response.status === 202 ? "Channel deletion is pending." : "Channel deleted." });
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : "Unable to delete channel");
+      showToast({ kind: "error", message: "Channel was not deleted." });
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -530,83 +634,40 @@ export function App() {
       : status.channels.length === 0 ? "No channels configured" : "Selecting channel");
 
   return (
-    <div className={`app-shell${railCollapsed ? " rail-collapsed" : ""}`}>
-      <aside className="rail" aria-label="Gateway navigation">
-        <div className="brand-block">
+    <div className="app-shell">
+      <header className="topnav" inert={form || settingsForm ? true : undefined} aria-hidden={form || settingsForm ? true : undefined}>
+        <button className="topnav-brand" type="button" onClick={() => showOverview()}>
           <span className="brand-mark" aria-hidden="true">SD</span>
-          <div className="brand-copy">
+          <span className="brand-copy">
             <strong>Signal Desk</strong>
             <small>WebRTC gateway</small>
-          </div>
-          <Tooltip content={railExpanded ? "Hide gateway navigation and resource details." : "Show gateway navigation and resource details."} placement="right">
-            {(tooltip) => <button
-              {...tooltip}
-              className="rail-toggle"
-              type="button"
-              aria-controls="gateway-navigation"
-              aria-expanded={railExpanded}
-              aria-label={railExpanded ? "Collapse gateway navigation" : "Expand gateway navigation"}
-              onClick={() => setRailCollapsed((collapsed) => !collapsed)}
-            >
-              <span aria-hidden="true">{railExpanded ? "‹" : "›"}</span>
-            </button>}
-          </Tooltip>
+          </span>
+        </button>
+
+        <nav className="topnav-links" aria-label="Primary">
+          <button
+            className={view === "overview" ? "topnav-link active" : "topnav-link"}
+            type="button"
+            aria-current={view === "overview" ? "page" : undefined}
+            onClick={() => showOverview()}
+          >Overview</button>
+          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status} title={`Global settings — ${gatewaySettingsState}`}>Settings</button>
+        </nav>
+
+        <ResourceStrip resources={status?.resources} disconnected={Boolean(statusError)} />
+
+        <div className="topnav-status">
+          <span className={statusError ? "signal fault" : status?.media.reachable ? "signal online" : status ? "signal fault" : "signal"} />
+          <span>{statusError ? status ? "Status stale" : "Gateway unavailable" : status?.media.reachable ? "Media plane connected" : status ? "Media plane unavailable" : "Loading Gateway"}</span>
+          <HelpTip
+            label="Gateway status"
+            content="Connection state between the management application and the shared MediaMTX media plane."
+            placement="left"
+          />
         </div>
+      </header>
 
-        <div id="gateway-navigation" className="rail-content" hidden={!railExpanded}>
-          <section className="rail-group gateway-rail" aria-labelledby="gateway-rail-title">
-          <div className="rail-heading">
-            <span id="gateway-rail-title">Gateway <HelpTip label="Gateway status" content="Connection state between the management application and the shared MediaMTX media plane." placement="right" /></span>
-          </div>
-          <div className="service-state">
-            <span className={status?.media.reachable ? "signal online" : status ? "signal fault" : "signal"} />
-            <div>
-              <strong>{status?.media.reachable ? "Media plane connected" : status ? "Media plane unavailable" : "Loading Gateway"}</strong>
-              <small>{status?.media.version ? `MediaMTX ${status.media.version}` : "Shared service status"}</small>
-            </div>
-          </div>
-          <button className="settings-nav" type="button" onClick={openSettings} disabled={!status}>
-            <span>Global settings</span>
-            <small>{gatewaySettingsState}</small>
-          </button>
-          </section>
-
-          <section className="rail-group channels-rail" aria-labelledby="channels-rail-title">
-          <div className="rail-heading">
-            <span id="channels-rail-title">Channels</span>
-            <button className="rail-add" type="button" onClick={openCreate} disabled={!status}>Add</button>
-          </div>
-
-          <nav className="channel-list" aria-label="Channels">
-            {status?.channels.map((item) => {
-              const live = item.outputReady;
-              const state = channelStateLabel(item);
-              const fault = channelHasFault(item);
-              return (
-                <button
-                  className={item.id === selectedID ? "channel active" : "channel"}
-                  key={item.id}
-                  onClick={() => setSelectedID(item.id)}
-                  type="button"
-                  aria-pressed={item.id === selectedID}
-                >
-                  <span className={live ? "signal online" : fault ? "signal fault" : "signal"} />
-                  <span>{item.name}</span>
-                  <small>{state}</small>
-                </button>
-              );
-            })}
-            {status === null && <div className="empty-rail">{statusError ? "Channels unavailable" : "Loading channels..."}</div>}
-            {status !== null && status.channels.length === 0 && (
-              <button className="empty-rail empty-action" type="button" onClick={openCreate}>Create the first channel</button>
-            )}
-          </nav>
-          </section>
-          <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
-        </div>
-      </aside>
-
-      <main className="workspace">
+      <main className="workspace" inert={form || settingsForm ? true : undefined} aria-hidden={form || settingsForm ? true : undefined}>
         <div className="gateway-notices" aria-label="Gateway notices">
           {statusError && <ScopedNotice scope="Gateway" message={`${statusError}. Gateway will retry automatically.`} />}
           {status?.settings.applyState === "error" && <ScopedNotice scope="Gateway" message={`Global settings saved but not applied: ${status.settings.applyError ?? "Media plane apply failed"}`} />}
@@ -634,17 +695,38 @@ export function App() {
           )}
         </div>
 
+        {view === "detail" && (
+        <div className="detail-breadcrumb">
+          <button className="crumb-back" type="button" onClick={() => showOverview()}><ArrowLeftIcon /> Overview</button>
+          <span className="crumb-divider">/</span>
+          <div className="crumb-stepper">
+            <button className="crumb-step" type="button" onClick={() => stepChannel(-1)} aria-label="Previous channel"><ChevronLeftIcon /></button>
+            <span>{selected?.name ?? "Channel"}</span>
+            <button className="crumb-step" type="button" onClick={() => stepChannel(1)} aria-label="Next channel"><ChevronRightIcon /></button>
+          </div>
+          <span className="crumb-hint">← → to switch channels</span>
+        </div>
+        )}
+
+        {view === "detail" && (<>
         <header className="topbar">
           <div>
-            <span className="eyebrow">{selected ? "CHANNEL" : "GATEWAY"}</span>
+            <span className="eyebrow">{selected ? inputModeLabel(selected.input.mode) : "GATEWAY"}</span>
             <h1>{workspaceTitle}</h1>
           </div>
           <div className="topbar-actions">
-            {selected && <button className="button secondary" type="button" disabled={selected.applyState === "deleting"} onClick={() => openEdit(selected)}>Configure channel</button>}
+            {selected && (confirmingDelete ? <div className="inline-confirm" role="group" aria-label="Confirm channel deletion">
+              <span>Disconnect viewers and delete?</span>
+              <button className="button danger" type="button" disabled={deleting} onClick={() => void deleteChannel(selected)}>{deleting ? "Deleting..." : "Confirm delete"}</button>
+              <button className="button secondary" type="button" disabled={deleting} onClick={() => setConfirmingDelete(false)}>Cancel</button>
+            </div> : <>
+              <button className="button danger ghost-danger" type="button" disabled={selected.applyState === "deleting"} onClick={() => setConfirmingDelete(true)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete"}</button>
+              <button className="button secondary" type="button" disabled={selected.applyState === "deleting"} onClick={() => openEdit(selected)}>Configure</button>
+            </>)}
             {status && !selected && <button className="button secondary" type="button" onClick={status.channels.length ? undefined : openCreate} disabled={status.channels.length > 0}>Create channel</button>}
-            <div className={isLive ? "state-pill live" : statusError && !status ? "state-pill fault" : "state-pill"}>
-              <span className={isLive ? "signal online" : selectedFault || Boolean(statusError && !status) ? "signal fault" : "signal"} />
-              {selected ? channelStateLabel(selected) : status === null ? statusError ? "Unavailable" : "Loading" : status.channels.length ? "Selecting" : "Empty"}
+            <div className={statusError || selectedFault ? "state-pill fault" : isLive ? "state-pill live" : "state-pill"}>
+              <span className={statusError || selectedFault ? "signal fault" : isLive ? "signal online" : "signal"} />
+              {statusError ? "Status stale" : selected ? channelStateLabel(selected) : status === null ? "Loading" : status.channels.length ? "Selecting" : "Empty"}
               <HelpTip label="channel state" content="Summarizes configuration, input, compatibility conversion, and output readiness for the selected channel." placement="left" />
             </div>
           </div>
@@ -655,43 +737,49 @@ export function App() {
           {selected?.applyState === "deleting" && <ScopedNotice scope={`Channel · ${selected.name}`} message="Deletion is pending and will be retried automatically." />}
           {selected && deleteError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Deletion failed: ${deleteError}`} />}
           {selected?.enabled && selected.applyState !== "deleting" && selected.relay && (selected.relay.state === "retrying" || selected.relay.state === "stopped") && <ScopedNotice scope={`Channel · ${selected.name}`} message={`SRT listener is unavailable: ${selected.relay.lastError ?? "the relay process stopped"}. Gateway will retry automatically.`} />}
-          {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Automatic preview was not updated: ${previewSettingError}`} />}
+          {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Preview was not updated: ${previewSettingError}`} />}
         </div>
+        </>)}
 
-        {selected ? (
+        {view === "overview" ? (
+          <>
+          <ChannelOverview
+            channels={status?.channels ?? []}
+            loading={status === null}
+            error={statusError}
+            rates={streamRates}
+            query={overviewQuery}
+            filter={overviewFilter}
+            layout={overviewLayout}
+            onQueryChange={setOverviewQuery}
+            onFilterChange={setOverviewFilter}
+            onLayoutChange={setOverviewLayout}
+            onSelect={(id) => showChannel(id)}
+            onEdit={openEdit}
+            previewSavingIDs={previewSavingIDs}
+            onAutomaticPreviewChange={(item, enabled) => void updateAutomaticPreview(item, enabled)}
+            onCreate={openCreate}
+            onRetry={() => setRefreshToken((current) => current + 1)}
+          />
+          <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
+          </>
+        ) : selected ? (
           <>
             <section className="connection-grid" aria-label="Channel connections">
-              <article className="panel connection-panel input-connection-panel">
-                <div className="panel-heading connection-heading">
-                  <div>
-                    <span className="eyebrow">INPUT CONNECTION</span>
-                    <h2>Encoder destination</h2>
-                  </div>
-                  <span className={selectedIsSRTPush ? "connection-badge" : "connection-badge muted"}>{selectedIsSRTPush ? "SRT PUSH" : "NOT APPLICABLE"}</span>
-                </div>
-                <BindingContext
-                  state={mediaBinding.state}
-                  activeLabel={bindingLabel(mediaBinding.address, status?.network.interfaces ?? [])}
-                  scope="Gateway › Media interface"
-                  error={status?.settings.applyError}
-                />
-                <div className="connection-rows">
-                  <ConnectionRow label="SRT URL" value={selectedSRTURL || "-"} />
-                  <ConnectionRow label="Destination IP" value={selectedMediaHost || "-"} />
-                  <ConnectionRow label="Destination port" value={selectedIsSRTPush && selected.input.srt?.port ? String(selected.input.srt.port) : "-"} />
-                  <ConnectionRow label="SRT mode" value={selectedIsSRTPush ? "Caller" : "-"} />
-                  <PassphraseRow
-                    applicable={selectedIsSRTPush}
-                    configured={Boolean(selected.input.srt?.hasPassphrase)}
-                    passphrase={revealedPassphrase}
-                    loading={revealingPassphrase}
-                    error={passphraseError}
-                    onReveal={() => void revealPassphrase(selected)}
-                    onHide={() => setRevealedPassphrase(null)}
-                  />
-                  <ConnectionRow label="MPEG-TS-only stream-ID URL" value={selectedSRTAdvancedURL || "-"} secondary />
-                </div>
-              </article>
+              <InputConnectionPanel
+                channel={selected}
+                bindingState={mediaBinding.state}
+                bindingName={bindingLabel(mediaBinding.address, status?.network.interfaces ?? [])}
+                bindingError={status?.settings.applyError}
+                mediaHost={selectedMediaHost}
+                srtURL={selectedSRTURL}
+                advancedSRTURL={selectedSRTAdvancedURL}
+                passphrase={revealedPassphrase}
+                passphraseLoading={revealingPassphrase}
+                passphraseError={passphraseError}
+                onReveal={() => void revealPassphrase(selected)}
+                onHide={() => setRevealedPassphrase(null)}
+              />
 
               <article className="panel connection-panel output-connection-panel">
                 <div className="panel-heading connection-heading">
@@ -724,13 +812,13 @@ export function App() {
                   <span className="eyebrow">WEBRTC PREVIEW</span>
                   <h2>{previewTitle(preview.state, selected.automaticPreview, isLive)}</h2>
                 </div>
-                <Tooltip content="Controls whether selecting this channel automatically opens one muted WebRTC preview session." placement="left">
+                <Tooltip content="Controls whether the dashboard opens a muted WebRTC preview for this channel." placement="left">
                   {(tooltip) => <button
                     {...tooltip}
                     className={selected.automaticPreview ? "toggle active" : "toggle"}
                     type="button"
-                    disabled={previewSaving || selected.applyState === "deleting"}
-                    aria-label={selected.automaticPreview ? "Disable automatic preview" : "Enable automatic preview"}
+                    disabled={previewSavingIDs.has(selected.id) || selected.applyState === "deleting"}
+                    aria-label={selected.automaticPreview ? "Disable preview" : "Enable preview"}
                     aria-pressed={selected.automaticPreview}
                     onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
                   ><span /></button>}
@@ -740,8 +828,8 @@ export function App() {
                 <video ref={preview.videoRef} autoPlay playsInline muted controls />
                 {!selected.automaticPreview && <div className="preview-message overlay-message">
                   <span className="preview-icon">OFF</span>
-                  <strong>Automatic preview disabled for this channel</strong>
-                  <p>Enable the persisted setting to create a dashboard WHEP reader when output is ready.</p>
+                  <strong>Preview disabled for this channel</strong>
+                  <p>Enable Preview to create a muted dashboard WHEP reader when output is ready.</p>
                 </div>}
                 {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`}>
                   <span className="preview-icon">{channelHasFault(selected) ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
@@ -816,9 +904,6 @@ export function App() {
               <InfoLine label="Ingest path" value={selected.path} mono />
               <InfoLine label="WebRTC route" help="Direct passthrough avoids transcoding. Compatibility output uses an isolated FFmpeg worker when browser-safe codecs are required." value={selected.compatibility.mode === "transcoded" ? "Automatic H264/Opus compatibility" : "Direct passthrough"} />
               <InfoLine label="WHEP signaling" help="HTTP endpoint browsers use to create and control a WebRTC receive session for this channel." value={whepURL} mono />
-              <div className="danger-row">
-                <button className="button danger" type="button" disabled={selected.applyState === "deleting"} onClick={() => void deleteChannel(selected)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete channel"}</button>
-              </div>
             </section>
           </>
         ) : (
@@ -886,6 +971,10 @@ export function App() {
   );
 }
 
+export function App() {
+  return <ToastProvider><Dashboard /></ToastProvider>;
+}
+
 function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefault, mediaBindingLabel, onChange, onClose, onSave }: {
   form: ChannelForm;
   editing: boolean;
@@ -913,34 +1002,31 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
   };
 
   return (
-    <div className="editor-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+    <ModalShell labelledBy="editor-title" onClose={onClose} dismissDisabled={saving} closeLabel="Close channel editor">
         <header className="editor-header">
           <div>
             <span className="eyebrow">CHANNEL CONFIGURATION</span>
             <h2 id="editor-title">{editing ? "Edit channel" : "New channel"}</h2>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close">×</button>
         </header>
 
         <div className="editor-body">
-          {error && <div className="alert editor-alert">{error}</div>}
+          {error && <div className="alert editor-alert" role="alert">{error}</div>}
 
           <div className="form-grid">
             <label className="field full">
               <span>Name</span>
-              <input value={form.name} maxLength={80} onChange={(event) => update("name", event.target.value)} placeholder="Studio camera" />
+              <input autoFocus value={form.name} maxLength={80} onChange={(event) => update("name", event.target.value)} placeholder="Studio camera" />
             </label>
 
-            <label className="field full">
-              <FieldTitle help="Select how the source reaches Gateway. Push modes listen locally; pull mode connects outward to a source.">Input mode</FieldTitle>
-              <select value={form.mode} onChange={(event) => switchMode(event.target.value as InputMode)}>
-                <option value="srt-push">SRT push into gateway</option>
-                <option value="srt-pull">SRT pull from source</option>
-                <option value="rtp-unicast">RTP unicast</option>
-                <option value="rtp-multicast">RTP multicast</option>
-              </select>
-            </label>
+            <fieldset className="field full mode-field">
+              <legend>Input mode <HelpTip label="Input mode" content="Select how the source reaches Gateway. Push modes listen locally; pull mode connects outward to a source." placement="left" /></legend>
+              <div className="mode-switch">
+                {(["srt-push", "srt-pull", "rtp-unicast", "rtp-multicast"] as InputMode[]).map((mode) => (
+                  <button key={mode} className={form.mode === mode ? "active" : ""} type="button" aria-pressed={form.mode === mode} onClick={() => switchMode(mode)}>{inputModeLabel(mode)}</button>
+                ))}
+              </div>
+            </fieldset>
 
             {isRTP && (
               <>
@@ -1036,18 +1122,17 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
 
             <div className="field option-stack">
               <label className="check"><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} /><span className="check-copy">Channel enabled <HelpTip label="Channel enabled" content="Starts the configured input and makes output available. Disabling stops listeners and playback without deleting configuration." placement="left" /></span></label>
-              <label className="check"><input type="checkbox" checked={form.automaticPreview} onChange={(event) => update("automaticPreview", event.target.checked)} /><span className="check-copy">Automatic dashboard preview <HelpTip label="Automatic dashboard preview" content="Creates one muted WebRTC reader when this channel is selected and output is ready." placement="left" /></span></label>
+              <label className="check"><input type="checkbox" checked={form.automaticPreview} onChange={(event) => update("automaticPreview", event.target.checked)} /><span className="check-copy">Dashboard preview <HelpTip label="Dashboard preview" content="Creates a muted WebRTC reader for visible overview tiles and the selected channel when output is ready." placement="left" /></span></label>
               <label className="check"><input type="checkbox" checked={form.useAbsoluteTimestamp} onChange={(event) => update("useAbsoluteTimestamp", event.target.checked)} /><span className="check-copy">Preserve absolute timestamps <HelpTip label="Preserve absolute timestamps" content="Keeps source timing information through MediaMTX and compatibility output when the source provides usable timestamps." placement="left" /></span></label>
             </div>
           </div>
         </div>
 
         <footer className="editor-footer">
-          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className="button secondary" type="button" disabled={saving} onClick={onClose}>Cancel</button>
           <button className="button primary" type="button" disabled={saving} onClick={onSave}>{saving ? "Saving..." : editing ? "Save changes" : "Create channel"}</button>
         </footer>
-      </section>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1086,18 +1171,16 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
   };
 
   return (
-    <div className="editor-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="editor settings-editor" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <ModalShell labelledBy="settings-title" onClose={onClose} dismissDisabled={saving} closeLabel="Close settings" className="settings-editor">
         <header className="editor-header">
           <div>
             <span className="eyebrow">GATEWAY CONFIGURATION</span>
             <h2 id="settings-title">Global settings</h2>
           </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close">×</button>
         </header>
 
         <div className="editor-body">
-          {error && <div className="alert editor-alert">{error}</div>}
+          {error && <div className="alert editor-alert" role="alert">{error}</div>}
           <div className="form-grid">
             <h3 className="settings-section">Control and media planes</h3>
             <p className="settings-section-note">Follow an interface to keep using its current address after DHCP changes, or retain an existing fixed address.</p>
@@ -1276,11 +1359,10 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
         </div>
 
         <footer className="editor-footer">
-          <button className="button secondary" type="button" onClick={onClose}>Cancel</button>
+          <button className="button secondary" type="button" disabled={saving} onClick={onClose}>Cancel</button>
           <button className="button primary" type="button" disabled={saving} onClick={onSave}>{saving ? "Saving..." : "Save settings"}</button>
         </footer>
-      </section>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1403,6 +1485,74 @@ function ScopedNotice({ scope, message }: { scope: string; message: string }) {
   );
 }
 
+export function InputConnectionPanel({ channel, bindingState, bindingName, bindingError, mediaHost: host, srtURL, advancedSRTURL, passphrase, passphraseLoading, passphraseError, onReveal, onHide }: {
+  channel: Channel;
+  bindingState: "active" | "pending-restart" | "unconfirmed";
+  bindingName: string;
+  bindingError?: string;
+  mediaHost: string;
+  srtURL: string;
+  advancedSRTURL: string;
+  passphrase: string | null;
+  passphraseLoading: boolean;
+  passphraseError: string;
+  onReveal: () => void;
+  onHide: () => void;
+}) {
+  const { mode, srt, rtp } = channel.input;
+  const isSRT = mode === "srt-push" || mode === "srt-pull";
+  const pullQuery = [
+    srt?.streamId ? `streamid=${encodeURIComponent(srt.streamId)}` : "",
+    srt?.latencyMs ? `latency=${srt.latencyMs}` : "",
+  ].filter(Boolean).join("&");
+  const pullURL = mode === "srt-pull" && srt?.host && srt.port
+    ? `srt://${urlHost(srt.host)}:${srt.port}${pullQuery ? `?${pullQuery}` : ""}`
+    : "";
+  const title = mode === "srt-push"
+    ? "Encoder destination"
+    : mode === "srt-pull" ? "Remote SRT source" : mode === "rtp-multicast" ? "Multicast receiver" : "RTP receiver";
+
+  return (
+    <article className="panel connection-panel input-connection-panel">
+      <div className="panel-heading connection-heading">
+        <div><span className="eyebrow">INPUT CONNECTION</span><h2>{title}</h2></div>
+        <span className="connection-badge">{inputModeLabel(mode).toUpperCase()}</span>
+      </div>
+      <BindingContext state={bindingState} activeLabel={bindingName} scope="Gateway › Media interface" error={bindingError} />
+      <div className="connection-rows">
+        {mode === "srt-push" && <>
+          <ConnectionRow label="SRT URL" value={srtURL || "-"} />
+          <ConnectionRow label="Destination IP" value={host || "-"} />
+          <ConnectionRow label="Destination port" value={srt?.port ? String(srt.port) : "-"} />
+          <ConnectionRow label="SRT mode" value="Caller" />
+        </>}
+        {mode === "srt-pull" && <>
+          <ConnectionRow label="Source URL" value={pullURL || "-"} />
+          <ConnectionRow label="Source host" value={srt?.host || "-"} />
+          <ConnectionRow label="Source port" value={srt?.port ? String(srt.port) : "-"} />
+          <ConnectionRow label="Stream ID" value={srt?.streamId || "Not configured"} />
+          <ConnectionRow label="Latency" value={srt?.latencyMs ? `${srt.latencyMs} ms` : "Default"} />
+        </>}
+        {mode === "rtp-unicast" && <>
+          <ConnectionRow label="Destination IP" value={host || "-"} />
+          <ConnectionRow label="Destination port" value={rtp?.port ? String(rtp.port) : "-"} />
+          <ConnectionRow label="Source IP restriction" value={rtp?.sourceIp || "Any source"} />
+          <ConnectionRow label="Session description" value={rtp?.sdp || "-"} />
+        </>}
+        {mode === "rtp-multicast" && <>
+          <ConnectionRow label="Multicast group" value={rtp?.address || "-"} />
+          <ConnectionRow label="Destination port" value={rtp?.port ? String(rtp.port) : "-"} />
+          <ConnectionRow label="Receive interface" value={rtp?.interface || bindingName} />
+          <ConnectionRow label="Source IP restriction" value={rtp?.sourceIp || "Any source"} />
+          <ConnectionRow label="Session description" value={rtp?.sdp || "-"} />
+        </>}
+        <PassphraseRow applicable={isSRT} configured={Boolean(srt?.hasPassphrase)} passphrase={passphrase} loading={passphraseLoading} error={passphraseError} onReveal={onReveal} onHide={onHide} />
+        {mode === "srt-push" && <ConnectionRow label="MPEG-TS-only stream-ID URL" value={advancedSRTURL || "-"} secondary />}
+      </div>
+    </article>
+  );
+}
+
 function BindingContext({ state, activeLabel, desiredLabel, scope, error }: {
   state: "active" | "pending-restart" | "unconfirmed";
   activeLabel: string;
@@ -1416,6 +1566,28 @@ function BindingContext({ state, activeLabel, desiredLabel, scope, error }: {
       <p>{scope} · {activeLabel}</p>
       {state === "pending-restart" && desiredLabel && <small>After Gateway restart · {desiredLabel}</small>}
       {state === "unconfirmed" && <small>{error ? `Apply failed: ${error}` : "The shared media binding has not been confirmed active."}</small>}
+    </div>
+  );
+}
+
+export function ResourceStrip({ resources, disconnected = false }: { resources?: ResourceSnapshot; disconnected?: boolean }) {
+  const scopes: Array<[string, ResourceScope | undefined]> = [
+    ["Gateway", resources?.gateway],
+    ["Host", resources?.host],
+  ];
+  return (
+    <div className="topnav-resources" aria-label="Resource usage">
+      {scopes.map(([label, scope]) => {
+        const cpu = scope?.cpu.percent;
+        const memory = scope?.memory.usedBytes;
+        const unavailable = disconnected || !scope || scope.status === "unavailable" || cpu === null || cpu === undefined;
+        return (
+          <span className={unavailable ? "topnav-resource stale" : "topnav-resource"} key={label}>
+            <em>{label}</em>
+            {unavailable ? "—" : `${cpu.toFixed(0)}% · ${formatBytes(memory ?? 0)}`}
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -1586,6 +1758,7 @@ function CopyButton({ label, value, input }: {
   value: string;
   input: { current: HTMLInputElement | null };
 }) {
+  const toast = useOptionalToast();
   const [feedback, setFeedback] = useState<"" | "Copied" | "Selected">("");
 
   useEffect(() => setFeedback(""), [value]);
@@ -1596,6 +1769,7 @@ function CopyButton({ label, value, input }: {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
       await navigator.clipboard.writeText(value);
       setFeedback("Copied");
+      toast?.showToast({ kind: "success", message: `${label} copied.` });
       return;
     } catch {
       input.current?.focus();
@@ -1603,12 +1777,14 @@ function CopyButton({ label, value, input }: {
       try {
         if (document.execCommand("copy")) {
           setFeedback("Copied");
+          toast?.showToast({ kind: "success", message: `${label} copied.` });
           return;
         }
       } catch {
         // Keep the field selected for manual copying.
       }
       setFeedback("Selected");
+      toast?.showToast({ kind: "info", message: `${label} selected. Press Ctrl+C to copy.` });
     }
   };
 
@@ -1824,17 +2000,8 @@ function formatChannels(value: number) {
   return String(value);
 }
 
-function inputModeLabel(mode: InputMode) {
-  return {
-    "srt-push": "SRT push",
-    "srt-pull": "SRT pull",
-    "rtp-unicast": "RTP unicast",
-    "rtp-multicast": "RTP multicast",
-  }[mode];
-}
-
 function previewTitle(state: WHEPPlayerState, automatic: boolean, live: boolean) {
-  if (!automatic) return "Automatic preview off";
+  if (!automatic) return "Preview off";
   if (state === "connecting") return "Connecting preview";
   if (state === "playing") return "Live preview";
   if (state === "error") return "Preview error";
@@ -1857,13 +2024,6 @@ function compatibilityTitle(item: Channel) {
   if (item.compatibility.state === "starting") return item.compatibility.worker.queued ? "WAITING FOR CAPACITY" : "AUTOMATIC CONVERSION";
   if (item.compatibility.mode === "transcoded") return "AUTOMATICALLY NORMALIZED";
   return item.input.mode.startsWith("rtp-") && codecWarnings(item.tracks).length ? "CHECK PLAYBACK" : "DIRECT PLAYBACK";
-}
-
-function formatBitrate(bitsPerSecond: number | null | undefined) {
-  if (bitsPerSecond === null || bitsPerSecond === undefined) return "Measuring";
-  if (bitsPerSecond < 1000) return `${Math.round(bitsPerSecond)} bps`;
-  if (bitsPerSecond < 1_000_000) return `${(bitsPerSecond / 1000).toFixed(1)} kbps`;
-  return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
 }
 
 function interfaceLabel(item: NetworkInterface) {

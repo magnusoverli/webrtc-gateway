@@ -1,14 +1,46 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, ConnectionRow, ResourceFooter } from "./App";
-import { railCollapsedKey } from "./uiPreferences";
+import { App, ConnectionRow, dashboardChannelID, dashboardURL, InputConnectionPanel, ResourceFooter } from "./App";
+import type { Channel, InputMode } from "./channel";
 
-describe("dashboard rail", () => {
+function channelWithMode(mode: InputMode): Channel {
+  return {
+    id: "channel-1",
+    number: 1,
+    name: "Studio",
+    path: "channel-1",
+    enabled: true,
+    automaticPreview: false,
+    input: mode === "srt-pull"
+      ? { mode, srt: { host: "2001:db8::10", port: 9000, streamId: "studio feed", hasPassphrase: true, latencyMs: 120 } }
+      : { mode, rtp: { address: mode === "rtp-multicast" ? "239.0.0.1" : "0.0.0.0", port: 22000, sourceIp: "192.0.2.20", sdp: "v=0" } },
+    maxReaders: 0,
+    useAbsoluteTimestamp: false,
+    applyState: "applied",
+    whepPath: "/whep/1",
+    viewerPath: "/view/1",
+    embedPath: "/embed/1",
+    available: false,
+    online: false,
+    inboundBytes: 0,
+    outputInboundBytes: 0,
+    outboundBytes: 0,
+    inboundFramesInError: 0,
+    readers: [],
+    tracks: [],
+    outputReady: false,
+    outputTracks: [],
+    compatibility: { state: "offline", required: false, reasons: [], worker: { running: false, restarts: 0 } },
+  };
+}
+
+describe("dashboard navigation", () => {
   beforeEach(() => {
     window.localStorage.clear();
+    window.history.replaceState(null, "", "/");
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => undefined)));
   });
 
@@ -17,18 +49,22 @@ describe("dashboard rail", () => {
     vi.unstubAllGlobals();
   });
 
-  it("collapses navigation accessibly and persists the preference", async () => {
-    const user = userEvent.setup();
+  it("exposes the overview as the current primary navigation item", () => {
     render(<App />);
-    const collapse = screen.getByRole("button", { name: "Collapse gateway navigation" });
-    const navigation = document.getElementById("gateway-navigation");
-    expect(collapse.getAttribute("aria-expanded")).toBe("true");
-    expect(navigation?.hasAttribute("hidden")).toBe(false);
+    expect(screen.getByRole("navigation", { name: "Primary" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
+    expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
+  });
 
-    await user.click(collapse);
-    expect(screen.getByRole("button", { name: "Expand gateway navigation" }).getAttribute("aria-expanded")).toBe("false");
-    expect(navigation?.hasAttribute("hidden")).toBe(true);
-    await waitFor(() => expect(window.localStorage.getItem(railCollapsedKey)).toBe("true"));
+  it("synchronizes detail state with browser history", () => {
+    window.history.replaceState(null, "", "/?channel=studio");
+    render(<App />);
+    expect(document.querySelector(".detail-breadcrumb")).not.toBeNull();
+
+    window.history.replaceState(null, "", "/");
+    fireEvent.popState(window);
+    expect(document.querySelector(".detail-breadcrumb")).toBeNull();
+    expect(screen.getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
   });
 
   it("marks retained resource values stale when status polling is disconnected", () => {
@@ -69,5 +105,47 @@ describe("dashboard rail", () => {
     expect(screen.getByRole("link", { name: "Open Channel embed URL" }).getAttribute("href")).toBe(value);
     await user.click(screen.getByRole("button", { name: "Copy Channel embed URL" }));
     expect(writeText).toHaveBeenCalledWith(value);
+  });
+});
+
+describe("dashboard URLs", () => {
+  it("reads and updates the channel query without dropping other URL state", () => {
+    expect(dashboardChannelID("?channel=studio&debug=1")).toBe("studio");
+    expect(dashboardURL("http://desk.local/?debug=1#status", "channel 2")).toBe("/?debug=1&channel=channel+2#status");
+    expect(dashboardURL("http://desk.local/?debug=1&channel=studio#status")).toBe("/?debug=1#status");
+  });
+});
+
+describe("input connection details", () => {
+  afterEach(cleanup);
+
+  const renderPanel = (channel: Channel) => render(<InputConnectionPanel
+    channel={channel}
+    bindingState="active"
+    bindingName="Follow eth0 IPv4"
+    mediaHost="192.0.2.10"
+    srtURL=""
+    advancedSRTURL=""
+    passphrase={null}
+    passphraseLoading={false}
+    passphraseError=""
+    onReveal={() => undefined}
+    onHide={() => undefined}
+  />);
+
+  it("shows a complete SRT pull source URL without push-only rows", () => {
+    renderPanel(channelWithMode("srt-pull"));
+    expect(screen.getByRole("textbox", { name: "Source URL value" })).toHaveProperty(
+      "value",
+      "srt://[2001:db8::10]:9000?streamid=studio%20feed&latency=120",
+    );
+    expect(screen.queryByRole("textbox", { name: "Destination IP value" })).toBeNull();
+  });
+
+  it("shows unicast RTP destination and source restriction", () => {
+    renderPanel(channelWithMode("rtp-unicast"));
+    expect(screen.getByRole("textbox", { name: "Destination IP value" })).toHaveProperty("value", "192.0.2.10");
+    expect(screen.getByRole("textbox", { name: "Source IP restriction value" })).toHaveProperty("value", "192.0.2.20");
+    expect(screen.queryByRole("textbox", { name: "SRT URL value" })).toBeNull();
   });
 });

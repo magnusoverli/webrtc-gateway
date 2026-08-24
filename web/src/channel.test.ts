@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   absolutePath,
+  channelTone,
   channelStateLabel,
   channelHasFault,
   hasInputStream,
@@ -193,6 +194,22 @@ describe("channelStateLabel", () => {
     expect(channelHasFault({ ...baseChannel, applyState: "deleting", relay: { state: "stopped", restarts: 0 } })).toBe(false);
     expect(channelStateLabel({ ...baseChannel, compatibility: { ...baseChannel.compatibility, state: "error" } })).toBe("Output error");
     expect(channelStateLabel({ ...baseChannel, enabled: false })).toBe("Disabled");
+  });
+});
+
+describe("channelTone", () => {
+  it("keeps disabled and deleting channels idle despite stale state", () => {
+    expect(channelTone({ ...baseChannel, enabled: false, applyState: "error", outputReady: true })).toBe("idle");
+    expect(channelTone({ ...baseChannel, applyState: "deleting", outputReady: true, compatibility: { ...baseChannel.compatibility, state: "error" } })).toBe("idle");
+  });
+
+  it("gives faults precedence over ready output", () => {
+    expect(channelTone({ ...baseChannel, applyState: "error", outputReady: true })).toBe("fault");
+  });
+
+  it("classifies ready and waiting channels", () => {
+    expect(channelTone({ ...baseChannel, outputReady: true })).toBe("live");
+    expect(channelTone(baseChannel)).toBe("idle");
   });
 });
 

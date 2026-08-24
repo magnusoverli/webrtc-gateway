@@ -7,6 +7,8 @@ export type Track = {
 
 export type TrackKind = "video" | "audio" | "unknown";
 
+export type ChannelTone = "live" | "fault" | "idle";
+
 export type ChannelStreamRates = {
   inputBitrateBps: number | null;
   outputBitrateBps: number | null;
@@ -176,6 +178,13 @@ export function channelHasFault(item: Channel) {
   return item.applyState === "error" || item.compatibility.state === "error" ||
     item.enabled && item.applyState !== "deleting" &&
     (item.relay?.state === "retrying" || item.relay?.state === "stopped");
+}
+
+export function channelTone(item: Channel): ChannelTone {
+  if (!item.enabled || item.applyState === "deleting") return "idle";
+  if (channelHasFault(item)) return "fault";
+  if (item.outputReady) return "live";
+  return "idle";
 }
 
 export function hasInputStream(item: Channel) {
