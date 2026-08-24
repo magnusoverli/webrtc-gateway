@@ -59,12 +59,15 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the selected input show `-`.
 4. Send the viewer URL to LAN users or place the iframe snippet in another LAN application. These UUID-based routes do not change when a channel is renamed or switches between direct and compatibility output.
 
-The standalone player routes are:
+The shared viewer and standalone player routes are:
 
 ```text
+http://HOST_IP:8080/view
 http://HOST_IP:8080/view/CHANNEL_ID
 http://HOST_IP:8080/embed/CHANNEL_ID
 ```
+
+The shared viewer shows every configured channel as a selectable button, including disabled and offline channels, and refreshes the list automatically. A `/view/CHANNEL_ID` link opens the same viewer with that channel preselected. The embed route remains channel-specific and omits viewer navigation.
 
 Viewer, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Standalone player routes always attempt playback when output is ready.
 

@@ -1478,6 +1478,10 @@ h2 {
   padding: 28px;
 }
 
+.multi-viewer-player {
+  grid-template-rows: auto auto 1fr auto;
+}
+
 .viewer-header {
   display: flex;
   gap: 22px;
@@ -1519,6 +1523,71 @@ h2 {
   color: var(--muted);
   font: 0.52rem/1 ui-monospace, monospace;
   text-transform: uppercase;
+}
+
+.viewer-channel-nav {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.viewer-channel-label {
+  padding-top: 11px;
+  color: var(--muted);
+  font: 600 0.58rem/1 ui-monospace, monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.viewer-channel-options {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.viewer-channel-option {
+  min-width: 0;
+  max-width: min(260px, 100%);
+  display: inline-flex;
+  gap: 9px;
+  align-items: center;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  background: #0d100c;
+  color: var(--ink);
+  font: 600 0.68rem/1.2 ui-monospace, monospace;
+  cursor: pointer;
+}
+
+.viewer-channel-option:hover {
+  border-color: #596452;
+  background: #161b14;
+}
+
+.viewer-channel-option.active {
+  border-color: rgba(200, 255, 98, 0.72);
+  background: rgba(200, 255, 98, 0.08);
+  color: var(--accent);
+}
+
+.viewer-channel-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.viewer-channel-option > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-channel-empty {
+  padding: 10px 0;
+  color: var(--muted);
+  font: 0.68rem/1.4 ui-monospace, monospace;
 }
 
 .standalone-stage {
@@ -1730,6 +1799,20 @@ h2 {
 
   .viewer-header {
     gap: 14px;
+  }
+
+  .viewer-channel-nav {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .viewer-channel-label {
+    padding-top: 0;
+  }
+
+  .viewer-player .standalone-stage {
+    min-height: 240px;
+    aspect-ratio: auto;
   }
 
   .restart-banner-content {

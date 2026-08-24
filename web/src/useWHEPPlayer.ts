@@ -132,15 +132,13 @@ export function useWHEPPlayer({ whepPath, enabled, retry = false }: {
           const detail = await response.text();
           throw new Error(detail || `WHEP request failed with ${response.status}`);
         }
-        const answer = await response.text();
-        if (!answer) throw new Error("WHEP response did not contain an SDP answer.");
         const location = response.headers.get("Location");
         if (location) current.location = new URL(location, window.location.href).toString();
-        if (disposed || session !== current) {
-          closeWHEPSession(current);
-          return;
-        }
+        const answer = await response.text();
+        if (!answer) throw new Error("WHEP response did not contain an SDP answer.");
+        if (disposed || session !== current) return;
         await peer.setRemoteDescription({ type: "answer", sdp: answer });
+        if (disposed || session !== current) return;
         if (peer.connectionState !== "connected") {
           current.connectionTimer = window.setTimeout(() => {
             fail("ICE could not connect. Allow the configured WebRTC media port through the host firewall, verify the advertised LAN host, or enable the TCP fallback in Global settings.");
@@ -149,11 +147,14 @@ export function useWHEPPlayer({ whepPath, enabled, retry = false }: {
 
         const updateStats = async () => {
           if (disposed || session !== current) return;
-          const result = summarizeRTCStats(await peer.getStats(), current.statsSample);
+          const report = await peer.getStats();
+          if (disposed || session !== current) return;
+          const result = summarizeRTCStats(report, current.statsSample);
           current.statsSample = result.sample;
           setStats(result.stats);
         };
         await updateStats();
+        if (disposed || session !== current) return;
         current.statsTimer = window.setInterval(() => void updateStats(), 1_000);
       } catch (caught) {
         if (current.abort.signal.aborted || disposed || session !== current) return;
