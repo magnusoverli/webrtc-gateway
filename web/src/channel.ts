@@ -7,7 +7,7 @@ export type Track = {
 
 export type TrackKind = "video" | "audio" | "unknown";
 
-export type ChannelTone = "live" | "fault" | "idle";
+export type ChannelTone = "live" | "starting" | "fault" | "idle";
 
 export type ChannelStreamRates = {
   inputBitrateBps: number | null;
@@ -161,11 +161,7 @@ export function channelStateLabel(item: Channel) {
   if (item.compatibility.state === "error") return "Output error";
   if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
   if (item.relay?.state === "starting") return "Listener restarting";
-  if (item.outputReady) {
-    return item.compatibility.mode === "transcoded"
-      ? "Output ready - normalized"
-      : "Output ready - direct";
-  }
+  if (item.outputReady) return "Output ready";
   if (item.available && item.online) {
     if (item.compatibility.state === "starting") {
       return item.compatibility.worker.queued
@@ -189,7 +185,10 @@ export function channelHasFault(item: Channel) {
 export function channelTone(item: Channel): ChannelTone {
   if (!item.enabled || item.applyState === "deleting") return "idle";
   if (channelHasFault(item)) return "fault";
+  if (item.applyState === "pending" || item.relay?.state === "starting") return "starting";
   if (item.outputReady) return "live";
+  if (item.compatibility.state === "probing" || item.compatibility.state === "starting" ||
+    item.available && item.online) return "starting";
   return "idle";
 }
 

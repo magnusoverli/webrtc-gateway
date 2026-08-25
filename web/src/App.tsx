@@ -874,7 +874,7 @@ function Dashboard() {
         </button>
       </header>
 
-      <main className="workspace" inert={modalOpen ? true : undefined} aria-hidden={modalOpen ? true : undefined}>
+      <main className={view === "overview" ? "workspace overview-workspace" : "workspace"} inert={modalOpen ? true : undefined} aria-hidden={modalOpen ? true : undefined}>
         <div className="gateway-notices" aria-label="Gateway notices">
           {statusError && <ScopedNotice scope="Gateway" message={`${statusError}. Gateway will retry automatically.`} />}
           {status?.settings.applyState === "pending" && <ScopedNotice scope="Gateway" message="Global settings changes are pending and have not yet been confirmed applied." />}
@@ -1795,7 +1795,6 @@ export function ResourceFooter({ resources, disconnected = false }: { resources?
       </div>
       <ResourceRow label="Gateway" scope={resources?.gateway} disconnected={disconnected} />
       <ResourceRow label="Host" scope={resources?.host} disconnected={disconnected} />
-      <p>Gateway includes compatibility and relay workers. MediaMTX is isolated.</p>
     </footer>
   );
 }

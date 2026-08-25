@@ -200,8 +200,8 @@ describe("channelStateLabel", () => {
     expect(channelStateLabel({ ...baseChannel, available: true, online: true, compatibility: { ...baseChannel.compatibility, state: "probing" } })).toBe("Encoder connected - inspecting");
     expect(channelStateLabel({ ...baseChannel, available: true, online: true, compatibility: { ...baseChannel.compatibility, state: "starting", worker: { running: false, queued: true, restarts: 0 } } })).toBe("Encoder connected - queued");
     expect(channelStateLabel({ ...baseChannel, available: true, online: true, compatibility: { ...baseChannel.compatibility, state: "starting" } })).toBe("Encoder connected - preparing");
-    expect(channelStateLabel({ ...baseChannel, outputReady: true })).toBe("Output ready - direct");
-    expect(channelStateLabel({ ...baseChannel, outputReady: true, compatibility: { ...baseChannel.compatibility, mode: "transcoded" } })).toBe("Output ready - normalized");
+    expect(channelStateLabel({ ...baseChannel, outputReady: true })).toBe("Output ready");
+    expect(channelStateLabel({ ...baseChannel, outputReady: true, compatibility: { ...baseChannel.compatibility, mode: "transcoded" } })).toBe("Output ready");
     expect(channelStateLabel({ ...baseChannel, applyState: "error" })).toBe("Configuration error");
     expect(channelStateLabel({ ...baseChannel, applyState: "pending" })).toBe("Applying configuration");
     expect(channelStateLabel({ ...baseChannel, applyState: "deleting" })).toBe("Deletion pending");
@@ -224,8 +224,12 @@ describe("channelTone", () => {
     expect(channelTone({ ...baseChannel, applyState: "error", outputReady: true })).toBe("fault");
   });
 
-  it("classifies ready and waiting channels", () => {
-    expect(channelTone({ ...baseChannel, outputReady: true })).toBe("live");
+  it("classifies ready, starting, and waiting channels", () => {
+    expect(channelTone({ ...baseChannel, available: true, online: true, outputReady: true })).toBe("live");
+    expect(channelTone({ ...baseChannel, applyState: "pending" })).toBe("starting");
+    expect(channelTone({ ...baseChannel, relay: { state: "starting", restarts: 0, listenerActive: false } })).toBe("starting");
+    expect(channelTone({ ...baseChannel, compatibility: { ...baseChannel.compatibility, state: "probing" } })).toBe("starting");
+    expect(channelTone({ ...baseChannel, available: true, online: true })).toBe("starting");
     expect(channelTone(baseChannel)).toBe("idle");
   });
 });

@@ -4,7 +4,7 @@ import { GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
-export type OverviewFilter = "all" | "live" | "fault" | "idle";
+export type OverviewFilter = "all" | "live" | "starting" | "fault" | "idle";
 export type OverviewLayout = "grid" | "list";
 
 type Props = {
@@ -28,7 +28,7 @@ type Props = {
   headingRef?: RefObject<HTMLHeadingElement | null>;
 };
 
-const filters: OverviewFilter[] = ["all", "live", "fault", "idle"];
+const filters: OverviewFilter[] = ["all", "live", "starting", "fault", "idle"];
 const layouts: OverviewLayout[] = ["grid", "list"];
 
 export function ChannelOverview({
@@ -191,26 +191,39 @@ function OverviewCard({ item, tone, rate, layout, stale, mutationsDisabled, prev
   const previewEnabled = showPreview && item.automaticPreview && channelPlaybackReady(item);
   const preview = useWHEPPlayer({ whepPath: item.whepPath, enabled: previewEnabled, retry: true });
   const previewStatus = overviewPreviewStatus(item, stale, preview.state, preview.hasVideo, preview.hasAudio);
+  const transcoding = item.compatibility.mode === "transcoded";
+  const routeLabel = transcoding ? "Transcoding" : "Passthrough";
+  const routeActive = item.compatibility.state === "ready" && item.outputReady && (!transcoding || item.compatibility.worker.running);
 
   return (
     <article className={`overview-card tone-${tone}`}>
       <button className="overview-card-hitbox" type="button" aria-label={`Open details for ${item.name}`} onClick={() => onSelect(item.id)} />
       <div className="overview-card-head">
-        <span className={`signal ${tone === "live" ? "online" : tone === "fault" ? "fault" : ""}`} />
-        <div className="overview-card-title"><strong>{item.name}</strong><small>{inputModeLabel(item.input.mode)}</small></div>
+        <span className={tone === "idle" ? "signal" : `signal ${tone === "live" ? "online" : tone}`} />
+        <div className="overview-card-title">
+          <strong>{item.name}</strong>
+          <div className="overview-card-meta">
+            <small>{inputModeLabel(item.input.mode)}</small>
+            {tone !== "idle" && <span
+                className={routeActive ? "overview-route active" : "overview-route"}
+                aria-label={`${routeLabel} ${routeActive ? "active" : "inactive"} for ${item.name}`}
+              >
+                {routeLabel}
+                <span aria-hidden="true" />
+              </span>}
+          </div>
+        </div>
         <button type="button" className="overview-card-edit" aria-label={`Configure ${item.name}`} title="Configure channel" disabled={mutationsDisabled} onClick={() => onEdit(item)}>
           <SettingsIcon aria-hidden="true" />
         </button>
       </div>
       {showPreview && (
-        <div className={`overview-thumb preview-${preview.state}${preview.state === "playing" ? " interactive" : ""}`} role="group" aria-label={`${item.name} preview: ${previewStatus}`}>
+        <div className={`overview-thumb preview-${preview.state}`} role="group" aria-label={`${item.name} preview: ${previewStatus}`}>
           <video
             ref={preview.videoRef}
             autoPlay
             playsInline
             muted
-            controls={preview.state === "playing"}
-            controlsList="nodownload noplaybackrate"
             aria-label={`${item.name} muted preview`}
           />
           {!(preview.state === "playing" && preview.hasVideo) && (
@@ -224,7 +237,13 @@ function OverviewCard({ item, tone, rate, layout, stale, mutationsDisabled, prev
         <div><span>Viewers</span><strong>{item.outputReady ? item.readers.length : "—"}</strong></div>
       </div>
       <div className="overview-card-foot">
-        <span className={`overview-state tone-${tone}`}>{stale ? "Status stale" : channelStateLabel(item)}</span>
+        <span
+          className={`overview-state tone-${tone}`}
+          aria-label={stale ? "Status stale" : channelStateLabel(item)}
+          title={stale ? "Status stale" : channelStateLabel(item)}
+        >
+          {stale ? "Status stale" : overviewStateLabel(item)}
+        </span>
         {showPreview && <div className="overview-preview-control">
           <span>Preview</span>
           <button
@@ -252,6 +271,23 @@ function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<
   if (state === "error") return "Preview unavailable";
   if (state === "playing" && !hasVideo) return hasAudio ? "Audio only" : "Connected";
   return "Muted live preview";
+}
+
+function overviewStateLabel(item: Channel) {
+  if (item.applyState === "deleting") return "Deleting";
+  if (!item.enabled) return "Disabled";
+  if (item.applyState === "error") return "Config error";
+  if (item.applyState === "pending") return "Applying";
+  if (item.compatibility.state === "error") return "Output error";
+  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
+  if (item.relay?.state === "starting") return "Restarting";
+  if (item.outputReady) return "Output ready";
+  if (item.available && item.online) {
+    if (item.compatibility.state === "starting") return item.compatibility.worker.queued ? "Encoder queued" : "Preparing";
+    return "Inspecting";
+  }
+  if (item.applyState === "applied" && item.input.mode === "srt-push") return "Listener ready";
+  return "Waiting input";
 }
 
 function OverviewState({ children, headingRef }: { children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {

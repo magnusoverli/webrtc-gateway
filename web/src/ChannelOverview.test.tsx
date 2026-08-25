@@ -39,11 +39,31 @@ describe("ChannelOverview", () => {
   });
 
   it("uses channel tone for filtering and card presentation", () => {
-    renderOverview({ channels: [channel("live", "Live", "live"), channel("fault", "Fault", "fault"), channel("idle", "Idle", "idle")] });
+    renderOverview({ channels: [channel("live", "Live", "live"), channel("starting", "Starting", "starting"), channel("fault", "Fault", "fault"), channel("idle", "Idle", "idle")] });
 
     expect(screen.getByRole("button", { name: "Open details for Live" }).closest("article")?.className).toContain("tone-live");
+    expect(screen.getByRole("button", { name: "Open details for Starting" }).closest("article")?.className).toContain("tone-starting");
+    expect(screen.getByRole("button", { name: "Open details for Starting" }).closest("article")?.querySelector(".signal")?.className).toContain("starting");
     expect(screen.getByRole("button", { name: "Open details for Fault" }).closest("article")?.className).toContain("tone-fault");
     expect(screen.getByRole("button", { name: "Open details for Idle" }).closest("article")?.className).toContain("tone-idle");
+    expect(screen.getByLabelText("Applying configuration").textContent).toBe("Applying");
+    expect(screen.getByLabelText("Configuration error").textContent).toBe("Config error");
+    expect(screen.getByLabelText("Listener ready - waiting for encoder").textContent).toBe("Listener ready");
+  });
+
+  it("indicates the active output route for grid channels", () => {
+    const direct = channel("direct", "Direct", "live");
+    const transcoded = channel("transcoded", "Transcoded", "live");
+    transcoded.compatibility = { ...transcoded.compatibility, mode: "transcoded", worker: { ...transcoded.compatibility.worker, running: true } };
+    const starting = channel("starting", "Starting", "starting");
+    starting.compatibility = { ...starting.compatibility, mode: "transcoded", state: "starting" };
+    const inactive = channel("inactive", "Inactive", "idle");
+    renderOverview({ channels: [direct, transcoded, starting, inactive] });
+
+    expect(screen.getByLabelText("Passthrough active for Direct").className).toContain("active");
+    expect(screen.getByLabelText("Transcoding active for Transcoded").className).toContain("active");
+    expect(screen.getByLabelText("Transcoding inactive for Starting").className).toBe("overview-route");
+    expect(screen.queryByLabelText("Passthrough inactive for Inactive")).toBeNull();
   });
 
   it("renders loading, initial error retry, no-channel, and filtered-empty copy", async () => {
@@ -224,8 +244,9 @@ function cardNames() {
   return screen.getAllByRole("article").map((item) => item.querySelector(".overview-card-title strong")?.textContent);
 }
 
-function channel(id: string, name: string, tone: "live" | "fault" | "idle"): Channel {
+function channel(id: string, name: string, tone: "live" | "starting" | "fault" | "idle"): Channel {
   const live = tone === "live";
+  const starting = tone === "starting";
   const fault = tone === "fault";
   return {
     id,
@@ -238,7 +259,7 @@ function channel(id: string, name: string, tone: "live" | "fault" | "idle"): Cha
     input: { mode: "srt-push", srt: { port: 10000, hasPassphrase: false } },
     maxReaders: 10,
     useAbsoluteTimestamp: true,
-    applyState: fault ? "error" : "applied",
+    applyState: fault ? "error" : starting ? "pending" : "applied",
     applyError: fault ? "failed" : undefined,
     createdAt: "2026-08-25T08:00:00Z",
     updatedAt: "2026-08-25T08:00:00Z",
