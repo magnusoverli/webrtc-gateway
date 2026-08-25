@@ -7,6 +7,7 @@
 }
 
 :root {
+  scrollbar-gutter: stable;
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   color: #e9e9ed;
   background: #161826;
@@ -1987,8 +1988,9 @@ button.state-pill { cursor: pointer; }
 
 /* --- Overview grid (Nocturne) --- */
 .overview { padding-top: 4px; }
-.overview-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
 .overview-subtitle { color: var(--muted); font-size: 0.83rem; margin: 0 0 22px; }
+.overview-intro { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.overview-intro .overview-subtitle { margin: 0; }
 .overview-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; flex-wrap: wrap; }
 .overview-search { flex: 1; min-width: 220px; max-width: 320px; height: 36px; padding: 0 12px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; font: inherit; }
 .overview-filters { display: inline-flex; gap: 6px; }
@@ -2150,12 +2152,14 @@ button.state-pill { cursor: pointer; }
 .topnav-diagnostics:hover { border-color: var(--accent-alpha-35); color: var(--ink-secondary); }
 .workspace { max-width: 1360px; }
 
-/* --- Detail breadcrumb / channel stepper --- */
+/* --- Shared channel breadcrumb / stepper --- */
 .detail-breadcrumb { display: flex; align-items: center; gap: 10px; padding-top: 22px; flex-wrap: wrap; }
+.crumb-current { padding: 6px 8px; color: var(--ink-secondary); font: 500 0.8rem/1 Inter, sans-serif; }
 .crumb-back { padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: 500 0.8rem/1 Inter, sans-serif; cursor: pointer; }
 .crumb-back:hover { color: var(--accent); background: var(--accent-alpha-10); }
 .crumb-divider { color: var(--line); }
 .crumb-stepper { display: flex; align-items: center; gap: 4px; font-size: 0.8rem; color: var(--ink-secondary); }
+.crumb-stepper > span { width: clamp(96px, 18vw, 220px); overflow: hidden; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .crumb-step { width: 26px; height: 26px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
 .crumb-step:hover { border-color: var(--accent); color: var(--accent); }
 .topbar { min-height: 96px; }

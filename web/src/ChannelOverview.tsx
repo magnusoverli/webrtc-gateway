@@ -97,17 +97,14 @@ export function ChannelOverview({
 
   return (
     <section className="overview" aria-labelledby="channel-overview-title">
-      <div className="overview-heading">
-        <div>
-          <span className="eyebrow">Overview</span>
-          <h1 id="channel-overview-title" ref={headingRef} tabIndex={-1}>Channels</h1>
-        </div>
+      <h1 id="channel-overview-title" className="visually-hidden" ref={headingRef} tabIndex={-1}>Channels</h1>
+      <div className="overview-intro">
+        <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
         <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
           <PlusIcon aria-hidden="true" />
           Add channel
         </button>
       </div>
-      <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
       {error && <div className="overview-stale"><span>Showing last known channel state. Gateway polling will retry automatically.</span><button className="button secondary" type="button" onClick={onRetry}>Retry now</button></div>}
 
       <div className="overview-controls">
@@ -293,12 +290,7 @@ function overviewStateLabel(item: Channel) {
 function OverviewState({ children, headingRef }: { children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {
   return (
     <section className="overview" aria-labelledby="channel-overview-title">
-      <div className="overview-heading">
-        <div>
-          <span className="eyebrow">Overview</span>
-          <h1 id="channel-overview-title" ref={headingRef} tabIndex={-1}>Channels</h1>
-        </div>
-      </div>
+      <h1 id="channel-overview-title" className="visually-hidden" ref={headingRef} tabIndex={-1}>Channels</h1>
       {children}
     </section>
   );

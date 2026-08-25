@@ -854,9 +854,9 @@ function Dashboard() {
 
         <nav className="topnav-links" aria-label="Primary">
           <button
-            className={view === "overview" ? "topnav-link active" : "topnav-link"}
+            className={!settingsForm ? "topnav-link active" : "topnav-link"}
             type="button"
-            aria-current={view === "overview" ? "page" : undefined}
+            aria-current={!settingsForm ? "page" : undefined}
             onClick={() => showOverview()}
           >Overview</button>
           <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
@@ -903,17 +903,17 @@ function Dashboard() {
           )}
         </div>
 
-        {view === "detail" && (
-        <div className="detail-breadcrumb">
-          <button className="crumb-back" type="button" onClick={() => showOverview()}><ArrowLeftIcon /> Overview</button>
-          <span className="crumb-divider">/</span>
-          <div className="crumb-stepper">
-            <button className="crumb-step" type="button" onClick={() => stepChannel(-1)} aria-label="Previous channel"><ChevronLeftIcon /></button>
-            <span>{selected?.name ?? "Channel"}</span>
-            <button className="crumb-step" type="button" onClick={() => stepChannel(1)} aria-label="Next channel"><ChevronRightIcon /></button>
-          </div>
-        </div>
-        )}
+        <nav className="detail-breadcrumb" aria-label="Channel navigation">
+          {view === "overview" ? <span className="crumb-current" aria-current="page">Overview</span> : <>
+            <button className="crumb-back" type="button" onClick={() => showOverview()}><ArrowLeftIcon /> Overview</button>
+            <span className="crumb-divider">/</span>
+            <div className="crumb-stepper">
+              <button className="crumb-step" type="button" disabled={(status?.channels.length ?? 0) < 2} onClick={() => stepChannel(-1)} aria-label="Previous channel"><ChevronLeftIcon /></button>
+              <span aria-current="page">{selected?.name ?? "Channel"}</span>
+              <button className="crumb-step" type="button" disabled={(status?.channels.length ?? 0) < 2} onClick={() => stepChannel(1)} aria-label="Next channel"><ChevronRightIcon /></button>
+            </div>
+          </>}
+        </nav>
 
         {view === "detail" && (<>
         <header className="topbar">

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, ConnectionRow, dashboardChannelID, dashboardURL, InputConnectionPanel, ResourceFooter } from "./App";
@@ -109,7 +109,7 @@ describe("dashboard navigation", () => {
   it("exposes the overview as the current primary navigation item", () => {
     render(<App />);
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeDefined();
-    expect(screen.getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
+    expect(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
   });
 
@@ -117,11 +117,15 @@ describe("dashboard navigation", () => {
     window.history.replaceState(null, "", "/?channel=studio");
     render(<App />);
     expect(document.querySelector(".detail-breadcrumb")).not.toBeNull();
+    expect(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
 
     window.history.replaceState(null, "", "/");
     fireEvent.popState(window);
-    expect(document.querySelector(".detail-breadcrumb")).toBeNull();
-    expect(screen.getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
+    expect(document.querySelector(".detail-breadcrumb")).not.toBeNull();
+    expect(screen.getByText("Overview", { selector: ".crumb-current" }).getAttribute("aria-current")).toBe("page");
+    expect(screen.queryByRole("button", { name: "Previous channel" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next channel" })).toBeNull();
+    expect(within(screen.getByRole("navigation", { name: "Primary" })).getByRole("button", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
     expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Channels", level: 1 }));
   });
 
