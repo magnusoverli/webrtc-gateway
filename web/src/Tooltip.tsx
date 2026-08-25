@@ -62,18 +62,71 @@ export function Tooltip({ content, children, placement = "top", clickToOpen = fa
       setPosition((current) => current.top === next.top && current.left === next.left && current.ready === next.ready ? current : next);
     };
     update();
-    let animationFrame = 0;
-    const trackLayout = () => {
-      update();
-      animationFrame = window.requestAnimationFrame(trackLayout);
+    let animationFrame: number | undefined;
+    const scheduleUpdate = () => {
+      if (animationFrame !== undefined) return;
+      if (typeof window.requestAnimationFrame !== "function") {
+        update();
+        return;
+      }
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = undefined;
+        update();
+      });
     };
-    if (typeof window.requestAnimationFrame === "function") animationFrame = window.requestAnimationFrame(trackLayout);
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
+    window.addEventListener("resize", scheduleUpdate);
+    window.addEventListener("scroll", scheduleUpdate, true);
+    const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(scheduleUpdate) : undefined;
+    if (resizeObserver) {
+      let current: HTMLElement | null = triggerRef.current;
+      while (current) {
+        resizeObserver.observe(current);
+        current = current.parentElement;
+      }
+      if (tooltipRef.current) resizeObserver.observe(tooltipRef.current);
+    }
+    const mutationObserver = typeof MutationObserver === "function" ? new MutationObserver((records) => {
+      if (records.some((record) => record.target !== tooltipRef.current || record.attributeName !== "style")) scheduleUpdate();
+    }) : undefined;
+    if (mutationObserver && document.body) {
+      mutationObserver.observe(document.body, { attributes: true, childList: true, characterData: true, subtree: true });
+    }
+    const fonts = document.fonts;
+    fonts?.addEventListener("loadingdone", scheduleUpdate);
+    let activeMotions = 0;
+    let motionFrame: number | undefined;
+    const trackMotion = () => {
+      update();
+      if (activeMotions > 0) motionFrame = window.requestAnimationFrame(trackMotion);
+      else motionFrame = undefined;
+    };
+    const motionStarted = () => {
+      activeMotions += 1;
+      if (motionFrame === undefined) motionFrame = window.requestAnimationFrame(trackMotion);
+    };
+    const motionEnded = () => {
+      activeMotions = Math.max(0, activeMotions - 1);
+    };
+    document.addEventListener("transitionrun", motionStarted, true);
+    document.addEventListener("transitionend", motionEnded, true);
+    document.addEventListener("transitioncancel", motionEnded, true);
+    document.addEventListener("animationstart", motionStarted, true);
+    document.addEventListener("animationend", motionEnded, true);
+    document.addEventListener("animationcancel", motionEnded, true);
     return () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("resize", scheduleUpdate);
+      window.removeEventListener("scroll", scheduleUpdate, true);
+      resizeObserver?.disconnect();
+      mutationObserver?.disconnect();
+      fonts?.removeEventListener("loadingdone", scheduleUpdate);
+      document.removeEventListener("transitionrun", motionStarted, true);
+      document.removeEventListener("transitionend", motionEnded, true);
+      document.removeEventListener("transitioncancel", motionEnded, true);
+      document.removeEventListener("animationstart", motionStarted, true);
+      document.removeEventListener("animationend", motionEnded, true);
+      document.removeEventListener("animationcancel", motionEnded, true);
+      if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame);
+      if (motionFrame !== undefined) window.cancelAnimationFrame(motionFrame);
     };
   }, [open, placement]);
 
