@@ -1,6 +1,7 @@
 package srtrelay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -147,6 +148,7 @@ type rtpPacket struct {
 type Supervisor struct {
 	logger     *slog.Logger
 	executable string
+	ffmpeg     string
 
 	mu               sync.Mutex
 	listeners        map[string]*listenerProcess
@@ -166,9 +168,12 @@ type channelOperation struct {
 	refs int
 }
 
-func New(logger *slog.Logger, executable string) *Supervisor {
+func New(logger *slog.Logger, executable, ffmpeg string) *Supervisor {
+	if ffmpeg == "" {
+		ffmpeg = "ffmpeg"
+	}
 	supervisor := &Supervisor{
-		logger: logger, executable: executable,
+		logger: logger, executable: executable, ffmpeg: ffmpeg,
 		listeners:  make(map[string]*listenerProcess),
 		prepared:   make(map[string]channel.SRTIngestPlan),
 		operations: make(map[string]*channelOperation),
@@ -275,7 +280,7 @@ func (s *Supervisor) Prepare(ctx context.Context, config channel.SRTListener) (c
 				return channel.SRTIngestPlan{}, err
 			}
 		}
-		output, err := buildPublishEndpoint(config, publishPassphrase)
+		output, err := buildPublishEndpoint(config)
 		if err != nil {
 			return channel.SRTIngestPlan{}, err
 		}
@@ -611,41 +616,54 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		terminateInput(input)
 		return "unknown", err
 	}
-	output := exec.CommandContext(ctx, s.executable, "-q", "-a:no", "file://con", plan.OutputAddress)
+	stderr := newBoundedWriter(8192)
+	output := exec.CommandContext(ctx, s.ffmpeg, remuxArgs(plan.OutputAddress, plan.PublishPassphrase)...)
+	output.Stdout = io.Discard
+	output.Stderr = stderr
+	output.Cancel = func() error {
+		if output.Process == nil {
+			return nil
+		}
+		return output.Process.Signal(syscall.SIGTERM)
+	}
+	output.WaitDelay = 3 * time.Second
 	sink, err := output.StdinPipe()
 	if err != nil {
 		terminateInput(input)
-		return mode.String(), fmt.Errorf("open MediaMTX relay input: %w", err)
+		return mode.String(), fmt.Errorf("open MPEG-TS remux input: %w", err)
 	}
 	if err := output.Start(); err != nil {
 		terminateInput(input)
-		return mode.String(), fmt.Errorf("start MediaMTX relay connection: %w", err)
+		return mode.String(), fmt.Errorf("start MPEG-TS remux: %w", err)
 	}
 	outputWait := make(chan error, 1)
 	go func() { outputWait <- output.Wait() }()
 	copyDone := make(chan error, 1)
 	go func() {
-		_, firstErr := sink.Write(initial)
-		streamErr := streamNormalized(reader, sink, mode)
+		firstErr := writeFull(sink, initial)
+		var streamErr error
+		if firstErr == nil {
+			streamErr = streamNormalized(reader, sink, mode)
+		}
 		closeErr := sink.Close()
 		copyDone <- errors.Join(firstErr, streamErr, closeErr)
 	}()
 
 	select {
 	case inputErr := <-input.wait:
+		_ = terminate(output, outputWait)
 		copyErr := <-copyDone
-		terminate(output, outputWait)
 		return mode.String(), errors.Join(inputErr, copyErr)
 	case copyErr := <-copyDone:
 		_ = input.cmd.Process.Kill()
 		inputErr := <-input.wait
-		terminate(output, outputWait)
-		return mode.String(), errors.Join(copyErr, inputErr)
+		_ = terminate(output, outputWait)
+		return mode.String(), errors.Join(copyErr, inputErr, remuxDetailError(stderr.String(), plan.PublishPassphrase))
 	case outputErr := <-outputWait:
 		_ = input.cmd.Process.Kill()
 		inputErr := <-input.wait
 		copyErr := <-copyDone
-		return mode.String(), errors.Join(outputErr, inputErr, copyErr)
+		return mode.String(), errors.Join(remuxError(outputErr, stderr.String(), plan.PublishPassphrase), inputErr, copyErr)
 	case <-ctx.Done():
 		_ = input.cmd.Process.Kill()
 		_ = output.Process.Kill()
@@ -731,10 +749,64 @@ func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) er
 			}
 			payload = packet.payload
 		}
-		if _, err := sink.Write(payload); err != nil {
+		if err := writeFull(sink, payload); err != nil {
 			return err
 		}
 	}
+}
+
+func remuxArgs(outputAddress, passphrase string) []string {
+	args := []string{
+		"-hide_banner", "-loglevel", "warning", "-nostdin",
+		"-copyts", "-f", "mpegts", "-i", "pipe:0",
+		"-map", "0:v?", "-map", "0:a?", "-c", "copy",
+		"-mpegts_flags", "+resend_headers", "-pes_payload_size", "0", "-muxdelay", "0",
+		"-mpegts_copyts", "1", "-f", "mpegts",
+	}
+	if passphrase != "" {
+		args = append(args, "-passphrase", passphrase)
+	}
+	return append(args, outputAddress)
+}
+
+func writeFull(output io.Writer, value []byte) error {
+	for len(value) > 0 {
+		written, err := output.Write(value)
+		if written > 0 {
+			value = value[written:]
+		}
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func remuxError(processErr error, stderr, passphrase string) error {
+	if detailErr := remuxDetailError(stderr, passphrase); detailErr != nil {
+		return detailErr
+	}
+	if processErr != nil {
+		return fmt.Errorf("MPEG-TS remux exited: %w", processErr)
+	}
+	return errors.New("MPEG-TS remux exited")
+}
+
+func remuxDetailError(stderr, passphrase string) error {
+	detail := strings.TrimSpace(stderr)
+	if passphrase != "" {
+		if detail == "" {
+			return nil
+		}
+		return errors.New("MPEG-TS remux exited; FFmpeg detail withheld for encrypted relay")
+	}
+	if detail == "" {
+		return nil
+	}
+	return fmt.Errorf("MPEG-TS remux exited: %s", detail)
 }
 
 func parseRTP(value []byte) (rtpPacket, error) {
@@ -935,7 +1007,7 @@ func buildInputEndpoint(config channel.SRTListener) (string, error) {
 	return endpoint.String(), nil
 }
 
-func buildPublishEndpoint(config channel.SRTListener, passphrase string) (string, error) {
+func buildPublishEndpoint(config channel.SRTListener) (string, error) {
 	host, port, err := net.SplitHostPort(config.DestinationAddress)
 	if err != nil {
 		return "", fmt.Errorf("parse MediaMTX SRT listener address: %w", err)
@@ -943,17 +1015,18 @@ func buildPublishEndpoint(config channel.SRTListener, passphrase string) (string
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
-	endpoint := "srt://" + net.JoinHostPort(host, port) +
-		"?mode=caller&transtype=live&streamid=publish:" + config.Path +
-		"&conntimeo=1000&peeridletimeo=3000&sndbuf=" + strconv.Itoa(bridgeReadBufferSize) +
-		"&latency=" + strconv.Itoa(channel.DefaultSRTLatencyMS)
-	if passphrase != "" {
-		if strings.ContainsAny(passphrase, "&?#") {
-			return "", errors.New("SRT relay passphrase cannot contain &, ?, or #")
-		}
-		endpoint += "&passphrase=" + passphrase
-	}
-	return endpoint, nil
+	endpoint := &url.URL{Scheme: "srt", Host: net.JoinHostPort(host, port)}
+	query := endpoint.Query()
+	query.Set("mode", "caller")
+	query.Set("transtype", "live")
+	query.Set("streamid", "publish:"+config.Path)
+	query.Set("connect_timeout", "1000")
+	query.Set("timeout", "3000000")
+	query.Set("sndbuf", strconv.Itoa(bridgeReadBufferSize))
+	query.Set("latency", strconv.Itoa(channel.DefaultSRTLatencyMS*1000))
+	query.Set("pkt_size", "1316")
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
 }
 
 func availableLoopbackUDPAddress() (string, error) {
@@ -983,16 +1056,16 @@ func terminateInput(input inputSession) {
 	<-input.wait
 }
 
-func terminate(cmd *exec.Cmd, wait <-chan error) {
+func terminate(cmd *exec.Cmd, wait <-chan error) error {
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
-	case <-wait:
-		return
+	case err := <-wait:
+		return err
 	case <-timer.C:
 		_ = cmd.Process.Kill()
-		<-wait
+		return <-wait
 	}
 }
 
@@ -1005,4 +1078,30 @@ func (mode payloadMode) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+type boundedWriter struct {
+	mu    sync.Mutex
+	limit int
+	data  []byte
+}
+
+func newBoundedWriter(limit int) *boundedWriter {
+	return &boundedWriter{limit: limit}
+}
+
+func (w *boundedWriter) Write(value []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.data = append(w.data, value...)
+	if len(w.data) > w.limit {
+		w.data = append([]byte(nil), w.data[len(w.data)-w.limit:]...)
+	}
+	return len(value), nil
+}
+
+func (w *boundedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(bytes.TrimSpace(w.data))
 }

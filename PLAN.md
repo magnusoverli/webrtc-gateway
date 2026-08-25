@@ -12,7 +12,7 @@ Build a Linux application deployable with Docker Compose that accepts independen
 - Inputs are configured once and then listen, connect, and recover automatically.
 - RTP unicast and multicast are supported. RTP configuration requires SDP.
 - SRT push and pull modes are supported.
-- SRT push senders that can provide only a destination IP and port are supported through a unique per-channel listener and a passthrough relay; sender-side stream IDs are not required.
+- SRT push senders that can provide only a destination IP and port are supported through a unique per-channel listener and stream-copy remux relay; sender-side stream IDs are not required.
 - The deployment target is Linux using Docker host networking.
 - The deployment is LAN-only. Internet TLS, STUN, and TURN are out of scope.
 - The web UI, application API, WHEP signaling proxy, and live statistics use one HTTP port.
@@ -229,3 +229,4 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 | 2026-08-24 | Replaced channel switching in the shared viewer with simultaneous all-channel multiview and reduced per-channel embeds to transparent, muted, control-free video surfaces. |
 | 2026-08-24 | Added persistent, gap-filling channel numbers for compact `/embed/NUMBER` routes and exposed each channel embed URL as a copyable/openable dashboard field. |
 | 2026-08-25 | Added overview grid/list navigation, bounded serial polling with hidden-page lifecycle handling, optimistic revision preconditions, preview-only PATCH updates, and on-demand sanitized diagnostics. |
+| 2026-08-25 | Bounded compatibility metadata probing and moved FFprobe off the reconciliation loop. Added a stream-copy MPEG-TS remux stage for Gateway-managed SRT so malformed codec metadata and multi-frame AC-3 PES payloads are normalized before MediaMTX. |

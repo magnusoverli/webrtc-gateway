@@ -63,7 +63,7 @@ func main() {
 		logger.Error("configure management listener", "error", err)
 		os.Exit(1)
 	}
-	relaySupervisor := srtrelay.New(logger, "srt-live-transmit")
+	relaySupervisor := srtrelay.New(logger, "srt-live-transmit", "ffmpeg")
 	defer relaySupervisor.Close()
 	control := controlplane.NewCoordinator()
 	channelService := channel.NewService(channelStore, mediaClient, settingsStore, relaySupervisor, control)

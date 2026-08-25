@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,13 +33,15 @@ func TestBuildInputEndpointUsesWiredLANDefaults(t *testing.T) {
 		input.Query().Get("rcvbuf") != "4194304" || input.Query().Get("conntimeo") != "1000" || input.Query().Get("peeridletimeo") != "3000" {
 		t.Fatalf("input URL options = %q", input.RawQuery)
 	}
-	outputValue, err := buildPublishEndpoint(config, config.Passphrase)
+	outputValue, err := buildPublishEndpoint(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	output, _ := url.Parse(outputValue)
 	if output.Hostname() != "127.0.0.1" || output.Port() != "8890" || output.Query().Get("streamid") != "publish:studio-camera" ||
-		output.Query().Get("passphrase") != "0123456789" || output.Query().Get("latency") != "60" || output.Query().Get("sndbuf") != "4194304" {
+		output.Query().Has("passphrase") || output.Query().Get("latency") != "60000" || output.Query().Get("sndbuf") != "4194304" ||
+		output.Query().Get("connect_timeout") != "1000" || output.Query().Get("timeout") != "3000000" || output.Query().Get("pkt_size") != "1316" ||
+		output.Query().Has("conntimeo") || output.Query().Has("peeridletimeo") {
 		t.Fatalf("output URL = %q", output.String())
 	}
 }
@@ -53,7 +56,8 @@ func TestPrepareSelectsPublisherForAutomaticTSPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if plan.Source != "publisher" || plan.RTPSDP != "" || plan.PublishPassphrase != "0123456789" || !strings.Contains(plan.OutputAddress, "streamid=publish:studio-camera") {
+	output, parseErr := url.Parse(plan.OutputAddress)
+	if plan.Source != "publisher" || plan.RTPSDP != "" || plan.PublishPassphrase != "0123456789" || parseErr != nil || output.Query().Get("streamid") != "publish:studio-camera" {
 		t.Fatalf("plan = %#v", plan)
 	}
 }
@@ -91,8 +95,21 @@ func TestPrepareUsesInternalPublishSecretForPull(t *testing.T) {
 	if plan.Source != "publisher" || len(plan.PublishPassphrase) < 10 || plan.PublishPassphrase == "encoder-secret" {
 		t.Fatalf("plan = %#v", plan)
 	}
-	if !strings.Contains(plan.OutputAddress, "passphrase="+plan.PublishPassphrase) {
-		t.Fatalf("output endpoint does not contain internal passphrase: %q", plan.OutputAddress)
+	if output, parseErr := url.Parse(plan.OutputAddress); parseErr != nil || output.Query().Has("passphrase") {
+		t.Fatalf("output endpoint exposes internal passphrase: %q", plan.OutputAddress)
+	}
+}
+
+func TestBuildPublishEndpointKeepsPassphraseOutOfURL(t *testing.T) {
+	value, err := buildPublishEndpoint(channel.SRTListener{
+		Path: "studio-camera", DestinationAddress: "127.0.0.1:8890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := url.Parse(value)
+	if err != nil || endpoint.Query().Has("passphrase") {
+		t.Fatalf("publish endpoint = %q, %v", value, err)
 	}
 }
 
@@ -137,6 +154,46 @@ func TestFindTSSyncAllowsInitialPartialPacket(t *testing.T) {
 	value[3], value[3+188], value[3+2*188] = 0x47, 0x47, 0x47
 	if got := findTSSync(value); got != 3 {
 		t.Fatalf("findTSSync() = %d, want 3", got)
+	}
+}
+
+func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
+	const passphrase = "plus+percent%secret"
+	args := remuxArgs("srt://127.0.0.1:8890?streamid=publish:test", passphrase)
+	for _, pair := range [][2]string{
+		{"-f", "mpegts"}, {"-i", "pipe:0"}, {"-map", "0:v?"}, {"-map", "0:a?"},
+		{"-c", "copy"}, {"-mpegts_flags", "+resend_headers"}, {"-pes_payload_size", "0"}, {"-muxdelay", "0"},
+		{"-mpegts_copyts", "1"},
+	} {
+		if !containsArgumentPair(args, pair[0], pair[1]) {
+			t.Fatalf("remux args missing %q %q: %#v", pair[0], pair[1], args)
+		}
+	}
+	if got := args[len(args)-1]; got != "srt://127.0.0.1:8890?streamid=publish:test" {
+		t.Fatalf("remux output = %q", got)
+	}
+	if !slices.Contains(args, "-copyts") {
+		t.Fatalf("remux args do not preserve timestamps: %#v", args)
+	}
+	if !containsArgumentPair(args, "-passphrase", passphrase) || strings.Contains(args[len(args)-1], passphrase) {
+		t.Fatalf("remux passphrase is not a separate output option: %#v", args)
+	}
+}
+
+func TestWriteFullHandlesShortWrites(t *testing.T) {
+	output := &shortWriter{limit: 3}
+	if err := writeFull(output, []byte("complete payload")); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.value.String(); got != "complete payload" {
+		t.Fatalf("written payload = %q", got)
+	}
+}
+
+func TestRemuxErrorRedactsPassphrase(t *testing.T) {
+	err := remuxError(errors.New("exit status 1"), "failed srt://host?passphrase=supersecret", "supersecret")
+	if strings.Contains(err.Error(), "supersecret") || !strings.Contains(err.Error(), "withheld") {
+		t.Fatalf("remux error = %q", err)
 	}
 }
 
@@ -645,7 +702,27 @@ func TestRestartDelayIsCapped(t *testing.T) {
 
 func newTestSupervisor(t *testing.T, srtExecutable string) *Supervisor {
 	t.Helper()
-	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), srtExecutable)
+	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), srtExecutable, "ffmpeg")
+}
+
+func containsArgumentPair(arguments []string, name, value string) bool {
+	for index := 0; index+1 < len(arguments); index++ {
+		if arguments[index] == name && arguments[index+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+type shortWriter struct {
+	limit int
+	value strings.Builder
+}
+
+func (w *shortWriter) Write(value []byte) (int, error) {
+	written := min(w.limit, len(value))
+	_, _ = w.value.Write(value[:written])
+	return written, nil
 }
 
 type packetRead struct {

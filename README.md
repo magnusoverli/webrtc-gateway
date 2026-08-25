@@ -145,7 +145,7 @@ ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
   "srt://HOST_IP:10000?latency=60"
 ```
 
-Gateway starts a supervised `srt-live-transmit` listener with a 60 ms wired-LAN latency default, a 4 MiB receive buffer, three-second peer-idle detection, and one-second connection timeout. It classifies each SRT message before routing it into MediaMTX. Raw MPEG-TS and RTP/MP2T use a packet-preserving SRT stream-copy publisher; elementary RTP is forwarded directly over loopback UDP. Neither route decodes or encodes media. Internal publishers exist only while a sender is active, and the listener recovers automatically after disconnects and Gateway restarts. MediaMTX's native SRT receiver currently retains its upstream 120 ms delay because replacing that format-neutral leg with RTSP would reject valid MPEG-TS codec combinations such as in-band AAC.
+Gateway starts a supervised `srt-live-transmit` listener with a 60 ms wired-LAN latency default, a 4 MiB receive buffer, three-second peer-idle detection, and one-second connection timeout. It classifies each SRT message before routing it into MediaMTX. Raw MPEG-TS and RTP/MP2T are stream-copy remuxed by FFmpeg to normalize transport headers, codec metadata, and PES framing; elementary RTP is forwarded directly over loopback UDP. Neither route decodes or encodes media. Internal publishers exist only while a sender is active, and the listener recovers automatically after disconnects and Gateway restarts.
 
 Senders that support stream IDs can alternatively use the direct MediaMTX SRT URL shown in the channel view. Direct publishing uses the global SRT listener, `8890/udp` by default, and a stream ID in the form `publish:CHANNEL_PATH`. This shortcut terminates in MediaMTX's native MPEG-TS SRT reader and is therefore MPEG-TS-only.
 
@@ -179,7 +179,7 @@ When conversion is required, Gateway starts one supervised FFmpeg process for th
 - Source disconnects, track changes, channel deletion, and Gateway shutdown stop the worker automatically.
 - Worker failure does not fall back to a known-incompatible direct path; the stable WHEP endpoint remains unavailable until compatible output is ready.
 
-Default video rate ceilings are `2 Mb/s` through 480p, `6 Mb/s` through 720p, `16 Mb/s` through 1080p, `24 Mb/s` through 1440p, and `40 Mb/s` above 1440p. These are maximum encoder rates rather than constant target rates, so simple content remains smaller. The VBV buffer is half the selected maximum rate. Compatibility input uses no-buffer/low-delay FFmpeg flags, source discovery checks once per second, active startup checks every 100 ms, and video inspection is bounded to two seconds.
+Default video rate ceilings are `2 Mb/s` through 480p, `6 Mb/s` through 720p, `16 Mb/s` through 1080p, `24 Mb/s` through 1440p, and `40 Mb/s` above 1440p. These are maximum encoder rates rather than constant target rates, so simple content remains smaller. The VBV buffer is half the selected maximum rate. Compatibility input uses no-buffer/low-delay FFmpeg flags, source discovery checks once per second, and active startup checks every 100 ms. Video inspection samples two seconds with a four-second process timeout; incomplete MediaMTX metadata receives an eight-second grace period before fallback inspection.
 
 The channel view reports whether WebRTC is using **Direct passthrough** or **Automatic H264/Opus compatibility**, including the conversion reasons and output tracks. Classification is intentionally limited to containers and codecs that MediaMTX can ingest and FFmpeg can decode. Send-field deinterlacing is charged at twice the normal resolution-based worker capacity because it encodes twice as many output frames.
 
@@ -201,15 +201,15 @@ The integration matrix has been verified through a real headless Chromium WHEP s
 | H264-only and Opus-only | Direct single-track output |
 | H265-only, AAC-only, and MP3-only | Converted single-track output |
 
-The same matrix covers raw MPEG-TS, RTP/MP2T, and SDP-described elementary RTP through per-channel SRT push and pull, plus direct MPEG-TS stream-ID publishing, SRT passphrase acceptance and rejection, video-only and audio-only inputs, interlaced inputs, and the supplied MOV source. The resilience suite additionally covers encrypted SRT pull, codec changes across reconnects, worker restart, channel isolation, concurrent viewers, and reader cleanup.
+The same matrix covers raw MPEG-TS, RTP/MP2T, and SDP-described elementary RTP through per-channel SRT push and pull, plus direct MPEG-TS stream-ID publishing, SRT passphrase acceptance and rejection, video-only and audio-only inputs, interlaced inputs, and the supplied MOV source. Gateway-managed MPEG-TS is stream-copy remuxed before MediaMTX so codec headers and PES framing are normalized without changing the encoded media. The resilience suite additionally covers encrypted SRT pull, codec changes across reconnects, worker restart, channel isolation, concurrent viewers, and reader cleanup.
 
-MediaMTX `1.20.1` rejects the FFmpeg-generated 192 kb/s AC-3 test stream when three 768-byte AC-3 frames are grouped into one MPEG-TS PES packet (`unexpected frame size: got 2304, expected 768`). Gateway reports a compatibility startup timeout and does not expose a broken output. Conventional 384 kb/s AC-3 framing is verified. This is an ingest/framing boundary, not a general promise that every AC-3 stream at either bitrate will behave identically.
+The remux stage emits bounded PES payloads and repeated MPEG-TS headers. This allows MediaMTX `1.20.1` to ingest the verified 192 kb/s AC-3 fixture whose source groups three AC-3 frames into one PES packet. Direct stream-ID publishers bypass Gateway and therefore do not receive this normalization.
 
 ### Integration Checks
 
 The scripts create temporary channels, use ports `11990`, `11991`, `11992`, `12010`, and `12011` by default, and remove their channels and processes on exit. They require `curl`, `jq`, FFmpeg, SRT tools, Node.js, and Chromium on the host.
 
-Run the common payload matrix, including browser media assertions and the expected AC-3 rejection:
+Run the common payload matrix, including browser media assertions:
 
 ```sh
 bash scripts/srt-matrix.sh

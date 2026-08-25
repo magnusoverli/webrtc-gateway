@@ -392,38 +392,6 @@ test_wrong_passphrase() {
   wait_offline || true
 }
 
-test_unsupported_ac3_framing() {
-  local case_name="ac3-192-multiframe-rejected"
-  local state
-	if [[ -n "$CASE_FILTER" && "$case_name" != *"$CASE_FILTER"* ]]; then
-		return
-	fi
-  if ! wait_offline; then
-    record_failure "$case_name" "previous source did not clean up"
-    return
-  fi
-  start_sender h264-baseline-ac3-192 "srt://$SRT_HOST:$SRT_PORT?pkt_size=1316" || {
-    record_failure "$case_name" "could not start sender"
-    return
-  }
-  for _ in $(seq 1 80); do
-    state="$(channel_status 2>/dev/null || true)"
-    if [[ -n "$state" ]] && jq -e \
-		'(.outputReady | not) and .compatibility.state == "error" and ((.compatibility.lastError // "") | length > 0)' \
-      <<<"$state" >/dev/null; then
-      passes=$((passes + 1))
-      printf '%-28s PASS  failed visibly without publishing an output\n' "$case_name"
-      stop_sender
-      wait_offline || record_failure "$case_name-cleanup" "worker remained after source disconnected"
-      return
-    fi
-    sleep 0.25
-  done
-  record_failure "$case_name" "expected visible compatibility rejection: $(jq -c '{outputReady,compatibility}' <<<"${state:-null}")"
-  stop_sender
-  wait_offline || true
-}
-
 printf 'Temporary channel: %s (%s), SRT port %s\n' "$channel_path" "$channel_id" "$SRT_PORT"
 run_case h264-baseline-opus direct 'H264,Opus' 'H264,Opus'
 run_case h264-high-no-b-opus direct 'H264,Opus' 'H264,Opus'
@@ -436,7 +404,7 @@ run_case mpeg2-mp2 transcoded 'MPEG-1/2 Video,MPEG-1/2 Audio' 'H264,Opus'
 run_case mpeg2-interlaced-mp2 transcoded 'MPEG-1/2 Video,MPEG-1/2 Audio' 'H264,Opus' '' 40
 run_case mpeg4-opus transcoded 'MPEG-4 Video,Opus' 'H264,Opus'
 run_case h264-baseline-ac3 transcoded 'H264,AC3' 'H264,Opus'
-test_unsupported_ac3_framing
+run_case h264-baseline-ac3-192 transcoded 'H264,AC3' 'H264,Opus'
 run_case mpeg4-ac3 transcoded 'MPEG-4 Video,AC3' 'H264,Opus'
 run_case h264-video-only direct 'H264' 'H264'
 run_case h265-video-only transcoded 'H265' 'H264'
