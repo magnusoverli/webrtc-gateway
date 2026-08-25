@@ -31,17 +31,22 @@ type mediaStatusReader interface {
 	GetGlobal(context.Context) (mediamtx.GlobalConfig, error)
 }
 
+type mediaReachabilityReader interface {
+	Reachable(context.Context) error
+}
+
 type channelService interface {
 	List(context.Context) ([]channel.Channel, error)
 	Get(context.Context, string) (channel.Channel, error)
 	Create(context.Context, channel.Draft) (channel.Channel, error)
-	Update(context.Context, string, channel.Draft) (channel.Channel, error)
+	UpdateExpected(context.Context, string, channel.Draft, int) (channel.Channel, error)
+	UpdateAutomaticPreview(context.Context, string, bool, *int) (channel.Channel, error)
 	Delete(context.Context, string) error
 }
 
 type settingsService interface {
 	Get(context.Context) (settings.Settings, error)
-	Update(context.Context, settings.Settings) (settings.Settings, error)
+	UpdateExpected(context.Context, settings.Settings, int) (settings.Settings, error)
 }
 
 type compatibilityReader interface {
@@ -112,14 +117,21 @@ type networkStatus struct {
 }
 
 type bindingStatus struct {
-	ActiveAddress   string `json:"activeAddress,omitempty"`
-	ActiveSelection string `json:"activeSelection,omitempty"`
-	DesiredAddress  string `json:"desiredAddress"`
-	ResolvedAddress string `json:"resolvedAddress,omitempty"`
-	ResolutionError string `json:"resolutionError,omitempty"`
-	Port            int    `json:"port,omitempty"`
-	RestartRequired bool   `json:"restartRequired"`
-	Locked          bool   `json:"locked,omitempty"`
+	ActiveAddress   string                `json:"activeAddress,omitempty"`
+	ActiveSelection string                `json:"activeSelection,omitempty"`
+	ActiveListeners *activeMediaListeners `json:"activeListeners,omitempty"`
+	DesiredAddress  string                `json:"desiredAddress"`
+	ResolvedAddress string                `json:"resolvedAddress,omitempty"`
+	ResolutionError string                `json:"resolutionError,omitempty"`
+	Port            int                   `json:"port,omitempty"`
+	RestartRequired bool                  `json:"restartRequired"`
+	Locked          bool                  `json:"locked,omitempty"`
+}
+
+type activeMediaListeners struct {
+	SRT       string `json:"srt"`
+	WebRTCUDP string `json:"webRTCUDP"`
+	WebRTCTCP string `json:"webRTCTCP"`
 }
 
 type gatewayStatus struct {
@@ -162,6 +174,7 @@ type srtInputRequest struct {
 
 type channelResponse struct {
 	ID                   string                `json:"id"`
+	Revision             int                   `json:"revision"`
 	Number               int                   `json:"number"`
 	Name                 string                `json:"name"`
 	Path                 string                `json:"path"`
@@ -232,6 +245,79 @@ type settingsRequest struct {
 	DefaultMaxReaders        int      `json:"defaultMaxReaders"`
 }
 
+type channelPatchRequest struct {
+	AutomaticPreview *bool `json:"automaticPreview"`
+}
+
+type diagnosticsResponse struct {
+	Gateway   diagnosticsGateway   `json:"gateway"`
+	Media     diagnosticsMedia     `json:"media"`
+	Settings  diagnosticsSettings  `json:"settings"`
+	Resources *telemetry.Snapshot  `json:"resources,omitempty"`
+	Channels  []diagnosticsChannel `json:"channels"`
+}
+
+type diagnosticsGateway struct {
+	Version   string    `json:"version"`
+	StartedAt time.Time `json:"startedAt"`
+}
+
+type diagnosticsMedia struct {
+	Reachable       bool                  `json:"reachable"`
+	Version         string                `json:"version,omitempty"`
+	Started         string                `json:"started,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	ActiveListeners *activeMediaListeners `json:"activeListeners,omitempty"`
+}
+
+type diagnosticsSettings struct {
+	Revision   int                 `json:"revision"`
+	ApplyState settings.ApplyState `json:"applyState"`
+	UpdatedAt  time.Time           `json:"updatedAt"`
+}
+
+type diagnosticsChannel struct {
+	ID            string                   `json:"id"`
+	Number        int                      `json:"number"`
+	Name          string                   `json:"name"`
+	Path          string                   `json:"path"`
+	Enabled       bool                     `json:"enabled"`
+	Revision      int                      `json:"revision"`
+	ApplyState    channel.ApplyState       `json:"applyState"`
+	CreatedAt     time.Time                `json:"createdAt"`
+	UpdatedAt     time.Time                `json:"updatedAt"`
+	Runtime       diagnosticsRuntime       `json:"runtime"`
+	OutputReady   bool                     `json:"outputReady"`
+	Relay         *srtrelay.Status         `json:"relay,omitempty"`
+	Compatibility diagnosticsCompatibility `json:"compatibility"`
+}
+
+type diagnosticsRuntime struct {
+	Available           bool                  `json:"available"`
+	AvailableTime       *string               `json:"availableTime,omitempty"`
+	Online              bool                  `json:"online"`
+	OnlineTime          *string               `json:"onlineTime,omitempty"`
+	OutputAvailableTime *string               `json:"outputAvailableTime,omitempty"`
+	Source              *mediamtx.PathSource  `json:"source,omitempty"`
+	Readers             []mediamtx.PathReader `json:"readers"`
+}
+
+type diagnosticsCompatibility struct {
+	State     string                         `json:"state"`
+	Mode      string                         `json:"mode,omitempty"`
+	Required  bool                           `json:"required"`
+	Reasons   []string                       `json:"reasons"`
+	LastError string                         `json:"lastError,omitempty"`
+	Worker    diagnosticsCompatibilityWorker `json:"worker"`
+}
+
+type diagnosticsCompatibilityWorker struct {
+	Running  bool   `json:"running"`
+	Queued   bool   `json:"queued,omitempty"`
+	Restarts int    `json:"restarts"`
+	Error    string `json:"error,omitempty"`
+}
+
 func New(options Options) (http.Handler, error) {
 	if options.Logger == nil {
 		return nil, fmt.Errorf("logger is required")
@@ -280,6 +366,7 @@ func New(options Options) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/status", s.status)
+	mux.HandleFunc("GET /api/v1/diagnostics", s.diagnostics)
 	mux.HandleFunc("GET /api/v1/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/v1/settings", s.updateSettings)
 	mux.HandleFunc("POST /api/v1/restart", s.restartGateway)
@@ -297,7 +384,13 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	response := map[string]any{"status": "ok", "mediaMTX": "ok"}
-	if _, err := s.mediaMTX.Status(ctx); err != nil {
+	var err error
+	if reachability, ok := s.mediaMTX.(mediaReachabilityReader); ok {
+		err = reachability.Reachable(ctx)
+	} else {
+		_, err = s.mediaMTX.GetGlobal(ctx)
+	}
+	if err != nil {
 		status = http.StatusServiceUnavailable
 		response["status"] = "degraded"
 		response["mediaMTX"] = "unavailable"
@@ -358,6 +451,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		response.Network.Media.ActiveAddress = networkbind.LegacyMediaBinding(
 			mediaGlobal.SRTAddress, mediaGlobal.WebRTCLocalUDPAddress, mediaGlobal.WebRTCLocalTCPAddress,
 		)
+		response.Network.Media.ActiveListeners = listenersFromGlobal(mediaGlobal)
 	}
 	mediaRuntime, mediaErr := s.mediaMTX.Status(r.Context())
 	if mediaErr != nil {
@@ -371,6 +465,95 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	response.Channels = s.mergeChannels(configured, mediaRuntime.Channels)
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
+	configured, err := s.channels.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "channel diagnostics are unavailable")
+		return
+	}
+	globalSettings, err := s.settings.Get(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "settings diagnostics are unavailable")
+		return
+	}
+	response := diagnosticsResponse{
+		Gateway: diagnosticsGateway{Version: s.version, StartedAt: s.startedAt},
+		Settings: diagnosticsSettings{
+			Revision: globalSettings.Revision, ApplyState: globalSettings.ApplyState, UpdatedAt: globalSettings.UpdatedAt,
+		},
+		Channels: make([]diagnosticsChannel, 0, len(configured)),
+	}
+	if s.resources != nil {
+		resources := s.resources.Snapshot()
+		response.Resources = &resources
+	}
+	if global, globalErr := s.mediaMTX.GetGlobal(r.Context()); globalErr == nil {
+		response.Media.ActiveListeners = listenersFromGlobal(global)
+	} else {
+		response.Media.Error = "MediaMTX listener configuration is unavailable"
+	}
+	runtime, runtimeErr := s.mediaMTX.Status(r.Context())
+	if runtimeErr != nil {
+		response.Media.Error = "MediaMTX is unavailable"
+	} else {
+		response.Media.Reachable = true
+		response.Media.Version = runtime.Info.Version
+		response.Media.Started = runtime.Info.Started
+	}
+	byPath := make(map[string]mediamtx.Channel, len(runtime.Channels))
+	for _, item := range runtime.Channels {
+		byPath[item.Name] = item
+	}
+	for _, item := range configured {
+		raw := byPath[item.Path]
+		state := compatibility.State{State: compatibility.StateOffline, Mode: compatibility.ModeDirect, Reasons: []string{}, OutputPath: item.Path}
+		if raw.Available && raw.Online {
+			state.State = compatibility.StateReady
+		}
+		if s.compat != nil {
+			state = stateForRuntime(s.compat.Snapshot(item.ID), raw, item.Path)
+		}
+		output := raw
+		if state.OutputPath != "" && state.OutputPath != item.Path {
+			output = byPath[state.OutputPath]
+		}
+		view := channelRuntimeView(item, raw, output, state)
+		s.attachRelayStatus(item, &view)
+		readers := append([]mediamtx.PathReader(nil), raw.Readers...)
+		if readers == nil {
+			readers = []mediamtx.PathReader{}
+		}
+		reasons := append([]string(nil), state.Reasons...)
+		if reasons == nil {
+			reasons = []string{}
+		}
+		response.Channels = append(response.Channels, diagnosticsChannel{
+			ID: item.ID, Number: item.Number, Name: item.Name, Path: item.Path, Enabled: item.Enabled,
+			Revision: item.Revision, ApplyState: item.ApplyState, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+			Runtime: diagnosticsRuntime{
+				Available: raw.Available, AvailableTime: raw.AvailableTime, Online: raw.Online,
+				OnlineTime: raw.OnlineTime, OutputAvailableTime: output.AvailableTime,
+				Source: raw.Source, Readers: readers,
+			},
+			OutputReady: view.OutputReady, Relay: view.Relay,
+			Compatibility: diagnosticsCompatibility{
+				State: state.State, Mode: state.Mode, Required: state.Required, Reasons: reasons, LastError: state.LastError,
+				Worker: diagnosticsCompatibilityWorker{
+					Running: state.Worker.Running, Queued: state.Worker.Queued,
+					Restarts: state.Worker.Restarts, Error: state.Worker.Error,
+				},
+			},
+		})
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func listenersFromGlobal(global mediamtx.GlobalConfig) *activeMediaListeners {
+	return &activeMediaListeners{
+		SRT: global.SRTAddress, WebRTCUDP: global.WebRTCLocalUDPAddress, WebRTCTCP: global.WebRTCLocalTCPAddress,
+	}
 }
 
 func (s *server) restartGateway(w http.ResponseWriter, _ *http.Request) {
@@ -388,10 +571,15 @@ func (s *server) getSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "global settings are unavailable")
 		return
 	}
+	w.Header().Set("ETag", revisionETag(value.Revision))
 	writeJSON(w, http.StatusOK, value)
 }
 
 func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
 	defer r.Body.Close()
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -454,12 +642,14 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	value, err = s.settings.Update(r.Context(), value)
+	value, err = s.settings.UpdateExpected(r.Context(), value, expectedRevision)
 	if err != nil && value.UpdatedAt.IsZero() {
 		if errors.Is(err, settings.ErrInvalid) {
 			writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), settings.ErrInvalid.Error()+": "))
 		} else if errors.Is(err, channel.ErrInvalid) {
 			writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), channel.ErrInvalid.Error()+": "))
+		} else if errors.Is(err, settings.ErrRevisionConflict) {
+			writeAPIError(w, http.StatusPreconditionFailed, "revision_conflict", "settings changed since they were read")
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal server error")
 		}
@@ -468,6 +658,7 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Warn("global settings saved but not applied", "error", err)
 	}
+	w.Header().Set("ETag", revisionETag(value.Revision))
 	writeJSON(w, http.StatusOK, value)
 }
 
@@ -524,10 +715,12 @@ func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "channel configuration is unavailable")
 		return
 	}
-	responses := make([]channelResponse, 0, len(items))
-	for _, item := range items {
-		responses = append(responses, s.channelView(item, mediamtx.Channel{}))
+	runtime, err := s.mediaMTX.Status(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
+		return
 	}
+	responses := s.mergeChannels(items, runtime.Channels)
 	writeJSON(w, http.StatusOK, map[string]any{"channels": responses})
 }
 
@@ -564,10 +757,12 @@ func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
 			s.getChannel(id, w, r)
 		case http.MethodPut:
 			s.updateChannel(id, w, r)
+		case http.MethodPatch:
+			s.patchChannel(id, w, r)
 		case http.MethodDelete:
 			s.deleteChannel(id, w, r)
 		default:
-			w.Header().Set("Allow", "GET, PUT, DELETE")
+			w.Header().Set("Allow", "GET, PUT, PATCH, DELETE")
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 		return
@@ -586,23 +781,56 @@ func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
+	sessionDelete, route, suffix := whepSessionDelete(r.Method, parts)
 	item, err := s.channels.Get(r.Context(), id)
 	if err != nil {
+		if sessionDelete && errors.Is(err, channel.ErrNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
-	if item.ApplyState == channel.ApplyDeleting {
-		if r.Method == http.MethodPost {
+	if sessionDelete {
+		mediaPath := item.Path
+		if route == "c" {
+			mediaPath = compatibility.CompatibilityPath(item.ID)
+		}
+		s.proxyWHEP(item.ID, mediaPath, route, suffix, w, r)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method == http.MethodPost {
+		if item.ApplyState == channel.ApplyDeleting {
 			writeError(w, http.StatusConflict, channel.ErrDeleting.Error())
 			return
 		}
-	} else if !item.Enabled {
+		if !item.Enabled || item.ApplyState != channel.ApplyApplied {
+			writeError(w, http.StatusConflict, "channel is not operational")
+			return
+		}
+		if len(parts) != 2 {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		mediaPath, route, err := s.operationalWHEPTarget(r.Context(), item)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		s.proxyWHEP(item.ID, mediaPath, route, "", w, r)
+		return
+	}
+	if !item.Enabled {
 		writeError(w, http.StatusConflict, "channel is disabled")
 		return
 	}
 	mediaPath := item.Path
-	route := ""
-	suffix := ""
+	route = ""
+	suffix = ""
 	if len(parts) > 2 && (parts[2] == "d" || parts[2] == "c") {
 		route = parts[2]
 		if route == "c" {
@@ -651,6 +879,60 @@ func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
 	s.proxyWHEP(item.ID, mediaPath, route, suffix, w, r)
 }
 
+func whepSessionDelete(method string, parts []string) (bool, string, string) {
+	if method != http.MethodDelete {
+		return false, "", ""
+	}
+	if len(parts) == 3 && parts[2] != "" {
+		return true, "", "/" + parts[2]
+	}
+	if len(parts) == 4 && (parts[2] == "d" || parts[2] == "c") && parts[3] != "" {
+		return true, parts[2], "/" + parts[3]
+	}
+	return false, "", ""
+}
+
+func (s *server) operationalWHEPTarget(ctx context.Context, item channel.Channel) (string, string, error) {
+	runtime, err := s.mediaMTX.Status(ctx)
+	if err != nil {
+		return "", "", errors.New("media status is unavailable")
+	}
+	byPath := make(map[string]mediamtx.Channel, len(runtime.Channels))
+	for _, candidate := range runtime.Channels {
+		byPath[candidate.Name] = candidate
+	}
+	raw := byPath[item.Path]
+	state := compatibility.State{State: compatibility.StateOffline, Mode: compatibility.ModeDirect, Reasons: []string{}, OutputPath: item.Path}
+	if raw.Available && raw.Online {
+		state.State = compatibility.StateReady
+	}
+	if s.compat != nil {
+		state = stateForRuntime(s.compat.Snapshot(item.ID), raw, item.Path)
+	}
+	output := raw
+	if state.OutputPath != "" && state.OutputPath != item.Path {
+		output = byPath[state.OutputPath]
+	}
+	if !channelRuntimeView(item, raw, output, state).OutputReady {
+		if state.LastError != "" {
+			return "", "", errors.New(state.LastError)
+		}
+		return "", "", errors.New("WebRTC output is not ready")
+	}
+	mediaPath := item.Path
+	route := ""
+	if s.compat != nil {
+		route = "d"
+	}
+	if state.OutputPath != "" {
+		mediaPath = state.OutputPath
+	}
+	if state.Mode == compatibility.ModeTranscoded {
+		route = "c"
+	}
+	return mediaPath, route, nil
+}
+
 func (s *server) getChannel(id string, w http.ResponseWriter, r *http.Request) {
 	item, err := s.channels.Get(r.Context(), id)
 	if err != nil {
@@ -663,6 +945,7 @@ func (s *server) getChannel(id string, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := s.mergeChannels([]channel.Channel{item}, runtime.Channels)
+	w.Header().Set("ETag", revisionETag(item.Revision))
 	writeJSON(w, http.StatusOK, view[0])
 }
 
@@ -676,16 +959,17 @@ func (s *server) getSRTPassphrase(id string, w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusConflict, "channel is not configured for SRT")
 		return
 	}
+	w.Header().Set("ETag", revisionETag(item.Revision))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"configured": item.Input.SRT.Passphrase != "",
 		"passphrase": item.Input.SRT.Passphrase,
+		"revision":   item.Revision,
 	})
 }
 
 func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request) {
-	current, err := s.channels.Get(r.Context(), id)
-	if err != nil {
-		writeServiceError(w, err)
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
 		return
 	}
 	request, err := decodeChannelRequest(r)
@@ -693,7 +977,10 @@ func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	item, err := s.channels.Update(r.Context(), current.ID, request.toDraft(&current))
+	draft := request.toDraft(nil)
+	draft.PreserveAutomaticPreview = request.AutomaticPreview == nil
+	draft.PreserveUseAbsoluteTimestamp = request.UseAbsoluteTimestamp == nil
+	item, err := s.channels.UpdateExpected(r.Context(), id, draft, expectedRevision)
 	if err != nil && item.ID == "" {
 		writeServiceError(w, err)
 		return
@@ -701,6 +988,30 @@ func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request
 	if err != nil {
 		s.logger.Warn("channel saved but not applied", "channel", item.ID, "error", err)
 	}
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusOK, s.channelView(item, mediamtx.Channel{}))
+}
+
+func (s *server) patchChannel(id string, w http.ResponseWriter, r *http.Request) {
+	var request channelPatchRequest
+	if err := decodeStrictJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.AutomaticPreview == nil {
+		writeError(w, http.StatusBadRequest, "automaticPreview is required")
+		return
+	}
+	expectedRevision, ok := optionalIfMatch(w, r)
+	if !ok {
+		return
+	}
+	item, err := s.channels.UpdateAutomaticPreview(r.Context(), id, *request.AutomaticPreview, expectedRevision)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("ETag", revisionETag(item.Revision))
 	writeJSON(w, http.StatusOK, s.channelView(item, mediamtx.Channel{}))
 }
 
@@ -726,6 +1037,16 @@ func (s *server) proxyWHEP(channelID, mediaPath, route, suffix string, w http.Re
 		req.Host = target.Host
 	}
 	proxy.ModifyResponse = func(res *http.Response) error {
+		if r.Method == http.MethodDelete && (res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusGone) {
+			res.StatusCode = http.StatusNoContent
+			res.Status = "204 " + http.StatusText(http.StatusNoContent)
+			res.Body.Close()
+			res.Body = http.NoBody
+			res.ContentLength = 0
+			res.Header.Del("Content-Type")
+			res.Header.Del("Content-Length")
+			return nil
+		}
 		location := res.Header.Get("Location")
 		if location == "" {
 			return nil
@@ -781,29 +1102,39 @@ func (s *server) requestLog(next http.Handler) http.Handler {
 }
 
 func decodeChannelRequest(r *http.Request) (channelRequest, error) {
-	defer r.Body.Close()
-	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-	decoder.DisallowUnknownFields()
 	var request channelRequest
-	if err := decoder.Decode(&request); err != nil {
-		return channelRequest{}, fmt.Errorf("invalid request body: %w", err)
+	if err := decodeStrictJSON(r, &request); err != nil {
+		return channelRequest{}, err
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return channelRequest{}, errors.New("request body must contain one JSON object")
+	if request.Input.SRT != nil && request.Input.SRT.Passphrase != nil && request.Input.SRT.ClearPassphrase {
+		return channelRequest{}, errors.New("passphrase and clearPassphrase cannot both be set")
 	}
 	return request, nil
 }
 
+func decodeStrictJSON(r *http.Request, target any) error {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid request body: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("request body must contain one JSON object")
+	}
+	return nil
+}
+
 func (r channelRequest) toDraft(current *channel.Channel) channel.Draft {
 	input := channel.Input{Mode: r.Input.Mode, RTP: r.Input.RTP}
+	passphraseIntent := channel.PassphraseUnspecified
 	if r.Input.SRT != nil {
+		passphraseIntent = channel.PassphraseKeep
 		passphrase := ""
-		if current != nil && current.Input.SRT != nil {
-			passphrase = current.Input.SRT.Passphrase
-		}
 		if r.Input.SRT.ClearPassphrase {
-			passphrase = ""
+			passphraseIntent = channel.PassphraseClear
 		} else if r.Input.SRT.Passphrase != nil {
+			passphraseIntent = channel.PassphraseSet
 			passphrase = *r.Input.SRT.Passphrase
 		}
 		input.SRT = &channel.SRTInput{
@@ -834,6 +1165,7 @@ func (r channelRequest) toDraft(current *channel.Channel) channel.Draft {
 		Enabled:              r.Enabled,
 		AutomaticPreview:     automaticPreview,
 		Input:                input,
+		PassphraseIntent:     passphraseIntent,
 		MaxReaders:           r.MaxReaders,
 		UseAbsoluteTimestamp: useAbsoluteTimestamp,
 	}
@@ -930,7 +1262,8 @@ func (s *server) attachRelayStatus(item channel.Channel, view *channelResponse) 
 }
 
 func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, compatibilityState compatibility.State) channelResponse {
-	outputReady := compatibilityState.State == compatibility.StateReady && output.Available && output.Online
+	outputReady := item.Enabled && item.ApplyState == channel.ApplyApplied &&
+		compatibilityState.State == compatibility.StateReady && output.Available && output.Online
 	var outputInboundBytes, outboundBytes uint64
 	var outputAvailableTime *string
 	var readers []mediamtx.PathReader
@@ -944,6 +1277,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 	}
 	view := channelResponse{
 		ID:                   item.ID,
+		Revision:             item.Revision,
 		Number:               item.Number,
 		Name:                 item.Name,
 		Path:                 item.Path,
@@ -1013,6 +1347,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, strings.TrimPrefix(err.Error(), channel.ErrInvalid.Error()+": "))
 	case errors.Is(err, channel.ErrDeleting):
 		writeError(w, http.StatusConflict, channel.ErrDeleting.Error())
+	case errors.Is(err, channel.ErrRevisionConflict):
+		writeAPIError(w, http.StatusPreconditionFailed, "revision_conflict", "channel changed since it was read")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
@@ -1027,4 +1363,52 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{"code": code, "message": message},
+	})
+}
+
+func revisionETag(revision int) string {
+	return `"` + strconv.Itoa(revision) + `"`
+}
+
+func requireIfMatch(w http.ResponseWriter, r *http.Request) (int, bool) {
+	value := strings.TrimSpace(r.Header.Get("If-Match"))
+	if value == "" {
+		writeAPIError(w, http.StatusPreconditionRequired, "precondition_required", "If-Match is required")
+		return 0, false
+	}
+	revision, err := parseRevisionETag(value)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_if_match", "If-Match must contain one strong revision ETag")
+		return 0, false
+	}
+	return revision, true
+}
+
+func optionalIfMatch(w http.ResponseWriter, r *http.Request) (*int, bool) {
+	value := strings.TrimSpace(r.Header.Get("If-Match"))
+	if value == "" {
+		return nil, true
+	}
+	revision, err := parseRevisionETag(value)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid_if_match", "If-Match must contain one strong revision ETag")
+		return nil, false
+	}
+	return &revision, true
+}
+
+func parseRevisionETag(value string) (int, error) {
+	if len(value) < 3 || value[0] != '"' || value[len(value)-1] != '"' || strings.Contains(value, ",") {
+		return 0, errors.New("invalid revision ETag")
+	}
+	revision, err := strconv.Atoi(value[1 : len(value)-1])
+	if err != nil || revision < 1 {
+		return 0, errors.New("invalid revision ETag")
+	}
+	return revision, nil
 }

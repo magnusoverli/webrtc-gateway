@@ -11,12 +11,35 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
+)
+
+const (
+	runtimeCacheTTL = 350 * time.Millisecond
+	staticCacheTTL  = 2 * time.Second
 )
 
 type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
+
+	cacheMu  sync.Mutex
+	cache    map[string]cacheEntry
+	inflight map[string]*cacheCall
+	epoch    uint64
+}
+
+type cacheEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+type cacheCall struct {
+	done  chan struct{}
+	data  []byte
+	err   error
+	epoch uint64
 }
 
 type Info struct {
@@ -123,6 +146,8 @@ func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		cache:    make(map[string]cacheEntry),
+		inflight: make(map[string]*cacheCall),
 	}, nil
 }
 
@@ -132,12 +157,12 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 
-	configs, err := getAllPages[PathConfig](ctx, c, "/v3/config/paths/list")
+	configs, err := getAllPages[PathConfig](ctx, c, "/v3/config/paths/list", staticCacheTTL)
 	if err != nil {
 		return Status{}, err
 	}
 
-	runtimePaths, err := getAllPages[Path](ctx, c, "/v3/paths/list")
+	runtimePaths, err := getAllPages[Path](ctx, c, "/v3/paths/list", runtimeCacheTTL)
 	if err != nil {
 		return Status{}, err
 	}
@@ -181,7 +206,7 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 
 func (c *Client) Info(ctx context.Context) (Info, error) {
 	var info Info
-	if err := c.get(ctx, "/v3/info", &info); err != nil {
+	if err := c.getCached(ctx, "/v3/info", staticCacheTTL, &info); err != nil {
 		return Info{}, err
 	}
 	return info, nil
@@ -189,10 +214,16 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 
 func (c *Client) GetGlobal(ctx context.Context) (GlobalConfig, error) {
 	var config GlobalConfig
-	if err := c.get(ctx, "/v3/config/global/get", &config); err != nil {
+	if err := c.getCached(ctx, "/v3/config/global/get", staticCacheTTL, &config); err != nil {
 		return GlobalConfig{}, err
 	}
 	return config, nil
+}
+
+func (c *Client) Reachable(ctx context.Context) error {
+	requestURL := c.endpointURL("/v3/info")
+	_, err := c.fetch(ctx, "/v3/info", requestURL)
+	return err
 }
 
 func (c *Client) ReplacePath(ctx context.Context, name string, config PathConfig) error {
@@ -208,42 +239,107 @@ func (c *Client) PatchGlobal(ctx context.Context, config GlobalConfig) error {
 }
 
 func (c *Client) get(ctx context.Context, endpoint string, target any) error {
-	requestURL := *c.baseURL
-	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
-	return c.getURL(ctx, endpoint, requestURL, target)
+	requestURL := c.endpointURL(endpoint)
+	data, err := c.fetch(ctx, endpoint, requestURL)
+	if err != nil {
+		return err
+	}
+	return decodeResponse(endpoint, data, target)
 }
 
-func (c *Client) getPage(ctx context.Context, endpoint string, pageNumber int, target any) error {
-	requestURL := *c.baseURL
-	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
+func (c *Client) getCached(ctx context.Context, endpoint string, ttl time.Duration, target any) error {
+	requestURL := c.endpointURL(endpoint)
+	return c.getURLCached(ctx, endpoint, requestURL, ttl, target)
+}
+
+func (c *Client) getPage(ctx context.Context, endpoint string, pageNumber int, ttl time.Duration, target any) error {
+	requestURL := c.endpointURL(endpoint)
 	query := requestURL.Query()
 	query.Set("page", strconv.Itoa(pageNumber))
 	requestURL.RawQuery = query.Encode()
-	return c.getURL(ctx, endpoint, requestURL, target)
+	return c.getURLCached(ctx, endpoint, requestURL, ttl, target)
 }
 
-func (c *Client) getURL(ctx context.Context, endpoint string, requestURL url.URL, target any) error {
+func (c *Client) endpointURL(endpoint string) url.URL {
+	requestURL := *c.baseURL
+	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
+	return requestURL
+}
+
+func (c *Client) getURLCached(ctx context.Context, endpoint string, requestURL url.URL, ttl time.Duration, target any) error {
+	key := requestURL.String()
+	now := time.Now()
+	c.cacheMu.Lock()
+	if cached, ok := c.cache[key]; ok && now.Before(cached.expiresAt) {
+		data := cached.data
+		c.cacheMu.Unlock()
+		return decodeResponse(endpoint, data, target)
+	}
+	if call := c.inflight[key]; call != nil && call.epoch == c.epoch {
+		c.cacheMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-call.done:
+			if call.err != nil {
+				return call.err
+			}
+			return decodeResponse(endpoint, call.data, target)
+		}
+	}
+	epoch := c.epoch
+	call := &cacheCall{done: make(chan struct{}), epoch: epoch}
+	c.inflight[key] = call
+	c.cacheMu.Unlock()
+
+	data, err := c.fetch(ctx, endpoint, requestURL)
+	c.cacheMu.Lock()
+	call.data = data
+	call.err = err
+	if c.inflight[key] == call {
+		delete(c.inflight, key)
+	}
+	if err == nil && c.epoch == epoch {
+		c.cache[key] = cacheEntry{data: data, expiresAt: time.Now().Add(ttl)}
+	}
+	close(call.done)
+	c.cacheMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return decodeResponse(endpoint, data, target)
+}
+
+func (c *Client) fetch(ctx context.Context, endpoint string, requestURL url.URL) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
-		return fmt.Errorf("create MediaMTX request: %w", err)
+		return nil, fmt.Errorf("create MediaMTX request: %w", err)
 	}
 
 	res, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request MediaMTX %s: %w", endpoint, err)
+		return nil, fmt.Errorf("request MediaMTX %s: %w", endpoint, err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("request MediaMTX %s: status %s", endpoint, res.Status)
+		return nil, fmt.Errorf("request MediaMTX %s: status %s", endpoint, res.Status)
 	}
-	if err := json.NewDecoder(res.Body).Decode(target); err != nil {
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read MediaMTX %s: %w", endpoint, err)
+	}
+	return data, nil
+}
+
+func decodeResponse(endpoint string, data []byte, target any) error {
+	if err := json.Unmarshal(data, target); err != nil {
 		return fmt.Errorf("decode MediaMTX %s: %w", endpoint, err)
 	}
 	return nil
 }
 
-func getAllPages[T any](ctx context.Context, c *Client, endpoint string) ([]T, error) {
+func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration) ([]T, error) {
 	items := []T(nil)
 	pageCount := 1
 	for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
@@ -252,7 +348,7 @@ func getAllPages[T any](ctx context.Context, c *Client, endpoint string) ([]T, e
 			PageCount int `json:"pageCount"`
 			Items     []T `json:"items"`
 		}
-		if err := c.getPage(ctx, endpoint, pageNumber, &response); err != nil {
+		if err := c.getPage(ctx, endpoint, pageNumber, ttl, &response); err != nil {
 			return nil, err
 		}
 		if pageNumber == 0 {
@@ -296,6 +392,7 @@ func (c *Client) mutate(ctx context.Context, method, endpoint string, body any, 
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusOK || (allowNotFound && res.StatusCode == http.StatusNotFound) {
+		c.invalidate()
 		return nil
 	}
 	var response struct {
@@ -306,4 +403,11 @@ func (c *Client) mutate(ctx context.Context, method, endpoint string, body any, 
 		return fmt.Errorf("request MediaMTX %s: %s", endpoint, response.Error)
 	}
 	return fmt.Errorf("request MediaMTX %s: status %s", endpoint, res.Status)
+}
+
+func (c *Client) invalidate() {
+	c.cacheMu.Lock()
+	c.epoch++
+	clear(c.cache)
+	c.cacheMu.Unlock()
 }

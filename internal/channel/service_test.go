@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
+	"webrtc-gateway/internal/controlplane"
 	"webrtc-gateway/internal/mediamtx"
 )
 
@@ -475,5 +477,55 @@ func TestServiceSerializesConcurrentPortAllocation(t *testing.T) {
 	}
 	if succeeded != 1 || rejected != 1 {
 		t.Fatalf("create results = %d succeeded, %d rejected", succeeded, rejected)
+	}
+}
+
+func TestServiceResolvesKeptPassphraseAfterCoordinatorAcquisition(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	control := controlplane.NewCoordinator()
+	service := NewService(store, &fakePathManager{}, nil, nil, control)
+	item, err := service.Create(context.Background(), Draft{
+		Name: "Secret source", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000, Passphrase: "old-secret0"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, release, err := control.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, updateErr := service.Update(context.Background(), item.ID, Draft{
+			Name: "Renamed source", Enabled: true, PassphraseIntent: PassphraseKeep,
+			Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+		})
+		result <- updateErr
+	}()
+
+	current, err := store.Get(context.Background(), item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Input.SRT.Passphrase = "new-secret0"
+	previousRevision := current.Revision
+	current.Revision++
+	current.UpdatedAt = time.Now().UTC()
+	if err := store.Update(context.Background(), current, previousRevision); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Get(context.Background(), item.ID)
+	if err != nil || loaded.Input.SRT.Passphrase != "new-secret0" {
+		t.Fatalf("preserved passphrase = %#v, %v", loaded.Input.SRT, err)
 	}
 }

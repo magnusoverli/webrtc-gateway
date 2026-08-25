@@ -48,6 +48,10 @@ func (s *Service) Get(ctx context.Context) (Settings, error) {
 }
 
 func (s *Service) Update(ctx context.Context, value Settings) (Settings, error) {
+	return s.UpdateExpected(ctx, value, value.Revision)
+}
+
+func (s *Service) UpdateExpected(ctx context.Context, value Settings, expectedRevision int) (Settings, error) {
 	ctx, release, err := s.control.Acquire(ctx)
 	if err != nil {
 		return Settings{}, err
@@ -57,6 +61,9 @@ func (s *Service) Update(ctx context.Context, value Settings) (Settings, error) 
 	current, err := s.store.Get(ctx)
 	if err != nil {
 		return Settings{}, err
+	}
+	if current.Revision != expectedRevision {
+		return Settings{}, ErrRevisionConflict
 	}
 	validated, err := Validate(value, s.now())
 	if err != nil {
@@ -73,7 +80,8 @@ func (s *Service) Update(ctx context.Context, value Settings) (Settings, error) 
 			return Settings{}, err
 		}
 	}
-	if err := s.store.Update(ctx, validated); err != nil {
+	validated.Revision = current.Revision + 1
+	if err := s.store.Update(ctx, validated, current.Revision); err != nil {
 		return Settings{}, err
 	}
 	return s.applyResolved(ctx, validated, effective, interfaceList, current.MediaBindAddress != validated.MediaBindAddress, true)
@@ -196,7 +204,7 @@ func (s *Service) applyResolved(
 	value.ApplyState = ApplyApplied
 	value.ApplyError = ""
 	if previousState != value.ApplyState || previousError != value.ApplyError {
-		if err := s.store.SetApplyResult(ctx, value.ApplyState, ""); err != nil {
+		if err := s.store.SetApplyResult(ctx, value.Revision, value.ApplyState, ""); err != nil {
 			return value, err
 		}
 	}
@@ -209,7 +217,7 @@ func (s *Service) applyFailure(ctx context.Context, value Settings, applyErr err
 	value.ApplyState = ApplyError
 	value.ApplyError = applyErr.Error()
 	if previousState != value.ApplyState || previousError != value.ApplyError {
-		if storeErr := s.store.SetApplyResult(ctx, value.ApplyState, value.ApplyError); storeErr != nil {
+		if storeErr := s.store.SetApplyResult(ctx, value.Revision, value.ApplyState, value.ApplyError); storeErr != nil {
 			return value, storeErr
 		}
 	}

@@ -193,6 +193,34 @@ func TestSupervisorReportsRestartFailures(t *testing.T) {
 	}
 }
 
+func TestSupervisorReportsSafeLocalPushListener(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	supervisor.startFn = func(context.Context, string) (inputSession, error) {
+		return inputSession{wait: make(chan error)}, nil
+	}
+	supervisor.relayFn = func(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
+		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
+		BindAddress: "192.0.2.20", Port: 10000, DestinationAddress: ":8890", Passphrase: "0123456789",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	status := supervisor.Snapshot("channel-1")
+	if status.ListenerAddress != "192.0.2.20:10000" || !status.ListenerActive {
+		t.Fatalf("listener status = %#v", status)
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSupervisorBacksOffRepeatedPostLaunchExits(t *testing.T) {
 	supervisor := newTestSupervisor(t, "unused")
 	var starts atomic.Int32

@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { codecWarnings, summarizeRTCStats } from "./webrtc";
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { codecWarnings, summarizeRTCStats, waitForICEGathering } from "./webrtc";
+
+afterEach(() => vi.useRealTimers());
 
 function report(entries: Array<Record<string, unknown>>) {
   return {
@@ -54,3 +58,49 @@ describe("codecWarnings", () => {
     ]);
   });
 });
+
+describe("waitForICEGathering", () => {
+  it("reports completion and removes its timeout", async () => {
+    vi.useFakeTimers();
+    const peer = new GatheringPeer();
+    const result = waitForICEGathering(peer as unknown as RTCPeerConnection, 5000);
+
+    peer.iceGatheringState = "complete";
+    peer.dispatchEvent(new Event("icegatheringstatechange"));
+
+    await expect(result).resolves.toBe("complete");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("reports timeout without treating gathering as complete", async () => {
+    vi.useFakeTimers();
+    const peer = new GatheringPeer();
+    const result = waitForICEGathering(peer as unknown as RTCPeerConnection, { timeoutMs: 100 });
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    await expect(result).resolves.toBe("timeout");
+    peer.iceGatheringState = "complete";
+    peer.dispatchEvent(new Event("icegatheringstatechange"));
+    await expect(result).resolves.toBe("timeout");
+  });
+
+  it("reports AbortSignal cancellation and cleans up its timer", async () => {
+    vi.useFakeTimers();
+    const peer = new GatheringPeer();
+    const controller = new AbortController();
+    const result = waitForICEGathering(peer as unknown as RTCPeerConnection, {
+      timeoutMs: 5000,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(result).resolves.toBe("aborted");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+class GatheringPeer extends EventTarget {
+  iceGatheringState: RTCIceGatheringState = "gathering";
+}

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   absolutePath,
+  activeListenerHost,
   channelTone,
   channelStateLabel,
   channelHasFault,
@@ -22,6 +23,7 @@ import {
 
 const baseChannel: Channel = {
   id: "channel-id",
+  revision: 1,
   number: 1,
   name: "Studio & Main",
   path: "studio-main",
@@ -31,6 +33,8 @@ const baseChannel: Channel = {
   maxReaders: 0,
   useAbsoluteTimestamp: false,
   applyState: "applied",
+  createdAt: "2026-08-25T08:00:00Z",
+  updatedAt: "2026-08-25T08:00:00Z",
   whepPath: "/api/v1/channels/channel-id/whep",
   viewerPath: "/view",
   embedPath: "/embed/1",
@@ -58,9 +62,9 @@ describe("connection URLs", () => {
 
   it("uses concrete bindings and brackets IPv6 hosts", () => {
     expect(mediaHost("2001:db8::20", location.hostname)).toBe("2001:db8::20");
-    expect(srtListenerURL(10000, "2001:db8::20", location.hostname)).toBe("srt://[2001:db8::20]:10000?latency=60");
-    expect(srtListenerURL(10000, "192.0.2.20", location.hostname, 80)).toBe("srt://192.0.2.20:10000?latency=80");
-    expect(srtPublishURL("studio-main", "[::]:8890", "2001:db8::20", location.hostname)).toBe(
+    expect(srtListenerURL("[2001:db8::20]:10000", location.hostname)).toBe("srt://[2001:db8::20]:10000?latency=60");
+    expect(srtListenerURL("192.0.2.20:10000", location.hostname, 80)).toBe("srt://192.0.2.20:10000?latency=80");
+    expect(srtPublishURL("studio-main", "[2001:db8::20]:8890", location.hostname)).toBe(
       "srt://[2001:db8::20]:8890?streamid=publish:studio-main&pkt_size=1316",
     );
     expect(managementOrigin("2001:db8::10", 8080, location)).toBe("http://[2001:db8::10]:8080");
@@ -68,7 +72,19 @@ describe("connection URLs", () => {
 
   it("falls back to the browser location for wildcard bindings", () => {
     expect(mediaHost("*", location.hostname)).toBe("desk.local");
+    expect(activeListenerHost(":10000", location.hostname)).toBe("desk.local");
+    expect(srtListenerURL("0.0.0.0:10000", location.hostname)).toBe("srt://desk.local:10000?latency=60");
+    expect(srtListenerURL("[::]:10000", location.hostname)).toBe("srt://desk.local:10000?latency=60");
+    expect(srtPublishURL("studio-main", ":8890", location.hostname)).toBe(
+      "srt://desk.local:8890?streamid=publish:studio-main&pkt_size=1316",
+    );
     expect(managementOrigin("*", 9000, location)).toBe(location.origin);
+  });
+
+  it("does not combine an active listener host with a configured port", () => {
+    expect(srtListenerURL("192.0.2.20:12000", location.hostname)).toContain(":12000?");
+    expect(srtListenerURL(undefined, location.hostname)).toBe("");
+    expect(srtPublishURL("studio-main", "malformed", location.hostname)).toBe("");
   });
 });
 
@@ -187,11 +203,12 @@ describe("channelStateLabel", () => {
     expect(channelStateLabel({ ...baseChannel, outputReady: true })).toBe("Output ready - direct");
     expect(channelStateLabel({ ...baseChannel, outputReady: true, compatibility: { ...baseChannel.compatibility, mode: "transcoded" } })).toBe("Output ready - normalized");
     expect(channelStateLabel({ ...baseChannel, applyState: "error" })).toBe("Configuration error");
+    expect(channelStateLabel({ ...baseChannel, applyState: "pending" })).toBe("Applying configuration");
     expect(channelStateLabel({ ...baseChannel, applyState: "deleting" })).toBe("Deletion pending");
-    expect(channelStateLabel({ ...baseChannel, relay: { state: "retrying", restarts: 2, lastError: "bind failed" } })).toBe("Listener error");
-    expect(channelHasFault({ ...baseChannel, relay: { state: "retrying", restarts: 2 } })).toBe(true);
-    expect(channelHasFault({ ...baseChannel, enabled: false, relay: { state: "stopped", restarts: 0 } })).toBe(false);
-    expect(channelHasFault({ ...baseChannel, applyState: "deleting", relay: { state: "stopped", restarts: 0 } })).toBe(false);
+    expect(channelStateLabel({ ...baseChannel, relay: { state: "retrying", restarts: 2, lastError: "bind failed", listenerActive: false } })).toBe("Listener error");
+    expect(channelHasFault({ ...baseChannel, relay: { state: "retrying", restarts: 2, listenerActive: false } })).toBe(true);
+    expect(channelHasFault({ ...baseChannel, enabled: false, relay: { state: "stopped", restarts: 0, listenerActive: false } })).toBe(false);
+    expect(channelHasFault({ ...baseChannel, applyState: "deleting", relay: { state: "stopped", restarts: 0, listenerActive: false } })).toBe(false);
     expect(channelStateLabel({ ...baseChannel, compatibility: { ...baseChannel.compatibility, state: "error" } })).toBe("Output error");
     expect(channelStateLabel({ ...baseChannel, enabled: false })).toBe("Disabled");
   });

@@ -1,5 +1,5 @@
-import { useMemo, type ReactNode } from "react";
-import { channelStateLabel, channelTone, type Channel, type ChannelStreamRates, type ChannelTone } from "./channel";
+import { useMemo, type ReactNode, type RefObject } from "react";
+import { channelPlaybackReady, channelStateLabel, channelTone, type Channel, type ChannelStreamRates, type ChannelTone } from "./channel";
 import { GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { useWHEPPlayer } from "./useWHEPPlayer";
@@ -24,6 +24,8 @@ type Props = {
   onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
   onCreate: () => void;
   onRetry: () => void;
+  mutationsDisabled?: boolean;
+  headingRef?: RefObject<HTMLHeadingElement | null>;
 };
 
 const filters: OverviewFilter[] = ["all", "live", "fault", "idle"];
@@ -46,6 +48,8 @@ export function ChannelOverview({
   onAutomaticPreviewChange,
   onCreate,
   onRetry,
+  mutationsDisabled = false,
+  headingRef,
 }: Props) {
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -57,7 +61,7 @@ export function ChannelOverview({
 
   if (loading && !error) {
     return (
-      <OverviewState>
+      <OverviewState headingRef={headingRef}>
         <p className="empty-state" role="status">Loading channels...</p>
       </OverviewState>
     );
@@ -65,7 +69,7 @@ export function ChannelOverview({
 
   if (error && channels.length === 0) {
     return (
-      <OverviewState>
+      <OverviewState headingRef={headingRef}>
         <div className="blank-state" role="alert">
           <span>CHANNELS UNAVAILABLE</span>
           <h2>Unable to load channels</h2>
@@ -79,10 +83,11 @@ export function ChannelOverview({
   if (channels.length === 0) {
     return (
       <section className="blank-state" aria-labelledby="empty-channels-title">
+        <h1 id="channel-overview-title" className="visually-hidden" ref={headingRef} tabIndex={-1}>Channels</h1>
         <span>NO CHANNELS</span>
         <h2 id="empty-channels-title">No channels configured</h2>
         <p>Create an RTP or SRT channel to begin routing media.</p>
-        <button className="button primary" type="button" onClick={onCreate}>
+        <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
           <PlusIcon aria-hidden="true" />
           Create channel
         </button>
@@ -95,15 +100,15 @@ export function ChannelOverview({
       <div className="overview-heading">
         <div>
           <span className="eyebrow">Overview</span>
-          <h1 id="channel-overview-title">Channels</h1>
+          <h1 id="channel-overview-title" ref={headingRef} tabIndex={-1}>Channels</h1>
         </div>
-        <button className="button primary" type="button" onClick={onCreate}>
+        <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
           <PlusIcon aria-hidden="true" />
           Add channel
         </button>
       </div>
       <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
-      {error && <div className="overview-stale" role="status"><span>Showing last known channel state. Gateway polling will retry automatically.</span><button className="button secondary" type="button" onClick={onRetry}>Retry now</button></div>}
+      {error && <div className="overview-stale"><span>Showing last known channel state. Gateway polling will retry automatically.</span><button className="button secondary" type="button" onClick={onRetry}>Retry now</button></div>}
 
       <div className="overview-controls">
         <input
@@ -157,6 +162,7 @@ export function ChannelOverview({
               rate={rates[item.id]}
               layout={layout}
               stale={Boolean(error)}
+              mutationsDisabled={mutationsDisabled}
               previewSaving={previewSavingIDs.has(item.id)}
               onSelect={onSelect}
               onEdit={onEdit}
@@ -169,19 +175,20 @@ export function ChannelOverview({
   );
 }
 
-function OverviewCard({ item, tone, rate, layout, stale, previewSaving, onSelect, onEdit, onAutomaticPreviewChange }: {
+function OverviewCard({ item, tone, rate, layout, stale, mutationsDisabled, previewSaving, onSelect, onEdit, onAutomaticPreviewChange }: {
   item: Channel;
   tone: ChannelTone;
   rate?: ChannelStreamRates;
   layout: OverviewLayout;
   stale: boolean;
+  mutationsDisabled: boolean;
   previewSaving: boolean;
   onSelect: (id: string) => void;
   onEdit: (item: Channel) => void;
   onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
 }) {
   const showPreview = layout === "grid";
-  const previewEnabled = showPreview && item.automaticPreview && item.outputReady && !stale && item.applyState !== "deleting";
+  const previewEnabled = showPreview && item.automaticPreview && channelPlaybackReady(item);
   const preview = useWHEPPlayer({ whepPath: item.whepPath, enabled: previewEnabled, retry: true });
   const previewStatus = overviewPreviewStatus(item, stale, preview.state, preview.hasVideo, preview.hasAudio);
 
@@ -191,12 +198,12 @@ function OverviewCard({ item, tone, rate, layout, stale, previewSaving, onSelect
       <div className="overview-card-head">
         <span className={`signal ${tone === "live" ? "online" : tone === "fault" ? "fault" : ""}`} />
         <div className="overview-card-title"><strong>{item.name}</strong><small>{inputModeLabel(item.input.mode)}</small></div>
-        <button type="button" className="overview-card-edit" aria-label={`Configure ${item.name}`} title="Configure channel" onClick={() => onEdit(item)}>
+        <button type="button" className="overview-card-edit" aria-label={`Configure ${item.name}`} title="Configure channel" disabled={mutationsDisabled} onClick={() => onEdit(item)}>
           <SettingsIcon aria-hidden="true" />
         </button>
       </div>
       {showPreview && (
-        <div className={`overview-thumb preview-${preview.state}${preview.state === "playing" ? " interactive" : ""}`} aria-label={`${item.name} preview: ${previewStatus}`}>
+        <div className={`overview-thumb preview-${preview.state}${preview.state === "playing" ? " interactive" : ""}`} role="group" aria-label={`${item.name} preview: ${previewStatus}`}>
           <video
             ref={preview.videoRef}
             autoPlay
@@ -218,18 +225,18 @@ function OverviewCard({ item, tone, rate, layout, stale, previewSaving, onSelect
       </div>
       <div className="overview-card-foot">
         <span className={`overview-state tone-${tone}`}>{stale ? "Status stale" : channelStateLabel(item)}</span>
-        <div className="overview-preview-control">
+        {showPreview && <div className="overview-preview-control">
           <span>Preview</span>
           <button
             className={item.automaticPreview ? "toggle active overview-preview-toggle" : "toggle overview-preview-toggle"}
             type="button"
-            disabled={previewSaving || item.applyState === "deleting" || stale}
+            disabled={previewSaving || item.applyState === "deleting" || stale || mutationsDisabled}
             aria-label={`${item.automaticPreview ? "Disable" : "Enable"} preview for ${item.name}`}
             aria-pressed={item.automaticPreview}
             title="Show a muted live preview for this channel"
             onClick={() => onAutomaticPreviewChange(item, !item.automaticPreview)}
           ><span /></button>
-        </div>
+        </div>}
       </div>
     </article>
   );
@@ -247,13 +254,13 @@ function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<
   return "Muted live preview";
 }
 
-function OverviewState({ children }: { children: ReactNode }) {
+function OverviewState({ children, headingRef }: { children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {
   return (
     <section className="overview" aria-labelledby="channel-overview-title">
       <div className="overview-heading">
         <div>
           <span className="eyebrow">Overview</span>
-          <h1 id="channel-overview-title">Channels</h1>
+          <h1 id="channel-overview-title" ref={headingRef} tabIndex={-1}>Channels</h1>
         </div>
       </div>
       {children}

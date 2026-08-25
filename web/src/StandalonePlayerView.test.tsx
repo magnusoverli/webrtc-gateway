@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Channel } from "./channel";
 
@@ -43,13 +43,15 @@ describe("ChannelViewer", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     document.documentElement.classList.remove("embed-document");
     vi.unstubAllGlobals();
   });
 
   it("renders every channel as a simultaneous player tile", async () => {
     const channels = [fixtureChannel("studio-a", 1, "Studio A", true), fixtureChannel("studio-b", 2, "Studio B", false)];
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ channels }) }));
+    const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ channels }) });
+    vi.stubGlobal("fetch", fetch);
 
     render(<ChannelViewer />);
 
@@ -61,6 +63,26 @@ describe("ChannelViewer", () => {
     expect(videos.every((video) => video.hasAttribute("controls"))).toBe(true);
     expect(playerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: "/api/v1/channels/studio-a/whep", enabled: true }));
     expect(playerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: "/api/v1/channels/studio-b/whep", enabled: false }));
+    expect(fetch).toHaveBeenCalledWith("/api/v1/channels", expect.objectContaining({ cache: "no-store" }));
+  });
+
+  it("retains multiview channels and enabled sessions after a transient poll failure", async () => {
+    vi.useFakeTimers();
+    const channel = fixtureChannel("studio-a", 1, "Studio A", true);
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ channels: [channel] }) })
+      .mockRejectedValueOnce(new TypeError("network down"));
+    vi.stubGlobal("fetch", fetch);
+
+    render(<ChannelViewer />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
+    expect(screen.getByRole("alert").textContent).toContain("network down");
+    expect(playerHarness.stopped).toEqual([]);
+    expect(playerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
   });
 
   it("preserves keyed sessions through reorder and cleans up removed or unready channels", () => {
@@ -97,6 +119,24 @@ describe("ChannelViewer", () => {
     expect(fetch).toHaveBeenCalledWith("/api/v1/channels/7", expect.objectContaining({ cache: "no-store" }));
   });
 
+  it("retains an enabled embed player when a later response is malformed", async () => {
+    vi.useFakeTimers();
+    const channel = fixtureChannel("studio-a", 7, "Studio A", true);
+    const fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => channel })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ malformed: true }) });
+    vi.stubGlobal("fetch", fetch);
+
+    render(<StandalonePlayer channelID="7" />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByLabelText("Studio A embedded video")).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByLabelText("Studio A embedded video")).toBeDefined();
+    expect(playerHarness.stopped).toEqual([]);
+    expect(playerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
+  });
+
   it("initializes document mode from the routed pathname", () => {
     expect(initializeStandaloneRoute("/embed/studio-a")).toEqual({ kind: "embed", channelID: "studio-a" });
     expect(document.documentElement.classList.contains("embed-document")).toBe(true);
@@ -108,6 +148,7 @@ describe("ChannelViewer", () => {
 function fixtureChannel(id: string, number: number, name: string, outputReady: boolean): Channel {
   return {
     id,
+    revision: 1,
     number,
     name,
     path: id,
@@ -117,6 +158,8 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
     maxReaders: 16,
     useAbsoluteTimestamp: true,
     applyState: "applied",
+    createdAt: "2026-08-25T08:00:00Z",
+    updatedAt: "2026-08-25T08:00:00Z",
     whepPath: `/api/v1/channels/${id}/whep`,
     viewerPath: "/view",
     embedPath: `/embed/${number}`,

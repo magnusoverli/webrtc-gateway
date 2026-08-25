@@ -14,8 +14,8 @@ import (
 
 type Repository interface {
 	Get(context.Context) (Settings, error)
-	Update(context.Context, Settings) error
-	SetApplyResult(context.Context, ApplyState, string) error
+	Update(context.Context, Settings, int) error
+	SetApplyResult(context.Context, int, ApplyState, string) error
 }
 
 type SQLiteStore struct {
@@ -49,12 +49,16 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS global_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
+		revision INTEGER NOT NULL DEFAULT 1,
 		settings_json TEXT NOT NULL,
 		apply_state TEXT NOT NULL,
 		apply_error TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`); err != nil {
 		return fmt.Errorf("migrate settings database: %w", err)
+	}
+	if err := s.addRevisionColumn(ctx); err != nil {
+		return err
 	}
 
 	defaults := Defaults(time.Now())
@@ -63,21 +67,48 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		return fmt.Errorf("encode default settings: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO global_settings (id, settings_json, apply_state, apply_error, updated_at)
-		VALUES (1, ?, ?, '', ?)`, string(encoded), defaults.ApplyState, defaults.UpdatedAt.Format(time.RFC3339Nano)); err != nil {
+		INSERT OR IGNORE INTO global_settings (id, revision, settings_json, apply_state, apply_error, updated_at)
+		VALUES (1, ?, ?, ?, '', ?)`, defaults.Revision, string(encoded), defaults.ApplyState, defaults.UpdatedAt.Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("initialize settings database: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) addRevisionColumn(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(global_settings)`)
+	if err != nil {
+		return fmt.Errorf("inspect settings schema: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, notNull, primaryKey int
+		var name, kind string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&id, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("inspect settings column: %w", err)
+		}
+		if name == "revision" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect settings schema: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE global_settings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return fmt.Errorf("add settings revision: %w", err)
 	}
 	return nil
 }
 
 func (s *SQLiteStore) Get(ctx context.Context) (Settings, error) {
 	var encoded string
+	var revision int
 	var applyState ApplyState
 	var applyError string
 	var updatedAt string
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT settings_json, apply_state, apply_error, updated_at FROM global_settings WHERE id = 1`,
-	).Scan(&encoded, &applyState, &applyError, &updatedAt); err != nil {
+		`SELECT revision, settings_json, apply_state, apply_error, updated_at FROM global_settings WHERE id = 1`,
+	).Scan(&revision, &encoded, &applyState, &applyError, &updatedAt); err != nil {
 		return Settings{}, fmt.Errorf("get settings: %w", err)
 	}
 	value := Defaults(time.Now())
@@ -98,6 +129,7 @@ func (s *SQLiteStore) Get(ctx context.Context) (Settings, error) {
 	}
 	value.ApplyState = applyState
 	value.ApplyError = applyError
+	value.Revision = revision
 	var err error
 	value.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt)
 	if err != nil {
@@ -137,25 +169,40 @@ func interfacesFor(selector string) ([]networkbind.InterfaceAddress, error) {
 	return networkbind.Interfaces()
 }
 
-func (s *SQLiteStore) Update(ctx context.Context, value Settings) error {
+func (s *SQLiteStore) Update(ctx context.Context, value Settings, expectedRevision int) error {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode settings: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE global_settings SET settings_json = ?, apply_state = ?, apply_error = ?, updated_at = ? WHERE id = 1`,
-		string(encoded), value.ApplyState, value.ApplyError, value.UpdatedAt.Format(time.RFC3339Nano))
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE global_settings SET revision = ?, settings_json = ?, apply_state = ?, apply_error = ?, updated_at = ?
+		WHERE id = 1 AND revision = ?`,
+		value.Revision, string(encoded), value.ApplyState, value.ApplyError, value.UpdatedAt.Format(time.RFC3339Nano), expectedRevision)
 	if err != nil {
 		return fmt.Errorf("update settings: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read settings affected rows: %w", err)
+	}
+	if count == 0 {
+		return ErrRevisionConflict
 	}
 	return nil
 }
 
-func (s *SQLiteStore) SetApplyResult(ctx context.Context, state ApplyState, applyError string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE global_settings SET apply_state = ?, apply_error = ? WHERE id = 1`, state, applyError)
+func (s *SQLiteStore) SetApplyResult(ctx context.Context, revision int, state ApplyState, applyError string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE global_settings SET apply_state = ?, apply_error = ? WHERE id = 1 AND revision = ?`, state, applyError, revision)
 	if err != nil {
 		return fmt.Errorf("set settings apply result: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read settings apply result affected rows: %w", err)
+	}
+	if count == 0 {
+		return ErrRevisionConflict
 	}
 	return nil
 }

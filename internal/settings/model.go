@@ -21,8 +21,10 @@ const (
 )
 
 var ErrInvalid = errors.New("invalid settings")
+var ErrRevisionConflict = errors.New("settings revision conflict")
 
 type Settings struct {
+	Revision                 int        `json:"revision"`
 	ManagementBindAddress    string     `json:"managementBindAddress"`
 	MediaBindAddress         string     `json:"mediaBindAddress"`
 	LogLevel                 string     `json:"logLevel"`
@@ -49,6 +51,7 @@ type Settings struct {
 
 func Defaults(now time.Time) Settings {
 	return Settings{
+		Revision:                 1,
 		ManagementBindAddress:    networkbind.All,
 		MediaBindAddress:         networkbind.All,
 		LogLevel:                 "info",

@@ -18,10 +18,12 @@ Build a Linux application deployable with Docker Compose that accepts independen
 - The web UI, application API, WHEP signaling proxy, and live statistics use one HTTP port.
 - Management and media listeners can bind to all interfaces, a fixed IP, or the current IPv4/IPv6 address of a persisted host interface selection.
 - RTP, SRT, and WebRTC media continue to use their own UDP ports.
-- Preview creates a real WebRTC reader, starts muted, is enabled by default per channel, and only runs for the selected dashboard channel.
+- Preview creates a real WebRTC reader and starts muted. Each eligible visible overview grid card can open one preview, list mode opens none, and channel detail can open its own preview.
 - Always-on statistics come from MediaMTX. Browser `getStats()` augments them while preview is active.
 - Gateway-container and whole-host CPU/RAM are sampled in the background from cgroup v2 and `/proc`; MediaMTX process resources remain explicitly excluded because its container is isolated.
-- The dashboard sidebar collapses to a persisted slim desktop rail, and technical controls/readouts use accessible compact help tooltips while essential guidance stays inline.
+- Dashboard status uses bounded serial HTTP polling with failure backoff and a hidden-page pause. Preview sessions close after 30 seconds hidden.
+- Technical controls/readouts use accessible compact help, essential guidance stays inline, and diagnostics is opened on demand instead of occupying permanent navigation or panels.
+- Full channel and settings replacements use revisions with `If-Match`; the automatic-preview preference uses a narrow `PATCH`.
 
 ## Architecture
 
@@ -86,6 +88,8 @@ The Gateway reverse-proxies WHEP `OPTIONS`, `POST`, `PATCH`, and `DELETE` reques
 - Persisted automatic dashboard-preview preference, enabled by default.
 - Automatic compatibility state and future encoder overrides.
 
+Settings and complete channel updates use optimistic revision checks. A stale `If-Match` precondition is rejected rather than overwriting a newer saved generation; preview-only changes do not require a full replacement payload.
+
 Dynamic elementary RTP cannot be completely auto-discovered because payload types require codec mappings. RTP channel inputs require SDP, while SRT uses an optional raw SDP editor: no SDP selects automatic raw MPEG-TS or RTP/MP2T detection, and supplied SDP selects elementary RTP.
 
 ## WebRTC Compatibility
@@ -118,9 +122,10 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 
 - Responsive channel list with online, degraded, incompatible, disabled, and apply-error states.
 - Create, duplicate, rename, configure, enable, disable, and delete channel actions.
-- Fixed selected-channel input, output, listener-status, preview, media-track, and health panels.
-- Persisted automatic-preview control, on by default, with muted autoplay and immediate WHEP cleanup when disabled.
-- Live statistics delivered through server-sent events.
+- Channel overview with grid/list layouts and a separate channel detail workspace for input, output, listener, preview, media-track, and health information.
+- Persisted automatic-preview control, on by default. Eligible visible grid cards and channel detail use muted autoplay; list mode does not preview. Sessions are cleaned up when disabled, when their surface closes, or after 30 seconds hidden.
+- Bounded serial HTTP status snapshots with failure backoff and hidden-page pause.
+- On-demand system and channel diagnostics with a sanitized copyable report and no permanent navigation item.
 - Global settings view and clear desired/applied state.
 - Copyable SRT publishing instructions, a stable multiview route, gap-filling numbered embed routes, iframe snippets, and stable UUID WHEP URLs.
 - Masked secrets in routine responses with explicit non-cacheable retrieval on the trusted management LAN.
@@ -159,7 +164,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 
 - [ ] Aggregate path, SRT, and WebRTC runtime statistics.
 - [ ] Calculate rates safely across reconnects and counter resets.
-- [ ] Stream snapshots to the UI with server-sent events.
+- [x] Poll status snapshots serially over bounded HTTP with failure backoff and hidden-page pause.
 - [ ] Validate host socket-buffer limits and report actionable warnings.
 - [x] Add bounded retries, health checks, graceful shutdown, and channel isolation tests.
 
@@ -186,7 +191,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - [x] The UI and all management functions are available on one HTTP port.
 - [x] All accepted input modes can be configured from the UI.
 - [x] Supported streams reach WebRTC without a Gateway transcoder running.
-- [x] Preview connects only for the selected channel when its persisted automatic-preview preference is enabled.
+- [x] Preview connects only on eligible visible overview grid cards or channel detail when the persisted automatic-preview preference is enabled; list mode creates no preview readers.
 - [x] Multiple channels and viewers operate independently.
 - [ ] Editing one channel does not interrupt unrelated channels.
 - [x] Configuration survives restarts and reconciles into MediaMTX.
@@ -194,7 +199,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - [ ] Live statistics handle reconnects and counter resets.
 - [x] Compatibility mode affects only its channel.
 - [x] Restarting Gateway does not stop existing direct media paths.
-- [x] Dashboard navigation collapses accessibly and remembers one browser preference at every viewport size.
+- [x] Dashboard overview/detail navigation, dialogs, and compact help are keyboard accessible and responsive.
 - [x] Gateway-container and host CPU/RAM degrade without affecting status or health.
 - [x] Technical options and metrics provide keyboard-, pointer-, and touch-accessible help.
 - [ ] Chrome and Firefox LAN playback are covered by automated tests.
@@ -223,3 +228,4 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 | 2026-08-24 | Added a persisted collapsible dashboard rail, cgroup-v2 Gateway and whole-host resource telemetry, a compact resource footer with explicit isolation boundaries, and accessible technical tooltips across settings and live readouts. |
 | 2026-08-24 | Replaced channel switching in the shared viewer with simultaneous all-channel multiview and reduced per-channel embeds to transparent, muted, control-free video surfaces. |
 | 2026-08-24 | Added persistent, gap-filling channel numbers for compact `/embed/NUMBER` routes and exposed each channel embed URL as a copyable/openable dashboard field. |
+| 2026-08-25 | Added overview grid/list navigation, bounded serial polling with hidden-page lifecycle handling, optimistic revision preconditions, preview-only PATCH updates, and on-demand sanitized diagnostics. |

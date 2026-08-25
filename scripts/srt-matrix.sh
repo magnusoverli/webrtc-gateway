@@ -72,6 +72,15 @@ channel_status() {
     jq -c --arg id "$channel_id" '.channels[] | select(.id == $id)'
 }
 
+put_channel() {
+  local revision
+  revision="$(channel_status | jq -er '.revision')" || return
+  curl --fail --silent --show-error --output /dev/null --request PUT \
+    --header 'Content-Type: application/json' \
+    --header "If-Match: \"$revision\"" \
+    --data-binary @- "$GATEWAY_URL/api/v1/channels/$channel_id"
+}
+
 wait_offline() {
   local state
   for _ in $(seq 1 80); do
@@ -328,9 +337,7 @@ set_elementary_sdp() {
 		input:{mode:"srt-push",srt:{port:$port,sdp:$sdp}},
 		maxReaders:0,
 		useAbsoluteTimestamp:true
-	}' | curl --fail --silent --show-error --output /dev/null --request PUT \
-		--header 'Content-Type: application/json' --data-binary @- \
-		"$GATEWAY_URL/api/v1/channels/$channel_id"
+	}' | put_channel
 }
 
 set_pull_config() {
@@ -341,9 +348,7 @@ set_pull_config() {
 		input:{mode:"srt-pull",srt:{host:$host,port:$port,latencyMs:500,sdp:$sdp}},
 		maxReaders:0,
 		useAbsoluteTimestamp:true
-	}' | curl --fail --silent --show-error --output /dev/null --request PUT \
-		--header 'Content-Type: application/json' --data-binary @- \
-		"$GATEWAY_URL/api/v1/channels/$channel_id"
+	}' | put_channel
 }
 
 set_passphrase() {
@@ -360,9 +365,7 @@ set_passphrase() {
     input:{mode:"srt-push",srt:({port:$port} + $srt)},
     maxReaders:0,
     useAbsoluteTimestamp:true
-  }' | curl --fail --silent --show-error --output /dev/null --request PUT \
-    --header 'Content-Type: application/json' --data-binary @- \
-    "$GATEWAY_URL/api/v1/channels/$channel_id"
+  }' | put_channel
 }
 
 test_wrong_passphrase() {

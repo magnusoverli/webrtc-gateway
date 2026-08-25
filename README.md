@@ -55,9 +55,9 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 ### Operator Workflow
 
 1. Create a channel and select its input mode. **SRT push** is the simplest option for encoders that accept a destination IP and port.
-2. Select the channel. Its fixed workspace shows encoder connection details, listener state, stable output links, and a muted WebRTC preview without requiring a separate configuration view.
-3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the selected input show `-`.
-4. Send the stable multiview URL to LAN users or copy the selected channel's embed URL or iframe snippet into another LAN application. Embed URLs use the channel number and do not change when that channel is renamed or switches between direct and compatibility output.
+2. Open a channel from the overview. Its detail workspace shows encoder connection details, listener state, stable output links, and an optional muted WebRTC preview.
+3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the channel input show `-`.
+4. Send the stable multiview URL to LAN users or copy the channel's embed URL or iframe snippet into another LAN application. Embed URLs use the channel number and do not change when that channel is renamed or switches between direct and compatibility output.
 
 The multiview and channel embed routes are:
 
@@ -68,17 +68,21 @@ http://HOST_IP:8080/embed/CHANNEL_NUMBER
 
 The multiview opens every ready channel simultaneously in a live grid while retaining visible offline, disabled, and error tiles. It refreshes the channel set automatically. Legacy `/view/CHANNEL_ID` links open the same multiview. Each channel receives the lowest available positive number, producing compact URLs such as `http://192.168.15.5:8080/embed/1`. Existing channels keep their number, but a number becomes available for reuse after its channel is deleted. The embed route renders only the muted video surface: no header, status overlay, native controls, border, or opaque page background. Previously issued UUID embed URLs remain valid aliases for their existing channels.
 
-Multiview, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Each ready channel in multiview creates an independent WebRTC reader. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. Only the selected dashboard channel creates a preview reader. Embed routes always attempt playback when output is ready.
+Multiview, embed, and dashboard playback start muted to satisfy desktop browser autoplay rules. Each ready channel in multiview creates an independent WebRTC reader. Automatic dashboard preview and source timestamp preservation are enabled by default and stored per channel; either can be disabled for a source that requires different behavior. Timestamp preservation is propagated to compatibility output paths but does not add custom clock correction or synchronization logic. In the dashboard overview, each eligible visible grid card can open one preview; list mode opens none. A channel detail can open its own preview. Embed routes always attempt playback when output is ready.
 
-SRT passphrases remain masked in normal channel and status responses. The selected channel can explicitly retrieve and copy its current passphrase through a non-cacheable API request. The deployment is intended for a trusted internal LAN and does not add authentication to management, player, passphrase, or restart endpoints.
+Dashboard status uses bounded serial HTTP polling: one request completes before the next starts, failures back off, and polling pauses while the page is hidden. Preview retry and statistics work pauses immediately; established media sessions receive a 30-second grace period before closing if the page remains hidden. Returning to the page refreshes status and reconnects eligible previews.
 
-### Dashboard Navigation And Help
+SRT passphrases remain masked in normal channel and status responses. A channel can explicitly retrieve and copy its current passphrase through a non-cacheable API request. The deployment is intended for a trusted internal LAN and does not add authentication to management, player, passphrase, or restart endpoints.
 
-The dashboard sidebar can collapse to a narrow rail containing the Signal Desk mark and its expand control. The preference is stored in the browser and the same navigation state is used at every viewport size. Technical settings, stream statistics, resource figures, status terms, and icon-only controls include compact help tooltips that work with pointer hover, keyboard focus, and touch. Operational warnings and instructions that affect connectivity or restarts remain visible inline.
+### Dashboard Help And Diagnostics
+
+The dashboard keeps primary navigation compact and leaves operational warnings or instructions that affect connectivity and restarts visible inline. Technical settings, stream statistics, resource figures, status terms, and icon-only controls use help text or tooltips that work with pointer hover, keyboard focus, and touch. Motion is reduced when the browser requests reduced motion.
+
+System and per-channel diagnostics are on-demand rather than permanent dashboard panels. Opening a diagnostics dialog makes one bounded request to `GET /api/v1/diagnostics`; failures and timeouts can be retried. The displayed and copyable report contains only allowlisted runtime, revision, listener, resource, relay, and compatibility fields. It excludes passphrases, input configuration, and unrecognized response fields.
 
 ### Resource Monitoring
 
-The sidebar footer samples CPU and RAM once per second and displays two explicitly scoped rows:
+The resource display samples CPU and RAM once per second and reports two explicitly scoped rows:
 
 - **Gateway** is the complete Gateway container cgroup, including the Go application, compatibility FFmpeg/FFprobe workers, per-channel SRT relays, and transient health-check processes. CPU is shown as a percentage of the logical CPU capacity available to the container. RAM is the cgroup working set, excluding inactive file cache, compared with its configured limit when finite.
 - **Host** is whole-host CPU busy time and Linux used memory calculated from `MemTotal - MemAvailable`. It includes every workload on the server, not only this Compose stack.
@@ -145,7 +149,7 @@ Gateway starts a supervised `srt-live-transmit` listener with a 60 ms wired-LAN 
 
 Senders that support stream IDs can alternatively use the direct MediaMTX SRT URL shown in the channel view. Direct publishing uses the global SRT listener, `8890/udp` by default, and a stream ID in the form `publish:CHANNEL_PATH`. This shortcut terminates in MediaMTX's native MPEG-TS SRT reader and is therefore MPEG-TS-only.
 
-The UI reports the channel online and displays the detected H264 profile and dimensions. Automatic preview creates a muted WHEP reader for the selected channel and displays receive bitrate, codec, resolution, frame rate, packet loss, jitter, ICE path, and decoded or dropped frames. Disabling automatic preview or changing channels closes the peer connection and deletes its WHEP session.
+The UI reports the channel online and displays the detected H264 profile and dimensions. Automatic preview creates a muted WHEP reader for an eligible overview card or open channel detail and displays receive bitrate, codec, resolution, frame rate, packet loss, jitter, ICE path, and decoded or dropped frames. Disabling automatic preview or leaving the surface closes the peer connection and deletes its WHEP session; a session also closes after the page remains hidden for 30 seconds.
 
 WebRTC media prefers UDP and also exposes a TCP fallback on the same port by default. Configure or disable the **WebRTC TCP fallback port** in **Global settings**, and allow the selected media interface and configured UDP/TCP ports through the host firewall. TCP and UDP can use the same port number.
 
@@ -273,6 +277,8 @@ The UI reports the channel online and exposes a stable UUID-based WHEP signaling
 Channel configuration and global settings are stored in the `gateway-state` Docker volume. Gateway reconciles this desired state into MediaMTX and restores per-channel SRT listeners at startup and after a MediaMTX restart. MediaMTX API changes are intentionally not treated as persistent state.
 
 Open **Global settings** in the UI to configure management/media interfaces, transport ports, timeouts, UDP buffering, WebRTC host discovery, the RTP channel port range, status polling, and default viewer limits. Changes to media transport settings cause MediaMTX and per-channel inputs to restart their listeners and briefly interrupt active channels. Management interface changes require a Gateway restart. Application-only changes, including the per-channel automatic-preview preference, and Gateway restarts skip the MediaMTX patch when its effective configuration is already current.
+
+Full settings and channel replacements use their current revision with `If-Match`, so a stale editor is rejected instead of overwriting newer state. The automatic-preview toggle uses a narrow `PATCH` request rather than sending a full channel configuration.
 
 Fresh deployments use a wired-LAN profile: five-second media I/O timeouts, a 512-packet writer queue, a 4 MiB UDP receive buffer, 1452-byte UDP payloads, 60 ms per-channel SRT latency, and a default maximum of 16 readers for new channels. A value of zero still explicitly selects unlimited readers. Persisted settings and existing per-channel viewer limits are not silently overwritten during upgrades.
 

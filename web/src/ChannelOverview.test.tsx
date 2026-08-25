@@ -6,7 +6,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Channel, ChannelStreamRates } from "./channel";
 import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
 
-afterEach(cleanup);
+const overviewPlayerHarness = vi.hoisted(() => ({ calls: vi.fn() }));
+
+vi.mock("./useWHEPPlayer", () => ({
+  useWHEPPlayer: (options: unknown) => {
+    overviewPlayerHarness.calls(options);
+    return { videoRef: { current: null }, state: "off", error: "", stats: null, hasVideo: false, hasAudio: false };
+  },
+}));
+
+afterEach(() => {
+  cleanup();
+  overviewPlayerHarness.calls.mockClear();
+});
 
 describe("ChannelOverview", () => {
   it("reports controlled query and filter changes and preserves channel order", async () => {
@@ -108,6 +120,25 @@ describe("ChannelOverview", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
+  it("disables overview playback and hides preview controls in list layout", () => {
+    const item = { ...channel("one", "Studio", "live"), automaticPreview: true };
+    const view = renderOverview({ channels: [item], layout: "grid" });
+
+    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
+    expect(screen.getByRole("button", { name: "Disable preview for Studio" })).toBeDefined();
+
+    overviewPlayerHarness.calls.mockClear();
+    view.rerender(overview({ channels: [item], layout: "list" }));
+    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: false }));
+    expect(screen.queryByRole("button", { name: "Disable preview for Studio" })).toBeNull();
+    expect(screen.queryByLabelText(/Studio preview:/)).toBeNull();
+
+    overviewPlayerHarness.calls.mockClear();
+    view.rerender(overview({ channels: [item], layout: "grid" }));
+    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
+    expect(screen.getByRole("button", { name: "Disable preview for Studio" })).toBeDefined();
+  });
+
   it("shows preview state in the grid tile", () => {
     const item = channel("one", "Studio", "idle");
     const view = renderOverview({ channels: [item] });
@@ -128,6 +159,17 @@ describe("ChannelOverview", () => {
     expect(within(layouts).getByRole("button", { name: "List view" }).getAttribute("aria-pressed")).toBe("true");
     expect(within(layouts).getByRole("button", { name: "Grid view" }).getAttribute("aria-pressed")).toBe("false");
   });
+
+  it("keeps an established preview enabled while stale and disables every card mutation", () => {
+    const item = { ...channel("one", "Studio", "live"), automaticPreview: true };
+    renderOverview({ channels: [item], error: "disconnected", mutationsDisabled: true });
+
+    expect(overviewPlayerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: item.whepPath, enabled: true }));
+    expect(screen.getByRole("button", { name: "Add channel" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Configure Studio" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).hasAttribute("disabled")).toBe(true);
+    expect(document.querySelectorAll(".overview-card [aria-live]")).toHaveLength(0);
+  });
 });
 
 type Overrides = Partial<{
@@ -147,6 +189,7 @@ type Overrides = Partial<{
   onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
   onCreate: () => void;
   onRetry: () => void;
+  mutationsDisabled: boolean;
 }>;
 
 function renderOverview(overrides: Overrides = {}) {
@@ -186,6 +229,7 @@ function channel(id: string, name: string, tone: "live" | "fault" | "idle"): Cha
   const fault = tone === "fault";
   return {
     id,
+    revision: 1,
     number: 1,
     name,
     path: id,
@@ -196,6 +240,8 @@ function channel(id: string, name: string, tone: "live" | "fault" | "idle"): Cha
     useAbsoluteTimestamp: true,
     applyState: fault ? "error" : "applied",
     applyError: fault ? "failed" : undefined,
+    createdAt: "2026-08-25T08:00:00Z",
+    updatedAt: "2026-08-25T08:00:00Z",
     whepPath: `/api/v1/channels/${id}/whep`,
     viewerPath: "/view",
     embedPath: `/embed/${id}`,

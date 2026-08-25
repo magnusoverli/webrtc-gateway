@@ -40,10 +40,12 @@ const (
 )
 
 type Status struct {
-	State       string     `json:"state"`
-	Restarts    int        `json:"restarts"`
-	LastError   string     `json:"lastError,omitempty"`
-	NextRetryAt *time.Time `json:"nextRetryAt,omitempty"`
+	State           string     `json:"state"`
+	Restarts        int        `json:"restarts"`
+	LastError       string     `json:"lastError,omitempty"`
+	NextRetryAt     *time.Time `json:"nextRetryAt,omitempty"`
+	ListenerAddress string     `json:"listenerAddress,omitempty"`
+	ListenerActive  bool       `json:"listenerActive"`
 }
 
 type listenerProcess struct {
@@ -57,7 +59,16 @@ type listenerProcess struct {
 func (p *listenerProcess) setStatus(state string, restarts int, lastError string, nextRetryAt *time.Time) {
 	p.statusMu.Lock()
 	defer p.statusMu.Unlock()
-	p.status = Status{State: state, Restarts: restarts, LastError: lastError, NextRetryAt: nextRetryAt}
+	p.status = p.statusFor(state, restarts, lastError, nextRetryAt)
+}
+
+func (p *listenerProcess) statusFor(state string, restarts int, lastError string, nextRetryAt *time.Time) Status {
+	status := Status{State: state, Restarts: restarts, LastError: lastError, NextRetryAt: nextRetryAt}
+	if p.plan.Listener.Mode == channel.InputSRTPush {
+		status.ListenerAddress = net.JoinHostPort(p.plan.Listener.BindAddress, strconv.Itoa(p.plan.Listener.Port))
+		status.ListenerActive = state == StateRunning
+	}
+	return status
 }
 
 func (p *listenerProcess) snapshot() Status {
@@ -237,8 +248,8 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 
 	process := &listenerProcess{
 		plan: plan, cancel: cancel, done: make(chan struct{}),
-		status: Status{State: StateRunning},
 	}
+	process.status = process.statusFor(StateRunning, 0, "", nil)
 	s.listeners[plan.Listener.ChannelID] = process
 	s.snapshots.Store(plan.Listener.ChannelID, process)
 	delete(s.prepared, plan.Listener.ChannelID)

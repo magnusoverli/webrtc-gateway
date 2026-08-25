@@ -48,7 +48,9 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 
 	loaded.Name = "Updated"
 	loaded.ApplyState = ApplyApplied
-	if err := store.Update(context.Background(), loaded); err != nil {
+	previousRevision := loaded.Revision
+	loaded.Revision++
+	if err := store.Update(context.Background(), loaded, previousRevision); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 	items, err := store.List(context.Background())
@@ -56,7 +58,7 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 		t.Fatalf("List() = %#v, %v", items, err)
 	}
 
-	if err := store.Delete(context.Background(), item.ID); err != nil {
+	if err := store.Delete(context.Background(), item.ID, loaded.Revision); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 	if _, err := store.Get(context.Background(), item.ID); !errors.Is(err, ErrNotFound) {
@@ -105,7 +107,8 @@ func TestSQLiteStoreMigratesLegacyColumnsAndNumbers(t *testing.T) {
 		t.Fatalf("List() = %#v, %v", items, err)
 	}
 	if items[0].ID != "legacy" || items[0].Number != 1 || !items[0].AutomaticPreview ||
-		items[1].ID != "legacy-2" || items[1].Number != 2 || !items[1].AutomaticPreview {
+		items[0].Revision != 1 || items[1].ID != "legacy-2" || items[1].Number != 2 ||
+		!items[1].AutomaticPreview || items[1].Revision != 1 {
 		t.Fatalf("migrated channels = %#v", items)
 	}
 	if err := store.Close(); err != nil {
@@ -120,5 +123,44 @@ func TestSQLiteStoreMigratesLegacyColumnsAndNumbers(t *testing.T) {
 	items, err = reopened.List(context.Background())
 	if err != nil || len(items) != 2 || items[0].Number != 1 || items[1].Number != 2 {
 		t.Fatalf("List() after reopen = %#v, %v", items, err)
+	}
+}
+
+func TestSQLiteStoreRejectsStaleRevisionAndOldApplyResult(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, err := New(Draft{
+		Name: "Generation test", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Number = 1
+	if err := store.Create(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := item
+	updated.Name = "Current generation"
+	updated.Revision = 2
+	if err := store.Update(context.Background(), updated, 1); err != nil {
+		t.Fatal(err)
+	}
+	stale := item
+	stale.Name = "Stale generation"
+	stale.Revision = 2
+	if err := store.Update(context.Background(), stale, 1); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale Update() error = %v", err)
+	}
+	if err := store.SetApplyResult(context.Background(), item.ID, 1, ApplyError, "old failure"); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("old SetApplyResult() error = %v", err)
+	}
+	loaded, err := store.Get(context.Background(), item.ID)
+	if err != nil || loaded.Name != "Current generation" || loaded.Revision != 2 || loaded.ApplyState != ApplyPending {
+		t.Fatalf("channel after stale writes = %#v, %v", loaded, err)
 	}
 }

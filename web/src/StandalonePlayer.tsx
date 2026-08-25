@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { channelHasFault, channelStateLabel, type Channel } from "./channel";
+import { channelHasFault, channelPlaybackReady, channelStateLabel, type Channel } from "./channel";
 import { startSerialPolling } from "./polling";
+import { requestJSON } from "./request";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
 export type StandaloneRoute =
@@ -29,10 +30,6 @@ export function initializeStandaloneRoute(pathname: string, root = document.docu
   return route;
 }
 
-export function channelPlaybackReady(channel: Pick<Channel, "enabled" | "applyState" | "outputReady"> | null) {
-  return Boolean(channel?.enabled && channel.applyState !== "deleting" && channel.outputReady);
-}
-
 export function ChannelViewer() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -42,18 +39,18 @@ export function ChannelViewer() {
     let disposed = false;
     const load = async (signal: AbortSignal) => {
       try {
-        const response = await fetch("/api/v1/status", { cache: "no-store", signal });
-        if (!response.ok) throw new Error(`Gateway status request failed with ${response.status}`);
-        const next = await response.json() as { channels: Channel[] };
-        if (!Array.isArray(next.channels)) throw new Error("Gateway status did not include channels");
+        const { response, body } = await requestJSON<unknown>("/api/v1/channels", { cache: "no-store", signal });
+        if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+        if (!isChannelList(body)) throw new Error("Gateway channel response was malformed");
         if (disposed) return;
-        setChannels(next.channels);
+        setChannels(body.channels);
         setLoaded(true);
         setLoadError("");
       } catch (error) {
         if (!disposed && !signal.aborted) {
           setLoadError(error instanceof Error ? error.message : "Channel status is unavailable");
         }
+        throw error;
       }
     };
 
@@ -105,38 +102,33 @@ export function StandalonePlayer({ channelID }: { channelID: string }) {
 
   useEffect(() => {
     let disposed = false;
-    let loading = false;
-    const abort = new AbortController();
-
-    const load = async () => {
-      if (loading) return;
-      loading = true;
+    const load = async (signal: AbortSignal) => {
       try {
-        const response = await fetch(`/api/v1/channels/${encodeURIComponent(channelID)}`, {
+        const { response, body } = await requestJSON<unknown>(`/api/v1/channels/${encodeURIComponent(channelID)}`, {
           cache: "no-store",
-          signal: abort.signal,
+          signal,
         });
-        if (!response.ok) {
-          const result = await response.json().catch(() => ({})) as { error?: string };
-          throw new Error(result.error ?? `Channel request failed with ${response.status}`);
+        if (response.status === 404 || response.status === 410) {
+          if (!disposed) setChannel(null);
+          return;
         }
-        const next = await response.json() as Channel;
+        if (!response.ok) {
+          throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+        }
+        if (!isChannel(body)) throw new Error("Gateway channel response was malformed");
         if (disposed) return;
-        setChannel(next);
-      } catch {
-        if (disposed || abort.signal.aborted) return;
-        setChannel((current) => current ? { ...current, available: false, online: false, outputReady: false } : null);
-      } finally {
-        loading = false;
+        setChannel(body);
+      } catch (error) {
+        if (disposed || signal.aborted) throw error;
+        // Retain the last definitive state so an established WHEP session is not interrupted.
+        throw error;
       }
     };
 
-    void load();
-    const timer = window.setInterval(() => void load(), 2_000);
+    const stopPolling = startSerialPolling(load, 2_000);
     return () => {
       disposed = true;
-      abort.abort();
-      window.clearInterval(timer);
+      stopPolling();
     };
   }, [channelID]);
 
@@ -214,4 +206,34 @@ function offlineDetail(channel: Channel) {
   if (channel.relay?.state === "retrying" || channel.relay?.state === "stopped") return channel.relay.lastError ?? "The SRT listener process is unavailable.";
   if (channel.available && channel.online) return "The encoder is connected and the browser-compatible output is being prepared.";
   return "The player will start automatically when output becomes ready.";
+}
+
+function isChannelList(value: unknown): value is { channels: Channel[] } {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { channels?: unknown }).channels)) return false;
+  return (value as { channels: unknown[] }).channels.every(isChannel);
+}
+
+function isChannel(value: unknown): value is Channel {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<Channel>;
+  return typeof item.id === "string" && typeof item.revision === "number" && item.revision >= 1 &&
+    typeof item.createdAt === "string" && typeof item.updatedAt === "string" && typeof item.name === "string" &&
+    typeof item.whepPath === "string" && typeof item.enabled === "boolean" &&
+    typeof item.outputReady === "boolean" && item.applyState !== undefined &&
+    Boolean(item.input && typeof item.input.mode === "string") &&
+    Boolean(item.compatibility && typeof item.compatibility.state === "string" && Array.isArray(item.compatibility.reasons) && item.compatibility.worker) &&
+    Array.isArray(item.readers);
+}
+
+function apiErrorMessage(body: unknown, status: number, fallback: string) {
+  if (typeof body === "string" && body) return body;
+  if (body && typeof body === "object") {
+    const error = (body as { error?: unknown }).error;
+    if (typeof error === "string" && error) return error;
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string" && message) return message;
+    }
+  }
+  return `${fallback} with ${status}`;
 }

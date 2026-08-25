@@ -26,6 +26,7 @@ export type ChannelRateSample = {
 
 export type Channel = {
   id: string;
+  revision: number;
   number: number;
   name: string;
   path: string;
@@ -53,6 +54,8 @@ export type Channel = {
   useAbsoluteTimestamp: boolean;
   applyState: "pending" | "applied" | "error" | "deleting";
   applyError?: string;
+  createdAt: string;
+  updatedAt: string;
   whepPath: string;
   viewerPath: string;
   embedPath: string;
@@ -75,6 +78,8 @@ export type Channel = {
     restarts: number;
     lastError?: string;
     nextRetryAt?: string;
+    listenerAddress?: string;
+    listenerActive: boolean;
   };
   compatibility: {
     state: "offline" | "probing" | "starting" | "ready" | "error";
@@ -152,6 +157,7 @@ export function channelStateLabel(item: Channel) {
   if (item.applyState === "deleting") return "Deletion pending";
   if (!item.enabled) return "Disabled";
   if (item.applyState === "error") return "Configuration error";
+  if (item.applyState === "pending") return "Applying configuration";
   if (item.compatibility.state === "error") return "Output error";
   if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
   if (item.relay?.state === "starting") return "Listener restarting";
@@ -193,6 +199,10 @@ export function hasInputStream(item: Channel) {
 
 export function hasOutputStream(item: Channel) {
   return item.outputReady && item.outputTracks.length > 0;
+}
+
+export function channelPlaybackReady(channel: Pick<Channel, "enabled" | "applyState" | "outputReady"> | null) {
+  return Boolean(channel?.enabled && channel.applyState === "applied" && channel.outputReady);
 }
 
 export function sampleChannelRates(
@@ -268,15 +278,24 @@ export function urlHost(host: string) {
   return bare.includes(":") ? `[${bare}]` : bare;
 }
 
-export function srtListenerURL(port: number | undefined, mediaBindAddress: string | undefined, fallbackHostname: string, latencyMs = 60) {
-  if (!port) return "";
-  return `srt://${urlHost(mediaHost(mediaBindAddress, fallbackHostname))}:${port}?latency=${latencyMs}`;
+export function activeListenerHost(listenerAddress: string | undefined, fallbackHostname: string) {
+  const listener = parseListenerSocket(listenerAddress);
+  if (!listener) return "";
+  return isWildcardHost(listener.host) ? fallbackHostname : listener.host;
 }
 
-export function srtPublishURL(path: string, listenAddress: string, mediaBindAddress: string | undefined, fallbackHostname: string) {
-  const port = listenerPort(listenAddress);
-  if (!path || !port) return "";
-  return `srt://${urlHost(mediaHost(mediaBindAddress, fallbackHostname))}:${port}?streamid=publish:${path}&pkt_size=1316`;
+export function srtListenerURL(listenerAddress: string | undefined, fallbackHostname: string, latencyMs = 60) {
+  const listener = parseListenerSocket(listenerAddress);
+  if (!listener) return "";
+  const host = isWildcardHost(listener.host) ? fallbackHostname : listener.host;
+  return `srt://${urlHost(host)}:${listener.port}?latency=${latencyMs}`;
+}
+
+export function srtPublishURL(path: string, listenerAddress: string | undefined, fallbackHostname: string) {
+  const listener = parseListenerSocket(listenerAddress);
+  if (!path || !listener) return "";
+  const host = isWildcardHost(listener.host) ? fallbackHostname : listener.host;
+  return `srt://${urlHost(host)}:${listener.port}?streamid=publish:${path}&pkt_size=1316`;
 }
 
 export function managementOrigin(managementBindAddress: string, port: number | undefined, location: BrowserLocation) {
@@ -301,4 +320,19 @@ function escapeAttribute(value: string) {
     .replaceAll('"', "&quot;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function parseListenerSocket(address: string | undefined) {
+  if (!address) return null;
+  const bracketed = address.match(/^\[([^\]]+)]:(\d+)$/);
+  const unbracketed = address.match(/^([^:]*):(\d+)$/);
+  const match = bracketed ?? unbracketed;
+  if (!match) return null;
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host: match[1], port };
+}
+
+function isWildcardHost(host: string) {
+  return host === "" || host === "*" || host === "0.0.0.0" || host === "::";
 }

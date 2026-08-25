@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   absolutePath,
+  activeListenerHost,
   channelHasFault,
+  channelPlaybackReady,
   channelStateLabel,
   hasInputStream,
   hasOutputStream,
@@ -25,10 +27,12 @@ import {
   type Track,
 } from "./channel";
 import { startSerialPolling } from "./polling";
+import { isRequestTimeoutError, requestJSON, requestText, type BoundedRequestInit } from "./request";
 import { HelpTip, Tooltip } from "./Tooltip";
 import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
 import { ArrowLeftIcon, ChevronLeftIcon, ChevronRightIcon } from "./Icons";
 import { ModalShell } from "./Modal";
+import { DiagnosticsDialog } from "./DiagnosticsDialog";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { ToastProvider, useOptionalToast, useToast } from "./Toast";
 import { readOverviewLayout, writeOverviewLayout } from "./uiPreferences";
@@ -37,6 +41,7 @@ import type { WHEPPlayerState } from "./useWHEPPlayer";
 import { codecWarnings, type PreviewStats, type ReceiverStats, type VideoReceiverStats } from "./webrtc";
 
 type GlobalSettings = {
+  revision: number;
   managementBindAddress: string;
   mediaBindAddress: string;
   logLevel: "error" | "warn" | "info" | "debug";
@@ -72,6 +77,11 @@ type BindingStatus = {
   port?: number;
   restartRequired: boolean;
   locked?: boolean;
+  activeListeners?: {
+    srt?: string;
+    webRTCUDP?: string;
+    webRTCTCP?: string;
+  };
 };
 
 type Status = {
@@ -114,7 +124,7 @@ type ResourceSnapshot = {
   media: { status: ResourceStatus; scope: string; errorCode?: string };
 };
 
-type SettingsForm = Omit<GlobalSettings, "webRTCAdditionalHosts" | "applyState" | "applyError" | "updatedAt"> & {
+type SettingsForm = Omit<GlobalSettings, "revision" | "webRTCAdditionalHosts" | "applyState" | "applyError" | "updatedAt"> & {
   webRTCAdditionalHosts: string;
 };
 
@@ -197,14 +207,18 @@ function Dashboard() {
   const [statusError, setStatusError] = useState("");
   const [deleteError, setDeleteError] = useState("");
   const [editingID, setEditingID] = useState<string | null>(null);
+  const [editingRevision, setEditingRevision] = useState<number | null>(null);
   const [form, setForm] = useState<ChannelForm | null>(null);
   const [formError, setFormError] = useState("");
+  const [formConflict, setFormConflict] = useState(false);
   const [saving, setSaving] = useState(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
+  const [settingsRevision, setSettingsRevision] = useState<number | null>(null);
   const [settingsError, setSettingsError] = useState("");
+  const [settingsConflict, setSettingsConflict] = useState(false);
   const [previewSavingIDs, setPreviewSavingIDs] = useState<ReadonlySet<string>>(() => new Set());
   const [previewSettingError, setPreviewSettingError] = useState("");
-  const [revealedPassphrase, setRevealedPassphrase] = useState<string | null>(null);
+  const [revealedPassphrase, setRevealedPassphrase] = useState<{ channelID: string; revision: number; value: string } | null>(null);
   const [passphraseError, setPassphraseError] = useState("");
   const [revealingPassphrase, setRevealingPassphrase] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -217,8 +231,23 @@ function Dashboard() {
   const [overviewLayout, setOverviewLayout] = useState<OverviewLayout>(readOverviewLayout);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [diagnosticsTarget, setDiagnosticsTarget] = useState<
+    { scope: "system" } | { scope: "channel"; channelID: string; channelName: string } | null
+  >(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState("");
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
+  const statusPollingRef = useRef<ReturnType<typeof startSerialPolling> | null>(null);
+  const selectedRevisionRef = useRef<{ id: string; revision: number } | null>(null);
+  const overviewHeadingRef = useRef<HTMLHeadingElement>(null);
+  const detailHeadingRef = useRef<HTMLHeadingElement>(null);
+  const pendingHeadingFocusRef = useRef<"overview" | "detail" | null>(null);
+  const deleteButtonRef = useRef<HTMLButtonElement>(null);
+  const confirmDeleteRef = useRef<HTMLButtonElement>(null);
+  const restoreDeleteFocusRef = useRef(false);
+  const previousStatusErrorRef = useRef(false);
+  const previousMediaReachableRef = useRef<boolean | null>(null);
+  const previousPreviewAnnouncementRef = useRef("");
 
   const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
 
@@ -227,7 +256,9 @@ function Dashboard() {
   useEffect(() => {
     const synchronizeRoute = () => {
       const channelID = dashboardChannelID(window.location.search);
-      setView(channelID ? "detail" : "overview");
+      const nextView = channelID ? "detail" : "overview";
+      pendingHeadingFocusRef.current = nextView;
+      setView(nextView);
       if (channelID) setSelectedID(channelID);
       setForm(null);
       setSettingsForm(null);
@@ -252,9 +283,10 @@ function Dashboard() {
 
     const load = async (signal: AbortSignal) => {
       try {
-        const response = await fetch("/api/v1/status", { cache: "no-store", signal });
-        if (!response.ok) throw new Error(`status ${response.status}`);
-        const nextStatus = (await response.json()) as Status;
+        const { response, body } = await requestJSON<unknown>("/api/v1/status", { cache: "no-store", signal });
+        if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Gateway status request failed"));
+        if (!isStatus(body)) throw new Error("Gateway returned malformed status data");
+        const nextStatus = body;
         if (disposed) return;
         const sampledRates = sampleChannelRates(nextStatus.channels, rateSamplesRef.current, performance.now());
         rateSamplesRef.current = sampledRates.samples;
@@ -266,50 +298,37 @@ function Dashboard() {
             ? current
             : nextStatus.channels[0]?.id ?? "",
         );
-      } catch {
-        if (!disposed && !signal.aborted) setStatusError("Gateway status is not responding");
+      } catch (error) {
+        if (!disposed && !signal.aborted) setStatusError(statusErrorMessage(error));
+        throw error;
       }
     };
 
     const stopPolling = startSerialPolling(load, pollInterval);
+    statusPollingRef.current = stopPolling;
     return () => {
       disposed = true;
       stopPolling();
+      if (statusPollingRef.current === stopPolling) statusPollingRef.current = null;
     };
   }, [pollInterval, refreshToken]);
 
   useEffect(() => setDeleteError(""), [selectedID]);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const typing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT";
-      const interactive = target?.closest("button, a, [contenteditable='true']");
-      if (typing || interactive || form || settingsForm || view !== "detail") return;
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        stepChannel(-1);
-      }
-      if (event.key === "ArrowRight") {
-        event.preventDefault();
-        stepChannel(1);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
-
   const selected = status?.channels.find((item) => item.id === selectedID) ?? null;
+  selectedRevisionRef.current = selected ? { id: selected.id, revision: selected.revision } : null;
+  const statusStale = Boolean(status && statusError);
   const selectedRates = selected ? streamRates[selected.id] : undefined;
   const selectedFault = Boolean(selected && channelHasFault(selected));
   const inputLive = Boolean(selected?.available && selected.online);
-  const isLive = Boolean(selected?.enabled && selected?.outputReady && !selectedFault);
+  const isLive = channelPlaybackReady(selected) && !selectedFault;
   const hasInput = Boolean(selected && hasInputStream(selected));
   const hasOutput = Boolean(selected && hasOutputStream(selected));
   const preview = useWHEPPlayer({
     whepPath: selected?.whepPath ?? "",
-    enabled: Boolean(view === "detail" && selected?.automaticPreview && selected.outputReady),
+    enabled: Boolean(view === "detail" && selected?.automaticPreview && channelPlaybackReady(selected)),
     retry: true,
+    collectStats: true,
   });
   const compatibility = selected
     ? selected.compatibility.reasons.length
@@ -335,11 +354,16 @@ function Dashboard() {
   const selectedMediaHost = mediaBindingAvailable
     ? mediaHost(mediaBinding.address, window.location.hostname)
     : "";
-  const selectedSRTURL = selectedIsSRTPush && mediaBindingAvailable
-    ? srtListenerURL(selected?.input.srt?.port, mediaBinding.address, window.location.hostname, selected?.input.srt?.latencyMs)
+  const activeRelayAddress = selected?.relay?.listenerActive ? selected.relay.listenerAddress : undefined;
+  const selectedSRTURL = selectedIsSRTPush
+    ? srtListenerURL(activeRelayAddress, window.location.hostname, selected?.input.srt?.latencyMs)
     : "";
-  const selectedSRTAdvancedURL = selectedIsSRTPush && selected && !selected.input.srt?.sdp && mediaBindingAvailable
-    ? srtPublishURL(selected.path, status?.settings.srtAddress ?? "", mediaBinding.address, window.location.hostname)
+  const selectedSRTActivePort = selectedSRTURL ? listenerPort(activeRelayAddress ?? "") : "";
+  const selectedSRTHost = selectedIsSRTPush
+    ? activeListenerHost(activeRelayAddress, window.location.hostname)
+    : selectedMediaHost;
+  const selectedSRTAdvancedURL = selectedIsSRTPush && selected && !selected.input.srt?.sdp
+    ? srtPublishURL(selected.path, status?.network.media.activeListeners?.srt, window.location.hostname)
     : "";
   const outputOrigin = managementOrigin(
     managementBinding.address,
@@ -369,35 +393,95 @@ function Dashboard() {
       passphraseRequestRef.current?.abort();
       passphraseRequestRef.current = null;
     };
-  }, [selectedID]);
+  }, [selectedID, selected?.revision]);
+
+  useEffect(() => {
+    const target = pendingHeadingFocusRef.current;
+    if (target !== view) return;
+    const heading = target === "overview" ? overviewHeadingRef.current : detailHeadingRef.current;
+    if (!heading) return;
+    pendingHeadingFocusRef.current = null;
+    heading.focus();
+  }, [selectedID, status, view]);
+
+  useEffect(() => {
+    const stale = Boolean(statusError && status);
+    if (stale && !previousStatusErrorRef.current) {
+      setLiveAnnouncement("Dashboard status is stale. Last known data and playback are retained.");
+    } else if (!statusError && previousStatusErrorRef.current) {
+      setLiveAnnouncement("Dashboard status recovered.");
+    }
+    previousStatusErrorRef.current = Boolean(statusError);
+  }, [status, statusError]);
+
+  useEffect(() => {
+    if (!status) return;
+    if (!status.media.reachable && previousMediaReachableRef.current !== false) {
+      showToast({
+        kind: "error",
+        message: "MediaMTX is unavailable. Channel status and playback may be affected.",
+        timeout: 7_000,
+      });
+    }
+    previousMediaReachableRef.current = status.media.reachable;
+  }, [showToast, status?.media.reachable]);
+
+  useEffect(() => {
+    const announcement = view === "detail" && selected
+      ? `${selected.name} preview: ${previewTitle(preview.state, selected.automaticPreview, isLive)}.`
+      : "";
+    if (announcement && announcement !== previousPreviewAnnouncementRef.current) {
+      previousPreviewAnnouncementRef.current = announcement;
+      setLiveAnnouncement(announcement);
+    }
+  }, [isLive, preview.state, selected?.automaticPreview, selected?.id, selected?.name, view]);
+
+  useEffect(() => {
+    if (confirmingDelete) {
+      confirmDeleteRef.current?.focus();
+    } else if (restoreDeleteFocusRef.current) {
+      restoreDeleteFocusRef.current = false;
+      deleteButtonRef.current?.focus();
+    }
+  }, [confirmingDelete]);
 
   const stepChannel = (delta: number) => {
     const list = status?.channels ?? [];
     if (list.length < 2) return;
     const index = list.findIndex((item) => item.id === selectedID);
     const next = list[(index + delta + list.length) % list.length];
-    if (next) showChannel(next.id, "replace");
+    if (next) showChannel(next.id, "replace", false);
   };
 
   const showOverview = (historyMode: DashboardHistoryMode = "push") => {
+    pendingHeadingFocusRef.current = "overview";
     setView("overview");
     window.history[`${historyMode}State`](null, "", dashboardURL(window.location.href));
   };
 
-  const showChannel = (channelID: string, historyMode: DashboardHistoryMode = "push") => {
+  const showChannel = (channelID: string, historyMode: DashboardHistoryMode = "push", focusHeading = true) => {
+    if (focusHeading) pendingHeadingFocusRef.current = "detail";
     setSelectedID(channelID);
     setView("detail");
     window.history[`${historyMode}State`](null, "", dashboardURL(window.location.href, channelID));
   };
 
   const openCreate = () => {
+    if (statusStale) return;
     setEditingID(null);
+    setEditingRevision(null);
     setForm(emptyForm(status?.settings, nextSRTListenPort(status)));
     setFormError("");
+    setFormConflict(false);
+  };
+
+  const refreshStatus = () => {
+    if (statusPollingRef.current) statusPollingRef.current.runNow();
+    else setRefreshToken((current) => current + 1);
   };
 
   const restartGateway = async () => {
-    if (!status?.gateway.restartRequired || restarting) return;
+    if (!status?.gateway.restartRequired || restarting || statusStale) return;
     const desiredAddress = status.network.management.resolvedAddress ?? resolveInterfaceBinding(status.settings.managementBindAddress, status.network.interfaces);
     if (!desiredAddress) {
       setRestartError(status.network.management.resolutionError ?? "The selected interface has no usable address");
@@ -413,10 +497,9 @@ function Dashboard() {
     setRestarting(true);
     setRestartError("");
     try {
-      const response = await fetch("/api/v1/restart", { method: "POST" });
-      const result = await response.json().catch(() => ({})) as { status?: string; error?: string };
+      const { response, body } = await requestAPI("/api/v1/restart", { method: "POST" });
       if (response.status !== 202) {
-        throw new Error(result.error ?? `Request failed with ${response.status}`);
+        throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Restart request failed"));
       }
       showToast({ kind: "info", message: "Gateway restart requested." });
       window.setTimeout(() => {
@@ -427,13 +510,19 @@ function Dashboard() {
         }
       }, 1_000);
     } catch (error) {
-      setRestartError(`${error instanceof Error ? error.message : "The restart request failed"}. Verify the Docker restart policy and try again.`);
+      if (isRequestTimeoutError(error)) {
+        setRestartError("The restart request timed out. Its outcome is indeterminate; current status is being refreshed.");
+        refreshStatus();
+      } else {
+        setRestartError(`${error instanceof Error ? error.message : "The restart request failed"}. Verify the Docker restart policy and try again.`);
+      }
       showToast({ kind: "error", message: "Gateway restart failed." });
       setRestarting(false);
     }
   };
 
-  const openEdit = (item: Channel) => {
+  const openEdit = (item: Channel, allowStale = false) => {
+    if (statusStale && !allowStale) return;
     const next = emptyForm(status?.settings, nextSRTListenPort(status));
     next.name = item.name;
     next.enabled = item.enabled;
@@ -457,25 +546,35 @@ function Dashboard() {
       next.srtSdp = item.input.srt.sdp ?? "";
     }
     setEditingID(item.id);
+    setEditingRevision(item.revision);
     setForm(next);
     setFormError("");
+    setFormConflict(false);
   };
 
   const openSettings = () => {
-    if (!status) return;
-    const { applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = status.settings;
+    if (!status || statusStale) return;
+    const { revision, applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = status.settings;
+    setSettingsRevision(revision);
     setSettingsForm({ ...editable, webRTCAdditionalHosts: status.settings.webRTCAdditionalHosts.join(", ") });
     setSettingsError("");
+    setSettingsConflict(false);
+  };
+
+  const changeChannelForm = (next: ChannelForm) => {
+    if (form && form.mode !== next.mode) setRevealedPassphrase(null);
+    setForm(next);
   };
 
   const saveSettings = async () => {
-    if (!settingsForm) return;
+    if (!settingsForm || settingsRevision === null || statusStale) return;
     setSaving(true);
     setSettingsError("");
+    setSettingsConflict(false);
     try {
-      const response = await fetch("/api/v1/settings", {
+      const { response, body: result } = await requestAPI("/api/v1/settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "If-Match": quoteRevision(settingsRevision) },
         body: JSON.stringify({
           ...settingsForm,
           srtAddress: listenerAddress(settingsForm.mediaBindAddress, settingsForm.srtAddress, listenerPort(settingsForm.srtAddress)),
@@ -484,20 +583,33 @@ function Dashboard() {
           webRTCAdditionalHosts: settingsForm.webRTCAdditionalHosts.split(",").map((host) => host.trim()).filter(Boolean),
         }),
       });
-      const result = (await response.json()) as GlobalSettings | { error: string };
-      if (!response.ok) throw new Error("error" in result ? result.error : `Request failed with ${response.status}`);
-      if ((result as GlobalSettings).applyState === "error") {
-        const failed = result as GlobalSettings;
+      if (response.status === 412) {
+        setSettingsConflict(true);
+        setSettingsError(`These settings were opened at revision ${settingsRevision}, but the Gateway has a newer revision. Your changes are preserved. Reload the latest settings before saving again.`);
+        refreshStatus();
+        return;
+      }
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Settings request failed"));
+      if (!isGlobalSettings(result)) throw new Error("Gateway returned malformed settings data");
+      setStatus((current) => current ? { ...current, settings: result } : current);
+      setSettingsRevision(result.revision);
+      if (result.applyState === "error") {
+        const failed = result;
         setSettingsError(`Settings saved, but the media plane rejected them: ${failed.applyError ?? "apply failed"}`);
-        setRefreshToken((current) => current + 1);
+        refreshStatus();
         showToast({ kind: "error", message: "Settings saved, but the media plane rejected them." });
         return;
       }
       setSettingsForm(null);
-      setRefreshToken((current) => current + 1);
+      refreshStatus();
       showToast({ kind: "success", message: "Settings saved." });
     } catch (error) {
-      setSettingsError(error instanceof Error ? error.message : "Unable to save settings");
+      if (isRequestTimeoutError(error)) {
+        setSettingsError("The settings request timed out. Its outcome is indeterminate; your form is preserved while current status is refreshed.");
+        refreshStatus();
+      } else {
+        setSettingsError(error instanceof Error ? error.message : "Unable to save settings");
+      }
       showToast({ kind: "error", message: "Settings were not saved." });
     } finally {
       setSaving(false);
@@ -505,27 +617,38 @@ function Dashboard() {
   };
 
   const updateAutomaticPreview = async (item: Channel, automaticPreview: boolean) => {
+    if (statusStale || previewSavingIDs.has(item.id)) return;
     setPreviewSavingIDs((current) => new Set(current).add(item.id));
     setPreviewSettingError("");
-    setStatus((current) => current ? {
-      ...current,
-      channels: current.channels.map((channel) => channel.id === item.id ? { ...channel, automaticPreview } : channel),
-    } : current);
     try {
-      const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(channelUpdatePayload(item, automaticPreview)),
+      const { response, body: result } = await requestAPI(`/api/v1/channels/${encodeURIComponent(item.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "If-Match": quoteRevision(item.revision) },
+        body: JSON.stringify({ automaticPreview }),
       });
-      const result = await response.json() as Channel | { error: string };
-      if (!response.ok) throw new Error("error" in result ? result.error : `Request failed with ${response.status}`);
-      setRefreshToken((current) => current + 1);
-    } catch (error) {
+      if (response.status === 412) {
+        setPreviewSettingError("The channel changed before the preview preference could be saved. Current status is being refreshed; try again afterward.");
+        refreshStatus();
+        return;
+      }
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Preview request failed"));
+      if (!isChannelPreference(result)) throw new Error("Gateway returned a malformed preview preference");
       setStatus((current) => current ? {
         ...current,
-        channels: current.channels.map((channel) => channel.id === item.id ? { ...channel, automaticPreview: item.automaticPreview } : channel),
+        channels: current.channels.map((channel) => channel.id === item.id ? {
+          ...channel,
+          automaticPreview: result.automaticPreview,
+          revision: result.revision,
+          updatedAt: result.updatedAt,
+        } : channel),
       } : current);
-      setPreviewSettingError(error instanceof Error ? error.message : "Unable to update preview");
+    } catch (error) {
+      if (isRequestTimeoutError(error)) {
+        setPreviewSettingError("The preview request timed out. Its outcome is indeterminate; current status is being refreshed.");
+        refreshStatus();
+      } else {
+        setPreviewSettingError(error instanceof Error ? error.message : "Unable to update preview");
+      }
       showToast({ kind: "error", message: "Preview was not updated." });
     } finally {
       setPreviewSavingIDs((current) => {
@@ -543,17 +666,25 @@ function Dashboard() {
     setRevealingPassphrase(true);
     setPassphraseError("");
     try {
-      const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}/srt-passphrase`, {
+      const { response, body: result } = await requestAPI(`/api/v1/channels/${encodeURIComponent(item.id)}/srt-passphrase`, {
         cache: "no-store",
         signal: abort.signal,
       });
-      const result = await response.json() as { configured?: boolean; passphrase?: string; error?: string };
-      if (!response.ok) throw new Error(result.error ?? `Request failed with ${response.status}`);
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Passphrase request failed"));
+      if (!isPassphraseResponse(result)) throw new Error("Gateway returned malformed passphrase data");
       if (passphraseRequestRef.current !== abort) return;
-      setRevealedPassphrase(result.configured ? result.passphrase ?? "" : null);
+      const current = selectedRevisionRef.current;
+      if (!current || current.id !== item.id || current.revision !== result.revision || result.revision !== item.revision) {
+        setRevealedPassphrase(null);
+        setPassphraseError("The channel changed while the passphrase was being read. Reveal it again from the latest revision.");
+        return;
+      }
+      setRevealedPassphrase(result.configured ? { channelID: item.id, revision: result.revision, value: result.passphrase } : null);
     } catch (error) {
       if (abort.signal.aborted || passphraseRequestRef.current !== abort) return;
-      setPassphraseError(error instanceof Error ? error.message : "Unable to reveal passphrase");
+      setPassphraseError(isRequestTimeoutError(error)
+        ? "The passphrase request timed out. Try again."
+        : error instanceof Error ? error.message : "Unable to reveal passphrase");
     } finally {
       if (passphraseRequestRef.current === abort) {
         passphraseRequestRef.current = null;
@@ -563,26 +694,37 @@ function Dashboard() {
   };
 
   const saveChannel = async () => {
-    if (!form) return;
+    if (!form || statusStale || (editingID !== null && editingRevision === null)) return;
     setSaving(true);
     setFormError("");
+    setFormConflict(false);
+    setRevealedPassphrase(null);
     try {
-      const response = await fetch(
+      const { response, body: result } = await requestAPI(
         editingID ? `/api/v1/channels/${encodeURIComponent(editingID)}` : "/api/v1/channels",
         {
           method: editingID ? "PUT" : "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(editingID && editingRevision !== null ? { "If-Match": quoteRevision(editingRevision) } : {}),
+          },
           body: JSON.stringify(channelPayload(form)),
         },
       );
-      const result = (await response.json()) as Channel | { error: string };
-      if (!response.ok) {
-        throw new Error("error" in result ? result.error : `Request failed with ${response.status}`);
+      if (response.status === 412 && editingID) {
+        setFormConflict(true);
+        setFormError(`This channel was opened at revision ${editingRevision}, but the Gateway has a newer revision. Your changes are preserved. Reload the latest channel before saving again.`);
+        refreshStatus();
+        return;
       }
-      const saved = result as Channel;
+      if (!response.ok) {
+        throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Channel request failed"));
+      }
+      if (!isChannel(result)) throw new Error("Gateway returned malformed channel data");
+      const saved = result;
       setSelectedID(saved.id);
       setForm(null);
-      setRefreshToken((current) => current + 1);
+      refreshStatus();
       showToast({
         kind: saved.applyState === "error" ? "error" : "success",
         message: saved.applyState === "error"
@@ -590,7 +732,12 @@ function Dashboard() {
           : editingID ? "Channel updated." : "Channel created.",
       });
     } catch (error) {
-      setFormError(error instanceof Error ? error.message : "Unable to save channel");
+      if (isRequestTimeoutError(error)) {
+        setFormError("The channel request timed out. Its outcome is indeterminate; your form is preserved while current status is refreshed.");
+        refreshStatus();
+      } else {
+        setFormError(error instanceof Error ? error.message : "Unable to save channel");
+      }
       showToast({ kind: "error", message: "Channel was not saved." });
     } finally {
       setSaving(false);
@@ -598,27 +745,83 @@ function Dashboard() {
   };
 
   const deleteChannel = async (item: Channel) => {
+    if (statusStale || deleting) return;
     setDeleteError("");
     setDeleting(true);
     try {
-      const response = await fetch(`/api/v1/channels/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+      const { response, body } = await requestAPI(`/api/v1/channels/${encodeURIComponent(item.id)}`, { method: "DELETE" });
       if (!response.ok) {
-        const result = await response.json().catch(() => ({})) as { error?: string };
-        throw new Error(result.error ?? `Unable to delete channel (${response.status})`);
+        throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Unable to delete channel"));
       }
       if (response.status !== 202) {
         setSelectedID(status?.channels.find((channel) => channel.id !== item.id)?.id ?? "");
         showOverview("replace");
       }
-      setRefreshToken((current) => current + 1);
+      refreshStatus();
       setConfirmingDelete(false);
       showToast({ kind: "success", message: response.status === 202 ? "Channel deletion is pending." : "Channel deleted." });
     } catch (error) {
-      setDeleteError(error instanceof Error ? error.message : "Unable to delete channel");
+      if (isRequestTimeoutError(error)) {
+        setDeleteError("The delete request timed out. Its outcome is indeterminate; current status is being refreshed.");
+        refreshStatus();
+      } else {
+        setDeleteError(error instanceof Error ? error.message : "Unable to delete channel");
+      }
       showToast({ kind: "error", message: "Channel was not deleted." });
     } finally {
       setDeleting(false);
     }
+  };
+
+  const reloadLatestChannel = async () => {
+    if (!editingID || saving) return;
+    setSaving(true);
+    try {
+      const { response, body } = await requestAPI(`/api/v1/channels/${encodeURIComponent(editingID)}`, { cache: "no-store" });
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Channel reload failed"));
+      if (!isChannel(body)) throw new Error("Gateway returned malformed channel data");
+      setStatus((current) => current ? {
+        ...current,
+        channels: current.channels.map((channel) => channel.id === body.id ? { ...channel, ...body } : channel),
+      } : current);
+      openEdit(body, true);
+      setFormError("");
+      setFormConflict(false);
+      setRevealedPassphrase(null);
+    } catch (error) {
+      setFormError(isRequestTimeoutError(error)
+        ? "Reloading the latest channel timed out. Your changes remain preserved."
+        : error instanceof Error ? error.message : "Unable to reload the latest channel");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reloadLatestSettings = async () => {
+    if (!settingsForm || saving) return;
+    setSaving(true);
+    try {
+      const { response, body } = await requestAPI("/api/v1/settings", { cache: "no-store" });
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Settings reload failed"));
+      if (!isGlobalSettings(body)) throw new Error("Gateway returned malformed settings data");
+      const { revision, applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = body;
+      setSettingsRevision(revision);
+      setSettingsForm({ ...editable, webRTCAdditionalHosts: body.webRTCAdditionalHosts.join(", ") });
+      setSettingsError("");
+      setSettingsConflict(false);
+      setStatus((current) => current ? { ...current, settings: body } : current);
+    } catch (error) {
+      setSettingsError(isRequestTimeoutError(error)
+        ? "Reloading the latest settings timed out. Your changes remain preserved."
+        : error instanceof Error ? error.message : "Unable to reload the latest settings");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancelDeleteConfirmation = () => {
+    restoreDeleteFocusRef.current = true;
+    setConfirmingDelete(false);
   };
 
   const gatewaySettingsState = status?.settings.applyState === "error"
@@ -631,11 +834,16 @@ function Dashboard() {
   const workspaceTitle = selected?.name
     ?? (status === null
       ? statusError ? "Gateway unavailable" : "Loading Gateway"
-      : status.channels.length === 0 ? "No channels configured" : "Selecting channel");
+       : status.channels.length === 0 ? "No channels configured" : "Selecting channel");
+  const displayedPassphrase = selected && revealedPassphrase && revealedPassphrase.channelID === selected.id && revealedPassphrase.revision === selected.revision
+    ? revealedPassphrase.value
+    : null;
+  const modalOpen = Boolean(form || settingsForm || diagnosticsTarget);
 
   return (
     <div className="app-shell">
-      <header className="topnav" inert={form || settingsForm ? true : undefined} aria-hidden={form || settingsForm ? true : undefined}>
+      <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">{liveAnnouncement}</div>
+      <header className="topnav" inert={modalOpen ? true : undefined} aria-hidden={modalOpen ? true : undefined}>
         <button className="topnav-brand" type="button" onClick={() => showOverview()}>
           <span className="brand-mark" aria-hidden="true">SD</span>
           <span className="brand-copy">
@@ -651,25 +859,25 @@ function Dashboard() {
             aria-current={view === "overview" ? "page" : undefined}
             onClick={() => showOverview()}
           >Overview</button>
-          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status} title={`Global settings — ${gatewaySettingsState}`}>Settings</button>
+          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
         </nav>
 
-        <ResourceStrip resources={status?.resources} disconnected={Boolean(statusError)} />
-
-        <div className="topnav-status">
-          <span className={statusError ? "signal fault" : status?.media.reachable ? "signal online" : status ? "signal fault" : "signal"} />
-          <span>{statusError ? status ? "Status stale" : "Gateway unavailable" : status?.media.reachable ? "Media plane connected" : status ? "Media plane unavailable" : "Loading Gateway"}</span>
-          <HelpTip
-            label="Gateway status"
-            content="Connection state between the management application and the shared MediaMTX media plane."
-            placement="left"
-          />
-        </div>
+        <button
+          className="topnav-diagnostics"
+          type="button"
+          aria-haspopup="dialog"
+          aria-label="Open system diagnostics"
+          title="Open system diagnostics"
+          onClick={() => setDiagnosticsTarget({ scope: "system" })}
+        >
+          Diagnostics
+        </button>
       </header>
 
-      <main className="workspace" inert={form || settingsForm ? true : undefined} aria-hidden={form || settingsForm ? true : undefined}>
+      <main className="workspace" inert={modalOpen ? true : undefined} aria-hidden={modalOpen ? true : undefined}>
         <div className="gateway-notices" aria-label="Gateway notices">
           {statusError && <ScopedNotice scope="Gateway" message={`${statusError}. Gateway will retry automatically.`} />}
+          {status?.settings.applyState === "pending" && <ScopedNotice scope="Gateway" message="Global settings changes are pending and have not yet been confirmed applied." />}
           {status?.settings.applyState === "error" && <ScopedNotice scope="Gateway" message={`Global settings saved but not applied: ${status.settings.applyError ?? "Media plane apply failed"}`} />}
           {status?.network.management.resolutionError && <ScopedNotice scope="Gateway" message={`Management interface unavailable: ${status.network.management.resolutionError}`} />}
           {status?.network.media.resolutionError && <ScopedNotice scope="Gateway" message={`Media interface unavailable: ${status.network.media.resolutionError}`} />}
@@ -685,7 +893,7 @@ function Dashboard() {
                   </p>
                 </div>
                 {status.gateway.restartRequired && (
-                  <button className="button restart-button" type="button" disabled={restarting || Boolean(status.network.management.resolutionError)} onClick={() => void restartGateway()}>
+                  <button className="button restart-button" type="button" disabled={restarting || statusStale || Boolean(status.network.management.resolutionError)} onClick={() => void restartGateway()}>
                     {restarting ? "Restarting..." : "Restart Gateway"}
                   </button>
                 )}
@@ -704,7 +912,6 @@ function Dashboard() {
             <span>{selected?.name ?? "Channel"}</span>
             <button className="crumb-step" type="button" onClick={() => stepChannel(1)} aria-label="Next channel"><ChevronRightIcon /></button>
           </div>
-          <span className="crumb-hint">← → to switch channels</span>
         </div>
         )}
 
@@ -712,29 +919,40 @@ function Dashboard() {
         <header className="topbar">
           <div>
             <span className="eyebrow">{selected ? inputModeLabel(selected.input.mode) : "GATEWAY"}</span>
-            <h1>{workspaceTitle}</h1>
+             <h1 ref={detailHeadingRef} tabIndex={-1}>{workspaceTitle}</h1>
           </div>
           <div className="topbar-actions">
             {selected && (confirmingDelete ? <div className="inline-confirm" role="group" aria-label="Confirm channel deletion">
               <span>Disconnect viewers and delete?</span>
-              <button className="button danger" type="button" disabled={deleting} onClick={() => void deleteChannel(selected)}>{deleting ? "Deleting..." : "Confirm delete"}</button>
-              <button className="button secondary" type="button" disabled={deleting} onClick={() => setConfirmingDelete(false)}>Cancel</button>
+              <button ref={confirmDeleteRef} className="button danger" type="button" disabled={deleting || statusStale} onClick={() => void deleteChannel(selected)}>{deleting ? "Deleting..." : "Confirm delete"}</button>
+              <button className="button secondary" type="button" disabled={deleting} onClick={cancelDeleteConfirmation}>Cancel</button>
             </div> : <>
-              <button className="button danger ghost-danger" type="button" disabled={selected.applyState === "deleting"} onClick={() => setConfirmingDelete(true)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete"}</button>
-              <button className="button secondary" type="button" disabled={selected.applyState === "deleting"} onClick={() => openEdit(selected)}>Configure</button>
+              <button ref={deleteButtonRef} className="button danger ghost-danger" type="button" disabled={selected.applyState === "deleting" || statusStale} onClick={() => setConfirmingDelete(true)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete"}</button>
+              <button className="button secondary" type="button" disabled={selected.applyState === "deleting" || statusStale} onClick={() => openEdit(selected)}>Configure</button>
             </>)}
-            {status && !selected && <button className="button secondary" type="button" onClick={status.channels.length ? undefined : openCreate} disabled={status.channels.length > 0}>Create channel</button>}
-            <div className={statusError || selectedFault ? "state-pill fault" : isLive ? "state-pill live" : "state-pill"}>
+            {status && !selected && <button className="button secondary" type="button" onClick={status.channels.length ? undefined : openCreate} disabled={status.channels.length > 0 || statusStale}>Create channel</button>}
+            {selected ? <button
+              className={statusError || selectedFault ? "state-pill fault" : isLive ? "state-pill live" : "state-pill"}
+              type="button"
+              aria-haspopup="dialog"
+              aria-label={`Open diagnostics for ${selected.name}. ${statusError ? "Status stale" : channelStateLabel(selected)}`}
+              title={`Open channel diagnostics - ${selected.name}`}
+              onClick={() => setDiagnosticsTarget({ scope: "channel", channelID: selected.id, channelName: selected.name })}
+            >
               <span className={statusError || selectedFault ? "signal fault" : isLive ? "signal online" : "signal"} />
-              {statusError ? "Status stale" : selected ? channelStateLabel(selected) : status === null ? "Loading" : status.channels.length ? "Selecting" : "Empty"}
-              <HelpTip label="channel state" content="Summarizes configuration, input, compatibility conversion, and output readiness for the selected channel." placement="left" />
-            </div>
+              {statusError ? "Status stale" : channelStateLabel(selected)}
+            </button> : <div className="state-pill"><span className="signal" />{status === null ? "Loading" : status.channels.length ? "Selecting" : "Empty"}</div>}
           </div>
         </header>
 
         <div className="channel-notices" aria-label="Channel notices">
+          {selected?.applyState === "pending" && <ScopedNotice scope={`Channel · ${selected.name}`} message="Configuration changes are pending and the channel is not ready for playback yet." />}
           {selected?.applyState === "error" && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Configuration saved but not applied: ${selected.applyError ?? "Channel apply failed"}`} />}
-          {selected?.applyState === "deleting" && <ScopedNotice scope={`Channel · ${selected.name}`} message="Deletion is pending and will be retried automatically." />}
+          {selected?.applyState === "deleting" && <ScopedNotice
+            scope={`Channel · ${selected.name}`}
+            message={selected.applyError ? `Deletion is pending after cleanup failed: ${selected.applyError}` : "Deletion is pending and will be retried automatically."}
+            action={selected.applyError ? <button className="button secondary" type="button" disabled={deleting || statusStale} onClick={() => void deleteChannel(selected)}>{deleting ? "Retrying..." : "Retry deletion"}</button> : undefined}
+          />}
           {selected && deleteError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Deletion failed: ${deleteError}`} />}
           {selected?.enabled && selected.applyState !== "deleting" && selected.relay && (selected.relay.state === "retrying" || selected.relay.state === "stopped") && <ScopedNotice scope={`Channel · ${selected.name}`} message={`SRT listener is unavailable: ${selected.relay.lastError ?? "the relay process stopped"}. Gateway will retry automatically.`} />}
           {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Preview was not updated: ${previewSettingError}`} />}
@@ -743,25 +961,27 @@ function Dashboard() {
 
         {view === "overview" ? (
           <>
-          <ChannelOverview
-            channels={status?.channels ?? []}
-            loading={status === null}
-            error={statusError}
-            rates={streamRates}
-            query={overviewQuery}
-            filter={overviewFilter}
-            layout={overviewLayout}
-            onQueryChange={setOverviewQuery}
-            onFilterChange={setOverviewFilter}
-            onLayoutChange={setOverviewLayout}
-            onSelect={(id) => showChannel(id)}
-            onEdit={openEdit}
-            previewSavingIDs={previewSavingIDs}
-            onAutomaticPreviewChange={(item, enabled) => void updateAutomaticPreview(item, enabled)}
-            onCreate={openCreate}
-            onRetry={() => setRefreshToken((current) => current + 1)}
-          />
-          <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
+            <ChannelOverview
+              channels={status?.channels ?? []}
+              loading={status === null}
+              error={statusError}
+              rates={streamRates}
+              query={overviewQuery}
+              filter={overviewFilter}
+              layout={overviewLayout}
+              onQueryChange={setOverviewQuery}
+              onFilterChange={setOverviewFilter}
+              onLayoutChange={setOverviewLayout}
+              onSelect={(id) => showChannel(id)}
+              onEdit={openEdit}
+              previewSavingIDs={previewSavingIDs}
+              onAutomaticPreviewChange={(item, enabled) => void updateAutomaticPreview(item, enabled)}
+              onCreate={openCreate}
+              onRetry={refreshStatus}
+              mutationsDisabled={statusStale}
+              headingRef={overviewHeadingRef}
+            />
+            <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
           </>
         ) : selected ? (
           <>
@@ -771,10 +991,11 @@ function Dashboard() {
                 bindingState={mediaBinding.state}
                 bindingName={bindingLabel(mediaBinding.address, status?.network.interfaces ?? [])}
                 bindingError={status?.settings.applyError}
-                mediaHost={selectedMediaHost}
+                mediaHost={selectedSRTHost}
                 srtURL={selectedSRTURL}
+                activeSRTPort={selectedSRTActivePort}
                 advancedSRTURL={selectedSRTAdvancedURL}
-                passphrase={revealedPassphrase}
+                passphrase={displayedPassphrase}
                 passphraseLoading={revealingPassphrase}
                 passphraseError={passphraseError}
                 onReveal={() => void revealPassphrase(selected)}
@@ -817,7 +1038,7 @@ function Dashboard() {
                     {...tooltip}
                     className={selected.automaticPreview ? "toggle active" : "toggle"}
                     type="button"
-                    disabled={previewSavingIDs.has(selected.id) || selected.applyState === "deleting"}
+                    disabled={previewSavingIDs.has(selected.id) || selected.applyState === "deleting" || statusStale}
                     aria-label={selected.automaticPreview ? "Disable preview" : "Enable preview"}
                     aria-pressed={selected.automaticPreview}
                     onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
@@ -826,19 +1047,19 @@ function Dashboard() {
               </div>
               <div className="preview-stage">
                 <video ref={preview.videoRef} autoPlay playsInline muted controls />
-                {!selected.automaticPreview && <div className="preview-message overlay-message">
+                {!selected.automaticPreview && <div className="preview-message overlay-message" role="status">
                   <span className="preview-icon">OFF</span>
                   <strong>Preview disabled for this channel</strong>
                   <p>Enable Preview to create a muted dashboard WHEP reader when output is ready.</p>
                 </div>}
-                {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`}>
+                {selected.automaticPreview && !isLive && <div className={`preview-message overlay-message${channelHasFault(selected) ? " error-message" : ""}`} role={channelHasFault(selected) ? "alert" : "status"}>
                   <span className="preview-icon">{channelHasFault(selected) ? "ERR" : inputLive ? "PREP" : "OFF"}</span>
                   <strong>{channelStateLabel(selected)}</strong>
                   <p>{previewOfflineDetail(selected)}</p>
                 </div>}
-                {selected.automaticPreview && isLive && preview.state === "connecting" && <div className="preview-message overlay-message"><span className="preview-icon pulse">ICE</span><strong>Establishing WHEP session</strong><p>Gathering LAN candidates and waiting for media.</p></div>}
-                {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>{preview.error} Retrying automatically.</p></div>}
-                {selected.automaticPreview && isLive && preview.state === "playing" && preview.hasAudio && !preview.hasVideo && <div className="preview-message audio-message"><span className="preview-icon">AUD</span><strong>Audio-only stream</strong><p>Audio is playing without a video track.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "connecting" && <div className="preview-message overlay-message" role="status"><span className="preview-icon pulse">ICE</span><strong>Establishing WHEP session</strong><p>Gathering LAN candidates and waiting for media.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message" role="alert"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>{preview.error} Retrying automatically.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "playing" && preview.hasAudio && !preview.hasVideo && <div className="preview-message audio-message" role="status"><span className="preview-icon">AUD</span><strong>Audio-only stream</strong><p>Audio is playing without a video track.</p></div>}
               </div>
             </article>
 
@@ -914,7 +1135,7 @@ function Dashboard() {
                   <span>STATUS UNAVAILABLE</span>
                   <h2>The Gateway did not respond.</h2>
                   <p>No channel or media-plane state is being assumed. Automatic polling will continue.</p>
-                  <button className="button primary" type="button" onClick={() => setRefreshToken((current) => current + 1)}>Retry now</button>
+                  <button className="button primary" type="button" onClick={refreshStatus}>Retry now</button>
                 </>
               ) : (
                 <>
@@ -928,7 +1149,7 @@ function Dashboard() {
                 <span>NO CHANNELS</span>
                 <h2>{status.media.reachable ? "The media plane is ready." : "The Gateway has no channels."}</h2>
                 <p>{status.media.reachable ? "Create an RTP or SRT channel to begin routing media." : "The channel list loaded successfully, but the shared media plane is unavailable."}</p>
-                <button className="button primary" type="button" onClick={openCreate}>Create channel</button>
+                <button className="button primary" type="button" onClick={openCreate} disabled={statusStale}>Create channel</button>
               </>
             ) : (
               <>
@@ -945,10 +1166,13 @@ function Dashboard() {
           form={form}
           editing={editingID !== null}
           error={formError}
+          conflict={formConflict}
           saving={saving}
-          onChange={setForm}
+          mutationBlocked={statusStale}
+          onChange={changeChannelForm}
           onClose={() => setForm(null)}
           onSave={() => void saveChannel()}
+          onReloadLatest={() => void reloadLatestChannel()}
           rtpPortMin={status?.settings.rtpPortMin ?? 22000}
           srtPortDefault={nextSRTListenPort(status)}
           mediaBindingLabel={bindingLabel(mediaBinding.address, status?.network.interfaces ?? [])}
@@ -959,14 +1183,20 @@ function Dashboard() {
         <SettingsEditor
           form={settingsForm}
           error={settingsError}
+          conflict={settingsConflict}
           saving={saving}
+          mutationBlocked={statusStale}
           onChange={setSettingsForm}
           onClose={() => setSettingsForm(null)}
           onSave={() => void saveSettings()}
+          onReloadLatest={() => void reloadLatestSettings()}
           network={status.network}
           currentMediaBindAddress={status.network.media.activeAddress ?? status.settings.mediaBindAddress}
         />
       )}
+
+      {diagnosticsTarget?.scope === "system" && <DiagnosticsDialog scope="system" onClose={() => setDiagnosticsTarget(null)} />}
+      {diagnosticsTarget?.scope === "channel" && <DiagnosticsDialog scope="channel" channelID={diagnosticsTarget.channelID} channelName={diagnosticsTarget.channelName} onClose={() => setDiagnosticsTarget(null)} />}
     </div>
   );
 }
@@ -975,17 +1205,20 @@ export function App() {
   return <ToastProvider><Dashboard /></ToastProvider>;
 }
 
-function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefault, mediaBindingLabel, onChange, onClose, onSave }: {
+function ChannelEditor({ form, editing, error, conflict, saving, mutationBlocked, rtpPortMin, srtPortDefault, mediaBindingLabel, onChange, onClose, onSave, onReloadLatest }: {
   form: ChannelForm;
   editing: boolean;
   error: string;
+  conflict: boolean;
   saving: boolean;
+  mutationBlocked: boolean;
   rtpPortMin: number;
   srtPortDefault: number;
   mediaBindingLabel: string;
   onChange: (form: ChannelForm) => void;
   onClose: () => void;
   onSave: () => void;
+  onReloadLatest: () => void;
 }) {
   const update = <K extends keyof ChannelForm>(key: K, value: ChannelForm[K]) => onChange({ ...form, [key]: value });
   const isRTP = form.mode === "rtp-unicast" || form.mode === "rtp-multicast";
@@ -1011,7 +1244,7 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
         </header>
 
         <div className="editor-body">
-          {error && <div className="alert editor-alert" role="alert">{error}</div>}
+          {error && <div className="alert editor-alert" role="alert"><span>{error}</span>{conflict && <button className="button secondary" type="button" disabled={saving} onClick={onReloadLatest}>Reload latest</button>}</div>}
 
           <div className="form-grid">
             <label className="field full">
@@ -1099,13 +1332,20 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
 
             {!isRTP && (
 			  <>
-				<div className="field full">
-				  <FieldTitle help="Optional SRT encryption secret. SRT requires 10 to 79 bytes and both peers must use the same value.">SRT passphrase</FieldTitle>
-				  <input type="password" value={form.passphrase} onChange={(event) => update("passphrase", event.target.value)} placeholder={form.hasPassphrase ? "Stored; leave blank to keep" : "Optional, 10-79 bytes"} />
-				  {form.hasPassphrase && (
-					<label className="check compact"><input type="checkbox" checked={form.clearPassphrase} onChange={(event) => update("clearPassphrase", event.target.checked)} />Clear stored passphrase</label>
-				  )}
-				</div>
+                <div className="field full">
+                  <label htmlFor="channel-srt-passphrase"><FieldTitle help="Optional SRT encryption secret. SRT requires 10 to 79 bytes and both peers must use the same value.">SRT passphrase</FieldTitle></label>
+                  <input
+                    id="channel-srt-passphrase"
+                    type="password"
+                    value={form.passphrase}
+                    disabled={form.clearPassphrase}
+                    onChange={(event) => onChange({ ...form, passphrase: event.target.value, clearPassphrase: false })}
+                    placeholder={form.hasPassphrase ? "Stored; leave blank to keep" : "Optional, 10-79 bytes"}
+                  />
+                  {form.hasPassphrase && (
+                    <label className="check compact"><input type="checkbox" checked={form.clearPassphrase} onChange={(event) => onChange({ ...form, clearPassphrase: event.target.checked, passphrase: event.target.checked ? "" : form.passphrase })} />Clear stored passphrase</label>
+                  )}
+                </div>
 				<label className="field full">
 				  <FieldTitle help="Required only when SRT carries elementary RTP. It maps dynamic RTP payload types to codecs.">Elementary RTP session description (SDP)</FieldTitle>
 				  <textarea rows={7} value={form.srtSdp} onChange={(event) => update("srtSdp", event.target.value)} spellCheck={false} placeholder="Optional; leave blank for automatic MPEG-TS or RTP/MP2T detection" />
@@ -1130,21 +1370,24 @@ function ChannelEditor({ form, editing, error, saving, rtpPortMin, srtPortDefaul
 
         <footer className="editor-footer">
           <button className="button secondary" type="button" disabled={saving} onClick={onClose}>Cancel</button>
-          <button className="button primary" type="button" disabled={saving} onClick={onSave}>{saving ? "Saving..." : editing ? "Save changes" : "Create channel"}</button>
+          <button className="button primary" type="button" disabled={saving || mutationBlocked} title={mutationBlocked ? "Current Gateway status is stale" : undefined} onClick={onSave}>{saving ? "Saving..." : editing ? "Save changes" : "Create channel"}</button>
         </footer>
     </ModalShell>
   );
 }
 
-function SettingsEditor({ form, error, saving, network, currentMediaBindAddress, onChange, onClose, onSave }: {
+function SettingsEditor({ form, error, conflict, saving, mutationBlocked, network, currentMediaBindAddress, onChange, onClose, onSave, onReloadLatest }: {
   form: SettingsForm;
   error: string;
+  conflict: boolean;
   saving: boolean;
+  mutationBlocked: boolean;
   network: Status["network"];
   currentMediaBindAddress: string;
   onChange: (form: SettingsForm) => void;
   onClose: () => void;
   onSave: () => void;
+  onReloadLatest: () => void;
 }) {
   const [sameInterface, setSameInterface] = useState(form.managementBindAddress === form.mediaBindAddress);
   const update = <K extends keyof SettingsForm>(key: K, value: SettingsForm[K]) => onChange({ ...form, [key]: value });
@@ -1180,7 +1423,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
         </header>
 
         <div className="editor-body">
-          {error && <div className="alert editor-alert" role="alert">{error}</div>}
+          {error && <div className="alert editor-alert" role="alert"><span>{error}</span>{conflict && <button className="button secondary" type="button" disabled={saving} onClick={onReloadLatest}>Reload latest</button>}</div>}
           <div className="form-grid">
             <h3 className="settings-section">Control and media planes</h3>
             <p className="settings-section-note">Follow an interface to keep using its current address after DHCP changes, or retain an existing fixed address.</p>
@@ -1360,7 +1603,7 @@ function SettingsEditor({ form, error, saving, network, currentMediaBindAddress,
 
         <footer className="editor-footer">
           <button className="button secondary" type="button" disabled={saving} onClick={onClose}>Cancel</button>
-          <button className="button primary" type="button" disabled={saving} onClick={onSave}>{saving ? "Saving..." : "Save settings"}</button>
+          <button className="button primary" type="button" disabled={saving || mutationBlocked} title={mutationBlocked ? "Current Gateway status is stale" : undefined} onClick={onSave}>{saving ? "Saving..." : "Save settings"}</button>
         </footer>
     </ModalShell>
   );
@@ -1444,54 +1687,23 @@ function channelPayload(form: ChannelForm) {
   };
 }
 
-function channelUpdatePayload(item: Channel, automaticPreview: boolean) {
-  const common = {
-    name: item.name,
-    enabled: item.enabled,
-    automaticPreview,
-    maxReaders: item.maxReaders,
-    useAbsoluteTimestamp: item.useAbsoluteTimestamp,
-  };
-  if (item.input.rtp) {
-    return {
-      ...common,
-      input: {
-        mode: item.input.mode,
-        rtp: { ...item.input.rtp },
-      },
-    };
-  }
-  return {
-    ...common,
-    input: {
-      mode: item.input.mode,
-      srt: {
-        host: item.input.srt?.host ?? "",
-        port: item.input.srt?.port ?? 0,
-        streamId: item.input.srt?.streamId ?? "",
-        latencyMs: item.input.srt?.latencyMs ?? 0,
-		sdp: item.input.srt?.sdp ?? "",
-      },
-    },
-  };
-}
-
-function ScopedNotice({ scope, message }: { scope: string; message: string }) {
+function ScopedNotice({ scope, message, action }: { scope: string; message: string; action?: ReactNode }) {
   return (
     <div className="alert scoped-notice" role="alert">
       <span className="notice-scope">{scope}</span>
-      <p>{message}</p>
+      <div className="scoped-notice-content"><p>{message}</p>{action}</div>
     </div>
   );
 }
 
-export function InputConnectionPanel({ channel, bindingState, bindingName, bindingError, mediaHost: host, srtURL, advancedSRTURL, passphrase, passphraseLoading, passphraseError, onReveal, onHide }: {
+export function InputConnectionPanel({ channel, bindingState, bindingName, bindingError, mediaHost: host, srtURL, activeSRTPort, advancedSRTURL, passphrase, passphraseLoading, passphraseError, onReveal, onHide }: {
   channel: Channel;
   bindingState: "active" | "pending-restart" | "unconfirmed";
   bindingName: string;
   bindingError?: string;
   mediaHost: string;
   srtURL: string;
+  activeSRTPort: string;
   advancedSRTURL: string;
   passphrase: string | null;
   passphraseLoading: boolean;
@@ -1521,9 +1733,9 @@ export function InputConnectionPanel({ channel, bindingState, bindingName, bindi
       <BindingContext state={bindingState} activeLabel={bindingName} scope="Gateway › Media interface" error={bindingError} />
       <div className="connection-rows">
         {mode === "srt-push" && <>
-          <ConnectionRow label="SRT URL" value={srtURL || "-"} />
-          <ConnectionRow label="Destination IP" value={host || "-"} />
-          <ConnectionRow label="Destination port" value={srt?.port ? String(srt.port) : "-"} />
+          <ConnectionRow label="SRT URL" value={srtURL || "Unavailable - listener not confirmed active"} />
+          <ConnectionRow label="Destination IP" value={host || "Unavailable - listener not confirmed active"} />
+          <ConnectionRow label="Destination port" value={activeSRTPort || "Unavailable - listener not confirmed active"} />
           <ConnectionRow label="SRT mode" value="Caller" />
         </>}
         {mode === "srt-pull" && <>
@@ -1547,7 +1759,7 @@ export function InputConnectionPanel({ channel, bindingState, bindingName, bindi
           <ConnectionRow label="Session description" value={rtp?.sdp || "-"} />
         </>}
         <PassphraseRow applicable={isSRT} configured={Boolean(srt?.hasPassphrase)} passphrase={passphrase} loading={passphraseLoading} error={passphraseError} onReveal={onReveal} onHide={onHide} />
-        {mode === "srt-push" && <ConnectionRow label="MPEG-TS-only stream-ID URL" value={advancedSRTURL || "-"} secondary />}
+        {mode === "srt-push" && <ConnectionRow label="MPEG-TS-only stream-ID URL" value={advancedSRTURL || "Unavailable - shared listener not confirmed active"} secondary />}
       </div>
     </article>
   );
@@ -1570,34 +1782,16 @@ function BindingContext({ state, activeLabel, desiredLabel, scope, error }: {
   );
 }
 
-export function ResourceStrip({ resources, disconnected = false }: { resources?: ResourceSnapshot; disconnected?: boolean }) {
-  const scopes: Array<[string, ResourceScope | undefined]> = [
-    ["Gateway", resources?.gateway],
-    ["Host", resources?.host],
-  ];
-  return (
-    <div className="topnav-resources" aria-label="Resource usage">
-      {scopes.map(([label, scope]) => {
-        const cpu = scope?.cpu.percent;
-        const memory = scope?.memory.usedBytes;
-        const unavailable = disconnected || !scope || scope.status === "unavailable" || cpu === null || cpu === undefined;
-        return (
-          <span className={unavailable ? "topnav-resource stale" : "topnav-resource"} key={label}>
-            <em>{label}</em>
-            {unavailable ? "—" : `${cpu.toFixed(0)}% · ${formatBytes(memory ?? 0)}`}
-          </span>
-        );
-      })}
-    </div>
-  );
-}
-
 export function ResourceFooter({ resources, disconnected = false }: { resources?: ResourceSnapshot; disconnected?: boolean }) {
+  const samplerStale = Boolean(resources && (resources.gateway.status === "stale" || resources.host.status === "stale"));
+  const summary = disconnected
+    ? resources ? "STALE" : "UNAVAILABLE"
+    : samplerStale ? "STALE" : resources ? "LIVE" : "LOADING";
   return (
     <footer className="resource-footer" aria-label="Resource usage">
       <div className="resource-footer-heading">
         <span>Resources <HelpTip label="resource scope" content="Gateway measures its own container and the whole host. MediaMTX is isolated and excluded. Warming means CPU needs another sample; stale means the last good values are retained." placement="right" /></span>
-        <small>{disconnected ? resources ? "STALE" : "UNAVAILABLE" : resources ? "LIVE" : "LOADING"}</small>
+        <small>{summary}</small>
       </div>
       <ResourceRow label="Gateway" scope={resources?.gateway} disconnected={disconnected} />
       <ResourceRow label="Host" scope={resources?.host} disconnected={disconnected} />
@@ -1693,6 +1887,7 @@ export function ConnectionRow({ label, value, secondary = false, openURL = false
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const help = connectionHelp(label);
+  const available = value !== "-" && !value.startsWith("Unavailable");
   return (
     <div className={`connection-row${secondary ? " secondary-row" : ""}`}>
       <label htmlFor={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}>{label}{help && <HelpTip label={label} content={help} placement="right" />}</label>
@@ -1706,8 +1901,8 @@ export function ConnectionRow({ label, value, secondary = false, openURL = false
           onFocus={(event) => event.currentTarget.select()}
         />
         <div className="connection-actions">
-          {openURL && value !== "-" && <a className="copy-action open-action" href={value} target="_blank" rel="noreferrer" aria-label={`Open ${label}`}>{label.toLowerCase().includes("embed") ? "Open embed" : "Open viewer"}</a>}
-          <CopyButton label={label} value={value === "-" ? "" : value} input={inputRef} />
+          {openURL && available && <a className="copy-action open-action" href={value} target="_blank" rel="noreferrer" aria-label={`Open ${label}`}>{label.toLowerCase().includes("embed") ? "Open embed" : "Open viewer"}</a>}
+          <CopyButton label={label} value={available ? value : ""} input={inputRef} />
         </div>
       </div>
     </div>
@@ -2078,4 +2273,86 @@ function nextSRTListenPort(status: Status | null) {
     if (!insideRTPRange && !used.has(port)) return port;
   }
   return 10000;
+}
+
+class APIRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "APIRequestError";
+    this.status = status;
+  }
+}
+
+async function requestAPI(input: RequestInfo | URL, init: BoundedRequestInit = {}) {
+  const { response, body: text } = await requestText(input, init);
+  if (!text) return { response, body: undefined as unknown };
+  try {
+    return { response, body: JSON.parse(text) as unknown };
+  } catch {
+    return { response, body: text as unknown };
+  }
+}
+
+function apiErrorMessage(body: unknown, status: number, fallback: string) {
+  if (typeof body === "string" && body.trim()) return body.trim();
+  if (body && typeof body === "object") {
+    const error = (body as { error?: unknown }).error;
+    if (typeof error === "string" && error) return error;
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string" && message) return message;
+    }
+  }
+  return `${fallback} (${status})`;
+}
+
+function statusErrorMessage(error: unknown) {
+  if (isRequestTimeoutError(error)) return "Gateway status request timed out";
+  return error instanceof Error && error.message ? error.message.replace(/[.]+$/, "") : "Gateway status is not responding";
+}
+
+function quoteRevision(revision: number) {
+  return `"${revision}"`;
+}
+
+function isStatus(value: unknown): value is Status {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<Status>;
+  return Boolean(item.gateway && item.media && item.network && isGlobalSettings(item.settings)) &&
+    Array.isArray(item.channels) && item.channels.every(isChannel);
+}
+
+function isGlobalSettings(value: unknown): value is GlobalSettings {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<GlobalSettings>;
+  return typeof item.revision === "number" && item.revision >= 1 &&
+    typeof item.managementBindAddress === "string" && typeof item.mediaBindAddress === "string" &&
+    typeof item.applyState === "string" && typeof item.updatedAt === "string" &&
+    Array.isArray(item.webRTCAdditionalHosts);
+}
+
+function isChannel(value: unknown): value is Channel {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<Channel>;
+  return typeof item.id === "string" && typeof item.revision === "number" && item.revision >= 1 &&
+    typeof item.name === "string" && typeof item.whepPath === "string" &&
+    typeof item.enabled === "boolean" && typeof item.automaticPreview === "boolean" &&
+    typeof item.outputReady === "boolean" && typeof item.applyState === "string" &&
+    Boolean(item.input && typeof item.input.mode === "string") &&
+    Boolean(item.compatibility && typeof item.compatibility.state === "string" && Array.isArray(item.compatibility.reasons)) &&
+    Array.isArray(item.readers) && Array.isArray(item.tracks) && Array.isArray(item.outputTracks);
+}
+
+function isChannelPreference(value: unknown): value is Pick<Channel, "automaticPreview" | "revision" | "updatedAt"> {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<Channel>;
+  return typeof item.automaticPreview === "boolean" && typeof item.revision === "number" && typeof item.updatedAt === "string";
+}
+
+function isPassphraseResponse(value: unknown): value is { configured: boolean; passphrase: string; revision: number } {
+  if (!value || typeof value !== "object") return false;
+  const item = value as { configured?: unknown; passphrase?: unknown; revision?: unknown };
+  return typeof item.configured === "boolean" && typeof item.passphrase === "string" && typeof item.revision === "number";
 }

@@ -29,19 +29,40 @@ export type PreviewStats = {
 
 type RawStats = RTCStats & Record<string, unknown>;
 
-export function waitForICEGathering(peer: RTCPeerConnection, timeoutMs = 5000) {
-  if (peer.iceGatheringState === "complete") return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const timer = window.setTimeout(finish, timeoutMs);
-    function finish() {
+export type ICEGatheringResult = "complete" | "timeout" | "aborted";
+
+export type ICEGatheringOptions = {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+export function waitForICEGathering(
+  peer: RTCPeerConnection,
+  timeoutOrOptions: number | ICEGatheringOptions = 5000,
+  legacySignal?: AbortSignal,
+): Promise<ICEGatheringResult> {
+  const timeoutMs = typeof timeoutOrOptions === "number" ? timeoutOrOptions : timeoutOrOptions.timeoutMs ?? 5000;
+  const signal = typeof timeoutOrOptions === "number" ? legacySignal : timeoutOrOptions.signal;
+  if (signal?.aborted) return Promise.resolve("aborted");
+  if (peer.iceGatheringState === "complete") return Promise.resolve("complete");
+
+  return new Promise<ICEGatheringResult>((resolve) => {
+    let settled = false;
+    const finish = (result: ICEGatheringResult) => {
+      if (settled) return;
+      settled = true;
       window.clearTimeout(timer);
       peer.removeEventListener("icegatheringstatechange", onStateChange);
-      resolve();
-    }
-    function onStateChange() {
-      if (peer.iceGatheringState === "complete") finish();
-    }
+      signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const onStateChange = () => {
+      if (peer.iceGatheringState === "complete") finish("complete");
+    };
+    const onAbort = () => finish("aborted");
+    const timer = window.setTimeout(() => finish("timeout"), Math.max(0, timeoutMs));
     peer.addEventListener("icegatheringstatechange", onStateChange);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

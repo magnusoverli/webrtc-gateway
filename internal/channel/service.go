@@ -86,6 +86,10 @@ func (s *Service) Create(ctx context.Context, draft Draft) (Channel, error) {
 	}
 	defer release()
 
+	draft, err = resolvePassphrase(draft, nil)
+	if err != nil {
+		return Channel{}, err
+	}
 	draft, err = ValidateDraft(draft)
 	if err != nil {
 		return Channel{}, err
@@ -115,6 +119,14 @@ func (s *Service) Create(ctx context.Context, draft Draft) (Channel, error) {
 }
 
 func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, error) {
+	return s.update(ctx, id, draft, nil)
+}
+
+func (s *Service) UpdateExpected(ctx context.Context, id string, draft Draft, expectedRevision int) (Channel, error) {
+	return s.update(ctx, id, draft, &expectedRevision)
+}
+
+func (s *Service) update(ctx context.Context, id string, draft Draft, expectedRevision *int) (Channel, error) {
 	ctx, release, err := s.control.Acquire(ctx)
 	if err != nil {
 		return Channel{}, err
@@ -125,8 +137,21 @@ func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, 
 	if err != nil {
 		return Channel{}, err
 	}
+	if expectedRevision != nil && current.Revision != *expectedRevision {
+		return Channel{}, ErrRevisionConflict
+	}
 	if current.ApplyState == ApplyDeleting {
 		return Channel{}, ErrDeleting
+	}
+	if draft.PreserveAutomaticPreview {
+		draft.AutomaticPreview = current.AutomaticPreview
+	}
+	if draft.PreserveUseAbsoluteTimestamp {
+		draft.UseAbsoluteTimestamp = current.UseAbsoluteTimestamp
+	}
+	draft, err = resolvePassphrase(draft, &current)
+	if err != nil {
+		return Channel{}, err
 	}
 	draft, err = ValidateDraft(draft)
 	if err != nil {
@@ -136,9 +161,11 @@ func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, 
 		return Channel{}, err
 	}
 	if sameAppliedConfiguration(current, draft) {
+		previousRevision := current.Revision
 		current.AutomaticPreview = draft.AutomaticPreview
+		current.Revision++
 		current.UpdatedAt = s.now().UTC()
-		if err := s.store.Update(ctx, current); err != nil {
+		if err := s.store.Update(ctx, current, previousRevision); err != nil {
 			return Channel{}, err
 		}
 		return current, nil
@@ -147,10 +174,57 @@ func (s *Service) Update(ctx context.Context, id string, draft Draft) (Channel, 
 	if err != nil {
 		return Channel{}, err
 	}
-	if err := s.store.Update(ctx, item); err != nil {
+	previousRevision := item.Revision
+	item.Revision++
+	if err := s.store.Update(ctx, item, previousRevision); err != nil {
 		return Channel{}, err
 	}
 	return s.apply(ctx, item)
+}
+
+func (s *Service) UpdateAutomaticPreview(ctx context.Context, id string, automaticPreview bool, expectedRevision *int) (Channel, error) {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return Channel{}, err
+	}
+	defer release()
+
+	current, err := s.Get(ctx, id)
+	if err != nil {
+		return Channel{}, err
+	}
+	if expectedRevision != nil && current.Revision != *expectedRevision {
+		return Channel{}, ErrRevisionConflict
+	}
+	if current.ApplyState == ApplyDeleting {
+		return Channel{}, ErrDeleting
+	}
+	if err := s.store.UpdateAutomaticPreview(ctx, current.ID, automaticPreview, s.now().UTC(), current.Revision); err != nil {
+		return Channel{}, err
+	}
+	return s.store.Get(ctx, current.ID)
+}
+
+func resolvePassphrase(draft Draft, current *Channel) (Draft, error) {
+	if draft.Input.SRT == nil {
+		if draft.PassphraseIntent == PassphraseSet || draft.PassphraseIntent == PassphraseClear {
+			return Draft{}, invalid("passphrase intent requires SRT input settings")
+		}
+		return draft, nil
+	}
+	switch draft.PassphraseIntent {
+	case PassphraseUnspecified, PassphraseSet:
+	case PassphraseKeep:
+		draft.Input.SRT.Passphrase = ""
+		if current != nil && current.Input.SRT != nil {
+			draft.Input.SRT.Passphrase = current.Input.SRT.Passphrase
+		}
+	case PassphraseClear:
+		draft.Input.SRT.Passphrase = ""
+	default:
+		return Draft{}, invalid("unsupported passphrase intent")
+	}
+	return draft, nil
 }
 
 func sameAppliedConfiguration(current Channel, draft Draft) bool {
@@ -258,11 +332,13 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	if item.ApplyState != ApplyDeleting {
+		previousRevision := item.Revision
 		item.Enabled = false
 		item.ApplyState = ApplyDeleting
 		item.ApplyError = ""
+		item.Revision++
 		item.UpdatedAt = s.now().UTC()
-		if err := s.store.Update(ctx, item); err != nil {
+		if err := s.store.Update(ctx, item, previousRevision); err != nil {
 			return err
 		}
 	}
@@ -277,11 +353,11 @@ func (s *Service) finishDelete(ctx context.Context, item Channel) error {
 	mediaErr := s.media.DeletePath(ctx, item.Path)
 	cleanupErr := errors.Join(relayErr, errorWithPrefix("remove MediaMTX path", mediaErr))
 	if cleanupErr != nil {
-		_ = s.store.SetApplyResult(ctx, item.ID, ApplyDeleting, cleanupErr.Error())
+		_ = s.store.SetApplyResult(ctx, item.ID, item.Revision, ApplyDeleting, cleanupErr.Error())
 		return errors.Join(ErrDeleting, cleanupErr)
 	}
-	if err := s.store.Delete(ctx, item.ID); err != nil {
-		_ = s.store.SetApplyResult(ctx, item.ID, ApplyDeleting, err.Error())
+	if err := s.store.Delete(ctx, item.ID, item.Revision); err != nil {
+		_ = s.store.SetApplyResult(ctx, item.ID, item.Revision, ApplyDeleting, err.Error())
 		return errors.Join(ErrDeleting, err)
 	}
 	return nil
@@ -455,7 +531,7 @@ func (s *Service) applyResult(ctx context.Context, item Channel, applyErr error)
 	if applyErr != nil {
 		item.ApplyState = ApplyError
 		item.ApplyError = applyErr.Error()
-		if err := s.store.SetApplyResult(ctx, item.ID, item.ApplyState, item.ApplyError); err != nil {
+		if err := s.store.SetApplyResult(ctx, item.ID, item.Revision, item.ApplyState, item.ApplyError); err != nil {
 			return item, errors.Join(applyErr, err)
 		}
 		return item, applyErr
@@ -463,7 +539,7 @@ func (s *Service) applyResult(ctx context.Context, item Channel, applyErr error)
 
 	item.ApplyState = ApplyApplied
 	item.ApplyError = ""
-	if err := s.store.SetApplyResult(ctx, item.ID, item.ApplyState, ""); err != nil {
+	if err := s.store.SetApplyResult(ctx, item.ID, item.Revision, item.ApplyState, ""); err != nil {
 		return item, err
 	}
 	return item, nil

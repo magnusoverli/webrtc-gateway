@@ -58,6 +58,7 @@ type Input struct {
 
 type Channel struct {
 	ID                   string     `json:"id"`
+	Revision             int        `json:"revision"`
 	Number               int        `json:"number"`
 	Name                 string     `json:"name"`
 	Path                 string     `json:"path"`
@@ -73,17 +74,30 @@ type Channel struct {
 }
 
 type Draft struct {
-	Name                 string
-	Enabled              bool
-	AutomaticPreview     bool
-	Input                Input
-	MaxReaders           int
-	UseAbsoluteTimestamp bool
+	Name                         string
+	Enabled                      bool
+	AutomaticPreview             bool
+	PreserveAutomaticPreview     bool
+	Input                        Input
+	PassphraseIntent             PassphraseIntent
+	MaxReaders                   int
+	UseAbsoluteTimestamp         bool
+	PreserveUseAbsoluteTimestamp bool
 }
+
+type PassphraseIntent uint8
+
+const (
+	PassphraseUnspecified PassphraseIntent = iota
+	PassphraseKeep
+	PassphraseSet
+	PassphraseClear
+)
 
 var pathCleaner = regexp.MustCompile(`[^a-z0-9]+`)
 var ErrInvalid = errors.New("invalid channel")
 var ErrDeleting = errors.New("channel deletion is pending")
+var ErrRevisionConflict = errors.New("channel revision conflict")
 
 func New(draft Draft, now time.Time) (Channel, error) {
 	draft, err := ValidateDraft(draft)
@@ -98,6 +112,7 @@ func New(draft Draft, now time.Time) (Channel, error) {
 
 	return Channel{
 		ID:                   id,
+		Revision:             1,
 		Name:                 draft.Name,
 		Path:                 pathFor(draft.Name, id),
 		Enabled:              draft.Enabled,

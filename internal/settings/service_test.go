@@ -283,6 +283,32 @@ func TestPendingSettingsRetryForcesCompleteChannelReconcile(t *testing.T) {
 	}
 }
 
+func TestServiceRejectsStaleExpectedRevision(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	current, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(store, &fakeGlobalManager{config: globalConfig(current)}, nil, nil)
+	current.LogLevel = "debug"
+	updated, err := service.UpdateExpected(context.Background(), current, current.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated.LogLevel = "error"
+	if _, err := service.UpdateExpected(context.Background(), updated, 1); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale UpdateExpected() error = %v", err)
+	}
+	persisted, err := store.Get(context.Background())
+	if err != nil || persisted.Revision != 2 || persisted.LogLevel != "debug" {
+		t.Fatalf("persisted settings = %#v, %v", persisted, err)
+	}
+}
+
 func globalConfig(value Settings) mediamtx.GlobalConfig {
 	return mediamtx.GlobalConfig{
 		LogLevel: value.LogLevel, ReadTimeout: value.ReadTimeout, WriteTimeout: value.WriteTimeout,

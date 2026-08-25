@@ -2,7 +2,9 @@ package settings
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,7 +24,9 @@ func TestSQLiteStoreInitializesAndPersistsSettings(t *testing.T) {
 	value.ManagementBindAddress = "interface:ipv4:eth0"
 	value.MediaBindAddress = "interface:ipv4:eth0"
 	value.ApplyState = ApplyApplied
-	if err := store.Update(context.Background(), value); err != nil {
+	previousRevision := value.Revision
+	value.Revision++
+	if err := store.Update(context.Background(), value, previousRevision); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
 	store.Close()
@@ -36,6 +40,63 @@ func TestSQLiteStoreInitializesAndPersistsSettings(t *testing.T) {
 	if err != nil || loaded.LogLevel != "debug" || loaded.ApplyState != ApplyApplied ||
 		loaded.ManagementBindAddress != "interface:ipv4:eth0" || loaded.MediaBindAddress != "interface:ipv4:eth0" {
 		t.Fatalf("persisted settings = %#v, %v", loaded, err)
+	}
+}
+
+func TestSQLiteStoreMigratesRevisionAndProtectsCurrentGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := Defaults(time.Now())
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE global_settings (
+		id INTEGER PRIMARY KEY CHECK (id = 1), settings_json TEXT NOT NULL,
+		apply_state TEXT NOT NULL, apply_error TEXT NOT NULL, updated_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO global_settings VALUES (1, ?, ?, '', ?)`,
+		string(encoded), ApplyPending, legacy.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	current, err := store.Get(context.Background())
+	if err != nil || current.Revision != 1 {
+		t.Fatalf("migrated settings = %#v, %v", current, err)
+	}
+	next := current
+	next.LogLevel = "debug"
+	next.Revision = 2
+	if err := store.Update(context.Background(), next, 1); err != nil {
+		t.Fatal(err)
+	}
+	stale := current
+	stale.LogLevel = "error"
+	stale.Revision = 2
+	if err := store.Update(context.Background(), stale, 1); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("stale Update() error = %v", err)
+	}
+	if err := store.SetApplyResult(context.Background(), 1, ApplyError, "old failure"); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("old SetApplyResult() error = %v", err)
+	}
+	loaded, err := store.Get(context.Background())
+	if err != nil || loaded.Revision != 2 || loaded.LogLevel != "debug" || loaded.ApplyState != ApplyPending {
+		t.Fatalf("settings after stale writes = %#v, %v", loaded, err)
 	}
 }
 

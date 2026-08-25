@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -196,5 +198,154 @@ func TestReplaceAndDeletePath(t *testing.T) {
 	}
 	if global.LogLevel != "debug" || global.WriteQueueSize != 1024 || global.WebRTCLocalUDPAddress != ":8189" || len(global.WebRTCIPsFromInterfacesList) != 1 || global.WebRTCIPsFromInterfacesList[0] != "wlan0" {
 		t.Fatalf("global config = %#v", global)
+	}
+}
+
+func TestClientCoalescesConcurrentStatusAndGlobalReads(t *testing.T) {
+	var infoReads atomic.Int32
+	var configReads atomic.Int32
+	var runtimeReads atomic.Int32
+	var globalReads atomic.Int32
+	releaseInfo := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		infoReads.Add(1)
+		<-releaseInfo
+		fmt.Fprint(w, `{"started":"start-1","version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		configReads.Add(1)
+		fmt.Fprint(w, `{"items":[{"name":"demo","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		runtimeReads.Add(1)
+		fmt.Fprint(w, `{"items":[{"name":"demo","available":true,"online":true}]}`)
+	})
+	mux.HandleFunc("GET /v3/config/global/get", func(w http.ResponseWriter, _ *http.Request) {
+		globalReads.Add(1)
+		fmt.Fprint(w, `{"logLevel":"info"}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 12
+	start := make(chan struct{})
+	errorsSeen := make(chan error, callers)
+	var wait sync.WaitGroup
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, callErr := client.Status(context.Background())
+			errorsSeen <- callErr
+		}()
+	}
+	close(start)
+	time.Sleep(20 * time.Millisecond)
+	close(releaseInfo)
+	wait.Wait()
+	close(errorsSeen)
+	for callErr := range errorsSeen {
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+	}
+	if infoReads.Load() != 1 || configReads.Load() != 1 || runtimeReads.Load() != 1 {
+		t.Fatalf("status reads = info %d, config %d, runtime %d", infoReads.Load(), configReads.Load(), runtimeReads.Load())
+	}
+
+	start = make(chan struct{})
+	errorsSeen = make(chan error, callers)
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, callErr := client.GetGlobal(context.Background())
+			errorsSeen <- callErr
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsSeen)
+	for callErr := range errorsSeen {
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+	}
+	if globalReads.Load() != 1 {
+		t.Fatalf("global reads = %d, want 1", globalReads.Load())
+	}
+}
+
+func TestClientRuntimeCacheExpiresAndMutationInvalidatesCaches(t *testing.T) {
+	var runtimeOnline atomic.Bool
+	runtimeOnline.Store(true)
+	var runtimeReads atomic.Int32
+	var globalReads atomic.Int32
+	var globalMu sync.Mutex
+	global := GlobalConfig{LogLevel: "info"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"started":"start-1","version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"demo","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		runtimeReads.Add(1)
+		fmt.Fprintf(w, `{"items":[{"name":"demo","available":%t,"online":%t}]}`, runtimeOnline.Load(), runtimeOnline.Load())
+	})
+	mux.HandleFunc("GET /v3/config/global/get", func(w http.ResponseWriter, _ *http.Request) {
+		globalReads.Add(1)
+		globalMu.Lock()
+		defer globalMu.Unlock()
+		_ = json.NewEncoder(w).Encode(global)
+	})
+	mux.HandleFunc("PATCH /v3/config/global/patch", func(w http.ResponseWriter, r *http.Request) {
+		var next GlobalConfig
+		if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
+			t.Errorf("decode patch: %v", err)
+		}
+		globalMu.Lock()
+		global = next
+		globalMu.Unlock()
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := client.Status(context.Background())
+	if err != nil || !status.Channels[0].Online {
+		t.Fatalf("initial Status() = %#v, %v", status, err)
+	}
+	runtimeOnline.Store(false)
+	time.Sleep(runtimeCacheTTL + 50*time.Millisecond)
+	status, err = client.Status(context.Background())
+	if err != nil || status.Channels[0].Online || runtimeReads.Load() != 2 {
+		t.Fatalf("fresh Status() = %#v, %v, runtime reads %d", status, err, runtimeReads.Load())
+	}
+
+	current, err := client.GetGlobal(context.Background())
+	if err != nil || current.LogLevel != "info" {
+		t.Fatalf("GetGlobal() = %#v, %v", current, err)
+	}
+	if _, err := client.GetGlobal(context.Background()); err != nil || globalReads.Load() != 1 {
+		t.Fatalf("cached GetGlobal() error = %v, reads %d", err, globalReads.Load())
+	}
+	if err := client.PatchGlobal(context.Background(), GlobalConfig{LogLevel: "debug"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err = client.GetGlobal(context.Background())
+	if err != nil || current.LogLevel != "debug" || globalReads.Load() != 2 {
+		t.Fatalf("invalidated GetGlobal() = %#v, %v, reads %d", current, err, globalReads.Load())
 	}
 }
