@@ -24,15 +24,19 @@ let socket;
 
 async function cleanup() {
   if (socket?.readyState === WebSocket.OPEN) socket.close();
-  if (browser && browser.exitCode === null) {
+  if (browser && browser.exitCode === null && browser.signalCode === null) {
+    const exited = new Promise((resolve) => browser.once("exit", resolve));
     browser.kill("SIGTERM");
     await Promise.race([
-      new Promise((resolve) => browser.once("exit", resolve)),
+      exited,
       new Promise((resolve) => setTimeout(resolve, 2_000)),
     ]);
-    if (browser.exitCode === null) browser.kill("SIGKILL");
+    if (browser.exitCode === null && browser.signalCode === null) {
+      browser.kill("SIGKILL");
+      await exited;
+    }
   }
-  await rm(profile, { recursive: true, force: true });
+  await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 try {
