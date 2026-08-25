@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -31,13 +32,14 @@ type Client struct {
 }
 
 type cacheEntry struct {
-	data      []byte
+	value     any
+	err       error
 	expiresAt time.Time
 }
 
 type cacheCall struct {
 	done  chan struct{}
-	data  []byte
+	value any
 	err   error
 	epoch uint64
 }
@@ -157,12 +159,12 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 
-	configs, err := getAllPages[PathConfig](ctx, c, "/v3/config/paths/list", staticCacheTTL)
+	configs, err := getAllPages(ctx, c, "/v3/config/paths/list", staticCacheTTL, clonePageResponse[PathConfig])
 	if err != nil {
 		return Status{}, err
 	}
 
-	runtimePaths, err := getAllPages[Path](ctx, c, "/v3/paths/list", runtimeCacheTTL)
+	runtimePaths, err := getAllPages(ctx, c, "/v3/paths/list", runtimeCacheTTL, clonePathPage)
 	if err != nil {
 		return Status{}, err
 	}
@@ -205,19 +207,11 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 }
 
 func (c *Client) Info(ctx context.Context) (Info, error) {
-	var info Info
-	if err := c.getCached(ctx, "/v3/info", staticCacheTTL, &info); err != nil {
-		return Info{}, err
-	}
-	return info, nil
+	return getCached(ctx, c, "/v3/info", staticCacheTTL, func(info Info) Info { return info })
 }
 
 func (c *Client) GetGlobal(ctx context.Context) (GlobalConfig, error) {
-	var config GlobalConfig
-	if err := c.getCached(ctx, "/v3/config/global/get", staticCacheTTL, &config); err != nil {
-		return GlobalConfig{}, err
-	}
-	return config, nil
+	return getCached(ctx, c, "/v3/config/global/get", staticCacheTTL, cloneGlobalConfig)
 }
 
 func (c *Client) Reachable(ctx context.Context) error {
@@ -238,26 +232,17 @@ func (c *Client) PatchGlobal(ctx context.Context, config GlobalConfig) error {
 	return c.mutate(ctx, http.MethodPatch, "/v3/config/global/patch", config, false)
 }
 
-func (c *Client) get(ctx context.Context, endpoint string, target any) error {
+func getCached[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(T) T) (T, error) {
 	requestURL := c.endpointURL(endpoint)
-	data, err := c.fetch(ctx, endpoint, requestURL)
-	if err != nil {
-		return err
-	}
-	return decodeResponse(endpoint, data, target)
+	return getURLCached(ctx, c, endpoint, requestURL, ttl, clone)
 }
 
-func (c *Client) getCached(ctx context.Context, endpoint string, ttl time.Duration, target any) error {
-	requestURL := c.endpointURL(endpoint)
-	return c.getURLCached(ctx, endpoint, requestURL, ttl, target)
-}
-
-func (c *Client) getPage(ctx context.Context, endpoint string, pageNumber int, ttl time.Duration, target any) error {
+func getPage[T any](ctx context.Context, c *Client, endpoint string, pageNumber int, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (pageResponse[T], error) {
 	requestURL := c.endpointURL(endpoint)
 	query := requestURL.Query()
 	query.Set("page", strconv.Itoa(pageNumber))
 	requestURL.RawQuery = query.Encode()
-	return c.getURLCached(ctx, endpoint, requestURL, ttl, target)
+	return getURLCached(ctx, c, endpoint, requestURL, ttl, clone)
 }
 
 func (c *Client) endpointURL(endpoint string) url.URL {
@@ -266,25 +251,30 @@ func (c *Client) endpointURL(endpoint string) url.URL {
 	return requestURL
 }
 
-func (c *Client) getURLCached(ctx context.Context, endpoint string, requestURL url.URL, ttl time.Duration, target any) error {
+func getURLCached[T any](ctx context.Context, c *Client, endpoint string, requestURL url.URL, ttl time.Duration, clone func(T) T) (T, error) {
+	var zero T
 	key := requestURL.String()
 	now := time.Now()
 	c.cacheMu.Lock()
 	if cached, ok := c.cache[key]; ok && now.Before(cached.expiresAt) {
-		data := cached.data
+		if cached.err != nil {
+			c.cacheMu.Unlock()
+			return zero, cached.err
+		}
+		value := cached.value.(T)
 		c.cacheMu.Unlock()
-		return decodeResponse(endpoint, data, target)
+		return clone(value), nil
 	}
 	if call := c.inflight[key]; call != nil && call.epoch == c.epoch {
 		c.cacheMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return zero, ctx.Err()
 		case <-call.done:
 			if call.err != nil {
-				return call.err
+				return zero, call.err
 			}
-			return decodeResponse(endpoint, call.data, target)
+			return clone(call.value.(T)), nil
 		}
 	}
 	epoch := c.epoch
@@ -293,21 +283,26 @@ func (c *Client) getURLCached(ctx context.Context, endpoint string, requestURL u
 	c.cacheMu.Unlock()
 
 	data, err := c.fetch(ctx, endpoint, requestURL)
+	fetched := err == nil
+	var value T
+	if fetched {
+		err = decodeResponse(endpoint, data, &value)
+	}
 	c.cacheMu.Lock()
-	call.data = data
+	call.value = value
 	call.err = err
 	if c.inflight[key] == call {
 		delete(c.inflight, key)
 	}
-	if err == nil && c.epoch == epoch {
-		c.cache[key] = cacheEntry{data: data, expiresAt: time.Now().Add(ttl)}
+	if fetched && c.epoch == epoch {
+		c.cache[key] = cacheEntry{value: value, err: err, expiresAt: time.Now().Add(ttl)}
 	}
 	close(call.done)
 	c.cacheMu.Unlock()
 	if err != nil {
-		return err
+		return zero, err
 	}
-	return decodeResponse(endpoint, data, target)
+	return clone(value), nil
 }
 
 func (c *Client) fetch(ctx context.Context, endpoint string, requestURL url.URL) ([]byte, error) {
@@ -339,16 +334,18 @@ func decodeResponse(endpoint string, data []byte, target any) error {
 	return nil
 }
 
-func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration) ([]T, error) {
+type pageResponse[T any] struct {
+	ItemCount int `json:"itemCount"`
+	PageCount int `json:"pageCount"`
+	Items     []T `json:"items"`
+}
+
+func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) ([]T, error) {
 	items := []T(nil)
 	pageCount := 1
 	for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
-		var response struct {
-			ItemCount int `json:"itemCount"`
-			PageCount int `json:"pageCount"`
-			Items     []T `json:"items"`
-		}
-		if err := c.getPage(ctx, endpoint, pageNumber, ttl, &response); err != nil {
+		response, err := getPage(ctx, c, endpoint, pageNumber, ttl, clone)
+		if err != nil {
 			return nil, err
 		}
 		if pageNumber == 0 {
@@ -362,6 +359,72 @@ func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl tim
 		items = append(items, response.Items...)
 	}
 	return items, nil
+}
+
+func clonePageResponse[T any](response pageResponse[T]) pageResponse[T] {
+	response.Items = slices.Clone(response.Items)
+	return response
+}
+
+func clonePathPage(response pageResponse[Path]) pageResponse[Path] {
+	response.Items = slices.Clone(response.Items)
+	for i := range response.Items {
+		response.Items[i] = clonePath(response.Items[i])
+	}
+	return response
+}
+
+func cloneGlobalConfig(config GlobalConfig) GlobalConfig {
+	config.WebRTCIPsFromInterfacesList = slices.Clone(config.WebRTCIPsFromInterfacesList)
+	config.WebRTCAdditionalHosts = slices.Clone(config.WebRTCAdditionalHosts)
+	return config
+}
+
+func clonePath(item Path) Path {
+	if item.AvailableTime != nil {
+		value := *item.AvailableTime
+		item.AvailableTime = &value
+	}
+	if item.OnlineTime != nil {
+		value := *item.OnlineTime
+		item.OnlineTime = &value
+	}
+	if item.Source != nil {
+		value := *item.Source
+		item.Source = &value
+	}
+	item.Readers = slices.Clone(item.Readers)
+	item.Tracks = slices.Clone(item.Tracks)
+	for i := range item.Tracks {
+		item.Tracks[i].CodecProps = cloneJSONMap(item.Tracks[i].CodecProps)
+	}
+	return item
+}
+
+func cloneJSONMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = cloneJSONValue(value)
+	}
+	return cloned
+}
+
+func cloneJSONValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneJSONMap(value)
+	case []any:
+		cloned := make([]any, len(value))
+		for i := range value {
+			cloned[i] = cloneJSONValue(value[i])
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 func (c *Client) mutate(ctx context.Context, method, endpoint string, body any, allowNotFound bool) error {
