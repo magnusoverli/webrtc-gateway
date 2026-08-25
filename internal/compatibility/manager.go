@@ -23,7 +23,11 @@ import (
 
 const pathPrefix = "compat-"
 
-const workerStartupTimeout = 8 * time.Second
+const (
+	metadataGrace        = 8 * time.Second
+	probeRetryDelay      = 3 * time.Second
+	workerStartupTimeout = 8 * time.Second
+)
 
 const (
 	StateOffline  = "offline"
@@ -88,15 +92,24 @@ type Manager struct {
 	activeInterval time.Duration
 	encoderThreads int
 	workerCapacity int
+	probeVideo     func(context.Context, string) (videoCharacteristics, error)
+	now            func() time.Time
 
-	mu      sync.RWMutex
-	entries map[string]*entry
-	closed  bool
-	workers sync.WaitGroup
+	mu             sync.RWMutex
+	entries        map[string]*entry
+	nextGeneration uint64
+	nextProbeTask  uint64
+	closed         bool
+	workers        sync.WaitGroup
 }
 
 type entry struct {
 	fingerprint             string
+	generation              uint64
+	srt                     bool
+	metadataDeadline        time.Time
+	probe                   *probeTask
+	outputResetPending      bool
 	classified              bool
 	decision                decision
 	state                   State
@@ -104,6 +117,14 @@ type entry struct {
 	retryAt                 time.Time
 	compatLimit             int
 	compatAbsoluteTimestamp bool
+}
+
+type probeTask struct {
+	id         uint64
+	generation uint64
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 type worker struct {
@@ -220,7 +241,7 @@ func (m *Manager) nextInterval() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, item := range m.entries {
-		if item.state.State == StateProbing || item.state.State == StateStarting {
+		if item.state.State == StateProbing || item.state.State == StateStarting || item.probe != nil {
 			return m.activeInterval
 		}
 	}
@@ -231,10 +252,12 @@ func (m *Manager) Close() {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
+		m.workers.Wait()
 		return
 	}
 	m.closed = true
 	for _, item := range m.entries {
+		cancelProbeLocked(item)
 		stopWorkerLocked(item)
 	}
 	m.mu.Unlock()
@@ -271,6 +294,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 		if _, ok := seen[id]; ok {
 			continue
 		}
+		cancelProbeLocked(item)
 		stopWorkerLocked(item)
 		delete(m.entries, id)
 	}
@@ -296,7 +320,7 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 	}
 
 	if item.Input.Mode != channel.InputSRTPush && item.Input.Mode != channel.InputSRTPull {
-		m.setDirect(item.ID, item.Path, fingerprint(raw), decision{})
+		m.setDirect(item.ID, item.Path, fingerprint(raw), decision{}, false)
 		if _, ok := byPath[compatPath]; ok {
 			if err := m.media.DeletePath(ctx, compatPath); err != nil {
 				m.logger.Warn("stale compatibility path cleanup failed", "channel", item.ID, "path", compatPath, "error", err)
@@ -306,59 +330,118 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 	}
 
 	fingerprint := fingerprint(raw)
-	if !tracksMetadataReady(raw.Tracks) {
-		m.resetForProbe(item.ID, item.Path, fingerprint)
+	now := m.nowTime()
+	tracks := cloneTracks(raw.Tracks)
+	m.mu.Lock()
+	current := m.entryLocked(item.ID)
+	if current.fingerprint != fingerprint || !current.srt {
+		cancelProbeLocked(current)
+		stopWorkerLocked(current)
+		m.nextGeneration++
+		current.fingerprint = fingerprint
+		current.generation = m.nextGeneration
+		current.srt = true
+		current.metadataDeadline = now.Add(metadataGrace)
+		current.classified = false
+		current.decision = decision{}
+		current.retryAt = time.Time{}
+		current.outputResetPending = byPath[compatPath].Name != ""
+		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
+	}
+	if current.outputResetPending {
+		if !current.retryAt.IsZero() && now.Before(current.retryAt) {
+			m.mu.Unlock()
+			return
+		}
+		generation := current.generation
+		m.mu.Unlock()
+		err := m.media.DeletePath(ctx, compatPath)
+		m.mu.Lock()
+		current = m.entries[item.ID]
+		if current != nil && current.generation == generation && current.outputResetPending {
+			if err != nil {
+				current.retryAt = m.nowTime().Add(probeRetryDelay)
+				current.state.State = StateError
+				current.state.LastError = fmt.Sprintf("reset compatibility output: %v", err)
+			} else {
+				current.outputResetPending = false
+				current.retryAt = time.Time{}
+			}
+		}
+		m.mu.Unlock()
 		return
 	}
-	m.mu.RLock()
-	current := m.entries[item.ID]
-	sameFingerprint := current != nil && current.fingerprint == fingerprint
-	known := sameFingerprint && current.classified
-	retryAt := time.Time{}
-	knownDecision := decision{}
-	if sameFingerprint {
-		retryAt = current.retryAt
-		knownDecision = current.decision
-	}
-	m.mu.RUnlock()
-	if known {
+	if current.classified {
+		knownDecision := current.decision
+		m.mu.Unlock()
 		if knownDecision.required {
 			m.ensureTranscoded(ctx, item, knownDecision, byPath[compatPath])
 		} else {
-			m.setDirect(item.ID, item.Path, fingerprint, knownDecision)
+			m.setDirect(item.ID, item.Path, fingerprint, knownDecision, true)
 			if _, ok := byPath[compatPath]; ok {
 				_ = m.media.DeletePath(ctx, compatPath)
 			}
 		}
 		return
 	}
-	if !retryAt.IsZero() && time.Now().Before(retryAt) {
+	if current.probe != nil || (!tracksMetadataReady(tracks) && now.Before(current.metadataDeadline)) || (!current.retryAt.IsZero() && now.Before(current.retryAt)) {
+		m.mu.Unlock()
 		return
 	}
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.nextProbeTask++
+	probeCtx, cancel := context.WithCancel(ctx)
+	task := &probeTask{id: m.nextProbeTask, generation: current.generation, ctx: probeCtx, cancel: cancel, done: make(chan struct{})}
+	current.probe = task
+	if current.state.LastError == "" {
+		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
+	}
+	m.workers.Add(1)
+	m.mu.Unlock()
+	go m.runProbe(item.ID, item.Path, fingerprint, task, tracks)
+}
 
-	m.resetForProbe(item.ID, item.Path, fingerprint)
-	probeURL := m.pathURL(item.Path)
-	result, err := classifyTracks(ctx, raw.Tracks, func(ctx context.Context) (videoCharacteristics, error) {
+func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask, tracks []mediamtx.Track) {
+	defer m.workers.Done()
+	defer task.cancel()
+	defer close(task.done)
+	probeURL := m.pathURL(path)
+	result, err := classifyTracks(task.ctx, tracks, func(ctx context.Context) (videoCharacteristics, error) {
+		if m.probeVideo != nil {
+			return m.probeVideo(ctx, probeURL)
+		}
 		return m.probeVideoCharacteristics(ctx, probeURL)
 	})
-	if err != nil {
-		m.setClassificationError(item.ID, err)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.entries[channelID]
+	if current == nil || current.generation != task.generation || current.fingerprint != fingerprint || current.probe != task || current.probe.id != task.id || task.ctx.Err() != nil {
 		return
 	}
-	m.mu.Lock()
-	current = m.entries[item.ID]
-	if current == nil || current.fingerprint != fingerprint {
-		m.mu.Unlock()
+	current.probe = nil
+	if err != nil {
+		current.classified = false
+		current.retryAt = m.nowTime().Add(probeRetryDelay)
+		current.state.State = StateError
+		current.state.LastError = err.Error()
 		return
 	}
 	current.classified = true
 	current.decision = result
-	m.mu.Unlock()
+	current.retryAt = time.Time{}
 	if result.required {
-		m.ensureTranscoded(ctx, item, result, byPath[compatPath])
-	} else {
-		m.setDirect(item.ID, item.Path, fingerprint, result)
+		current.state = State{
+			State: StateStarting, Mode: ModeTranscoded, Required: true,
+			Reasons: append([]string(nil), result.reasons...), OutputPath: CompatibilityPath(channelID),
+			InputFingerprint: fingerprint,
+		}
+		return
 	}
+	current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
 }
 
 func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, result decision, output mediamtx.Channel) {
@@ -366,7 +449,14 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	m.mu.RLock()
 	current := m.entries[item.ID]
 	refreshPath := current == nil || current.compatLimit != item.MaxReaders || current.compatAbsoluteTimestamp != item.UseAbsoluteTimestamp
+	retryAt := time.Time{}
+	if current != nil {
+		retryAt = current.retryAt
+	}
 	m.mu.RUnlock()
+	if !retryAt.IsZero() && m.nowTime().Before(retryAt) {
+		return
+	}
 	if output.Name == "" || refreshPath {
 		if err := m.media.ReplacePath(ctx, compatPath, mediamtx.PathConfig{
 			Source: "publisher", MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
@@ -378,18 +468,30 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		if current := m.entries[item.ID]; current != nil {
 			current.compatLimit = item.MaxReaders
 			current.compatAbsoluteTimestamp = item.UseAbsoluteTimestamp
+			current.retryAt = time.Time{}
 		}
 		m.mu.Unlock()
 	}
 
 	m.mu.Lock()
 	current = m.entries[item.ID]
-	if current == nil || current.fingerprint == "" {
+	if m.closed || current == nil || current.fingerprint == "" {
+		m.mu.Unlock()
+		return
+	}
+	workerRunning := current.worker != nil && !current.worker.stopping
+	if workerRunning && output.Available && output.Online {
+		current.state = State{
+			State: StateReady, Mode: ModeTranscoded, Required: true,
+			Reasons: append([]string(nil), result.reasons...), OutputPath: compatPath, InputFingerprint: current.fingerprint,
+			Worker: WorkerState{Running: workerRunning, Restarts: current.state.Worker.Restarts},
+		}
+		current.retryAt = time.Time{}
 		m.mu.Unlock()
 		return
 	}
 	waitingCapacity := false
-	if current.worker == nil && (current.retryAt.IsZero() || !time.Now().Before(current.retryAt)) {
+	if current.worker == nil && (current.retryAt.IsZero() || !m.nowTime().Before(current.retryAt)) {
 		reservation := m.workerReservation(result.workerUnits)
 		if m.usedWorkerCapacityLocked()+reservation <= m.workerCapacity {
 			m.startWorkerLocked(ctx, item, current, result, reservation)
@@ -400,7 +502,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 			}
 		}
 	}
-	if current.worker != nil && !current.worker.stopping && !output.Available && time.Since(current.worker.started) >= workerStartupTimeout {
+	if current.worker != nil && !current.worker.stopping && (!output.Available || !output.Online) && m.nowTime().Sub(current.worker.started) >= workerStartupTimeout {
 		detail := fmt.Sprintf("compatibility output did not become ready within %s", workerStartupTimeout)
 		restarts := current.state.Worker.Restarts + 1
 		current.state = State{
@@ -409,23 +511,19 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 			Worker: WorkerState{Restarts: restarts, Error: detail}, OutputPath: compatPath,
 			InputFingerprint: current.fingerprint,
 		}
-		current.retryAt = time.Now().Add(retryDelay(restarts))
+		current.retryAt = m.nowTime().Add(retryDelay(restarts))
 		stopWorkerLocked(current)
 		m.logger.Warn("compatibility worker startup timed out", "channel", item.ID, "timeout", workerStartupTimeout)
 		m.mu.Unlock()
 		return
 	}
-	workerRunning := current.worker != nil && !current.worker.stopping
+	workerRunning = current.worker != nil && !current.worker.stopping
 	workerState := StateStarting
-	if !workerRunning && !waitingCapacity && current.state.Worker.Error != "" {
+	if current.state.LastError != "" {
 		workerState = StateError
 	}
 	lastError := current.state.LastError
 	workerError := current.state.Worker.Error
-	if waitingCapacity {
-		lastError = ""
-		workerError = ""
-	}
 	current.state = State{
 		State: workerState, Mode: ModeTranscoded, Required: true,
 		Reasons: append([]string(nil), result.reasons...), OutputPath: compatPath, InputFingerprint: current.fingerprint,
@@ -434,11 +532,6 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 			Running: workerRunning, Queued: waitingCapacity,
 			Restarts: current.state.Worker.Restarts, Error: workerError,
 		},
-	}
-	if workerRunning && output.Available && output.Online {
-		current.state.State = StateReady
-		current.state.LastError = ""
-		current.state.Worker.Error = ""
 	}
 	m.mu.Unlock()
 }
@@ -459,13 +552,13 @@ func (m *Manager) startWorkerLocked(ctx context.Context, item channel.Channel, c
 	cmd.WaitDelay = 3 * time.Second
 	if err := cmd.Start(); err != nil {
 		cancel()
-		current.retryAt = time.Now().Add(retryDelay(current.state.Worker.Restarts))
+		current.retryAt = m.nowTime().Add(retryDelay(current.state.Worker.Restarts))
 		current.state.LastError = err.Error()
 		current.state.Worker.Error = err.Error()
 		current.state.Worker.Restarts++
 		return
 	}
-	running := &worker{cancel: cancel, cmd: cmd, stderr: stderr, started: time.Now(), units: reservation}
+	running := &worker{cancel: cancel, cmd: cmd, stderr: stderr, started: m.nowTime(), units: reservation}
 	current.worker = running
 	current.retryAt = time.Time{}
 	m.workers.Add(1)
@@ -516,7 +609,7 @@ func (m *Manager) waitWorker(channelID string, running *worker) {
 	current.state.Worker.Running = false
 	current.state.Worker.Error = detail
 	current.state.Worker.Restarts++
-	current.retryAt = time.Now().Add(retryDelay(current.state.Worker.Restarts))
+	current.retryAt = m.nowTime().Add(retryDelay(current.state.Worker.Restarts))
 	m.logger.Warn("compatibility worker stopped", "channel", channelID, "error", detail)
 }
 
@@ -524,44 +617,33 @@ func (m *Manager) setInactive(channelID, path, state string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := m.entryLocked(channelID)
+	cancelProbeLocked(current)
 	stopWorkerLocked(current)
 	current.fingerprint = ""
+	current.srt = false
+	current.outputResetPending = false
 	current.classified = false
 	current.retryAt = time.Time{}
 	current.state = State{State: state, Mode: ModeDirect, Reasons: []string{}, OutputPath: path}
 }
 
-func (m *Manager) setDirect(channelID, path, fingerprint string, result decision) {
+func (m *Manager) setDirect(channelID, path, fingerprint string, result decision, srt bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := m.entryLocked(channelID)
+	if current.srt && !srt {
+		m.nextGeneration++
+		current.generation = m.nextGeneration
+	}
+	cancelProbeLocked(current)
 	stopWorkerLocked(current)
 	current.fingerprint = fingerprint
+	current.srt = srt
+	current.outputResetPending = false
 	current.classified = true
 	current.decision = result
 	current.retryAt = time.Time{}
 	current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
-}
-
-func (m *Manager) resetForProbe(channelID, path, fingerprint string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current := m.entryLocked(channelID)
-	stopWorkerLocked(current)
-	current.fingerprint = fingerprint
-	current.classified = false
-	current.retryAt = time.Time{}
-	current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
-}
-
-func (m *Manager) setClassificationError(channelID string, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current := m.entryLocked(channelID)
-	current.classified = false
-	current.retryAt = time.Now().Add(3 * time.Second)
-	current.state.State = StateError
-	current.state.LastError = err.Error()
 }
 
 func (m *Manager) setWorkerError(channelID, outputPath string, result decision, err error) {
@@ -574,7 +656,7 @@ func (m *Manager) setWorkerError(channelID, outputPath string, result decision, 
 		Worker: WorkerState{Restarts: current.state.Worker.Restarts, Error: err.Error()}, OutputPath: outputPath,
 		InputFingerprint: current.fingerprint,
 	}
-	current.retryAt = time.Now().Add(3 * time.Second)
+	current.retryAt = m.nowTime().Add(probeRetryDelay)
 }
 
 func (m *Manager) entryLocked(channelID string) *entry {
@@ -597,6 +679,36 @@ func stopWorkerLocked(current *entry) {
 	running.stopping = true
 	current.state.Worker.Running = false
 	running.cancel()
+}
+
+func cancelProbeLocked(current *entry) {
+	if current.probe == nil {
+		return
+	}
+	task := current.probe
+	current.probe = nil
+	task.cancel()
+}
+
+func cloneTracks(tracks []mediamtx.Track) []mediamtx.Track {
+	result := make([]mediamtx.Track, len(tracks))
+	for index, track := range tracks {
+		result[index] = track
+		if track.CodecProps != nil {
+			result[index].CodecProps = make(map[string]any, len(track.CodecProps))
+			for name, value := range track.CodecProps {
+				result[index].CodecProps[name] = value
+			}
+		}
+	}
+	return result
+}
+
+func (m *Manager) nowTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
 }
 
 func classifyTracks(ctx context.Context, tracks []mediamtx.Track, probeVideo func(context.Context) (videoCharacteristics, error)) (decision, error) {

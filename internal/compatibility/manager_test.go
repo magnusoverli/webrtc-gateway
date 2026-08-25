@@ -6,10 +6,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -419,6 +421,333 @@ func TestTracksMetadataReadyWaitsForVideoProperties(t *testing.T) {
 	}
 }
 
+func TestMetadataGraceIsFixedAndFallsBackToIncompleteMetadata(t *testing.T) {
+	clock := newTestClock()
+	probeCalls := make(chan map[string]any, 1)
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		probeCalls <- nil
+		return progressiveVideo("h264", "yuv420p", 1920, 1080), nil
+	})
+	t.Cleanup(manager.Close)
+	configured := srtChannel("channel", "raw")
+	properties := map[string]any{"width": 0, "height": 0, "profile": ""}
+	runtime := srtRuntime("generation-a", []mediamtx.Track{{Codec: "H264", CodecProps: properties}})
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	manager.mu.RLock()
+	deadline := manager.entries[configured.ID].metadataDeadline
+	manager.mu.RUnlock()
+	if want := clock.Now().Add(metadataGrace); !deadline.Equal(want) {
+		t.Fatalf("metadata deadline = %v, want %v", deadline, want)
+	}
+	assertNoProbeCall(t, probeCalls)
+
+	clock.Advance(metadataGrace - time.Nanosecond)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	manager.mu.RLock()
+	unchangedDeadline := manager.entries[configured.ID].metadataDeadline
+	manager.mu.RUnlock()
+	if !unchangedDeadline.Equal(deadline) {
+		t.Fatalf("metadata deadline moved from %v to %v", deadline, unchangedDeadline)
+	}
+	assertNoProbeCall(t, probeCalls)
+
+	clock.Advance(time.Nanosecond)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	receiveProbeCall(t, probeCalls)
+	properties["width"] = 3840
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	state := manager.Snapshot(configured.ID)
+	if state.Mode != ModeDirect || state.LastError != "" {
+		t.Fatalf("fallback classification state = %#v", state)
+	}
+}
+
+func TestMetadataReadyProbesImmediately(t *testing.T) {
+	clock := newTestClock()
+	probeCalls := make(chan map[string]any, 1)
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		probeCalls <- nil
+		return progressiveVideo("h264", "yuv420p", 1280, 720), nil
+	})
+	t.Cleanup(manager.Close)
+	configured := srtChannel("channel", "raw")
+	runtime := srtRuntime("generation-a", []mediamtx.Track{{Codec: "H264", CodecProps: map[string]any{
+		"width": 1280, "height": 720, "profile": "Baseline",
+	}}})
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	receiveProbeCall(t, probeCalls)
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+}
+
+func TestProbeIsAsynchronousNonblockingAndSingleFlight(t *testing.T) {
+	clock := newTestClock()
+	probeStarted := make(chan struct{}, 2)
+	releaseProbe := make(chan struct{})
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		probeStarted <- struct{}{}
+		<-releaseProbe
+		return progressiveVideo("h264", "yuv420p", 1920, 1080), nil
+	})
+	t.Cleanup(manager.Close)
+	blocked := srtChannel("blocked", "blocked-raw")
+	blockedRuntime := srtRuntime("blocked-generation", []mediamtx.Track{{Codec: "H264"}})
+	other := srtChannel("other", "other-raw")
+	otherRuntime := srtRuntime("other-generation", []mediamtx.Track{{Codec: "Opus"}})
+
+	firstDone := make(chan struct{})
+	go func() {
+		manager.reconcileChannel(context.Background(), blocked, map[string]mediamtx.Channel{blocked.Path: blockedRuntime})
+		close(firstDone)
+	}()
+	waitClosed(t, firstDone, "blocked channel reconciliation")
+	waitClosed(t, probeStarted, "probe start")
+
+	otherDone := make(chan struct{})
+	go func() {
+		manager.reconcileChannel(context.Background(), other, map[string]mediamtx.Channel{other.Path: otherRuntime})
+		close(otherDone)
+	}()
+	waitClosed(t, otherDone, "other channel reconciliation")
+	waitForState(t, manager, other.ID, func(state State) bool { return state.State == StateReady })
+
+	for range 3 {
+		manager.reconcileChannel(context.Background(), blocked, map[string]mediamtx.Channel{blocked.Path: blockedRuntime})
+	}
+	assertNoSignal(t, probeStarted, "duplicate probe")
+	close(releaseProbe)
+	waitForState(t, manager, blocked.ID, func(state State) bool { return state.State == StateReady })
+}
+
+func TestProbeRejectsStaleABAResult(t *testing.T) {
+	clock := newTestClock()
+	probeCalls := make(chan *controlledProbe, 3)
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		call := &controlledProbe{result: make(chan probeResult, 1), done: make(chan struct{})}
+		probeCalls <- call
+		result := <-call.result
+		close(call.done)
+		return result.characteristics, result.err
+	})
+	t.Cleanup(manager.Close)
+	configured := srtChannel("channel", "raw")
+	tracks := []mediamtx.Track{{Codec: "H264"}}
+	generationA := srtRuntime("generation-a", tracks)
+	generationB := srtRuntime("generation-b", tracks)
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": generationA})
+	firstA := receiveControlledProbe(t, probeCalls)
+	manager.mu.RLock()
+	firstTask := manager.entries[configured.ID].probe
+	manager.mu.RUnlock()
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": generationB})
+	callB := receiveControlledProbe(t, probeCalls)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": generationA})
+	secondA := receiveControlledProbe(t, probeCalls)
+
+	firstA.result <- probeResult{characteristics: progressiveVideo("h264", "yuv422p", 1920, 1080)}
+	waitClosed(t, firstA.done, "first generation A probe")
+	waitClosed(t, firstTask.done, "first generation A result processing")
+	state := manager.Snapshot(configured.ID)
+	if state.State != StateProbing || state.Required {
+		t.Fatalf("stale ABA result changed state: %#v", state)
+	}
+	manager.mu.RLock()
+	currentTask := manager.entries[configured.ID].probe
+	manager.mu.RUnlock()
+	if currentTask == nil {
+		t.Fatal("current generation probe was cleared by stale result")
+	}
+
+	callB.result <- probeResult{characteristics: progressiveVideo("h264", "yuv422p", 1920, 1080)}
+	waitClosed(t, callB.done, "generation B probe")
+	secondA.result <- probeResult{characteristics: progressiveVideo("h264", "yuv420p", 1920, 1080)}
+	waitClosed(t, secondA.done, "second generation A probe")
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	if state := manager.Snapshot(configured.ID); state.Mode != ModeDirect || state.Required {
+		t.Fatalf("current ABA result state = %#v", state)
+	}
+}
+
+func TestProbeRetryKeepsErrorVisibleAndRecovers(t *testing.T) {
+	clock := newTestClock()
+	probeCalls := make(chan *controlledProbe, 2)
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		call := &controlledProbe{result: make(chan probeResult, 1), done: make(chan struct{})}
+		probeCalls <- call
+		result := <-call.result
+		close(call.done)
+		return result.characteristics, result.err
+	})
+	t.Cleanup(manager.Close)
+	configured := srtChannel("channel", "raw")
+	runtime := srtRuntime("generation-a", []mediamtx.Track{{Codec: "H264"}})
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	first := receiveControlledProbe(t, probeCalls)
+	first.result <- probeResult{err: errors.New("temporary probe failure")}
+	waitClosed(t, first.done, "failed probe")
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateError })
+	failed := manager.Snapshot(configured.ID)
+	if !strings.Contains(failed.LastError, "temporary probe failure") {
+		t.Fatalf("failed probe state = %#v", failed)
+	}
+
+	clock.Advance(probeRetryDelay - time.Nanosecond)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	assertNoSignal(t, probeCalls, "early retry")
+	if state := manager.Snapshot(configured.ID); state.State != StateError || state.LastError != failed.LastError {
+		t.Fatalf("waiting retry state = %#v, want error %q", state, failed.LastError)
+	}
+
+	clock.Advance(time.Nanosecond)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	second := receiveControlledProbe(t, probeCalls)
+	if state := manager.Snapshot(configured.ID); state.State != StateError || state.LastError != failed.LastError {
+		t.Fatalf("in-flight retry state = %#v, want error %q", state, failed.LastError)
+	}
+	second.result <- probeResult{characteristics: progressiveVideo("h264", "yuv420p", 1920, 1080)}
+	waitClosed(t, second.done, "successful retry")
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	if state := manager.Snapshot(configured.ID); state.LastError != "" {
+		t.Fatalf("recovered probe retained error: %#v", state)
+	}
+}
+
+func TestCloseCancelsProbeAndWaitsForExit(t *testing.T) {
+	clock := newTestClock()
+	probeStarted := make(chan struct{})
+	probeCancelled := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	manager := newProbeTestManager(t, clock, func(ctx context.Context, _ string) (videoCharacteristics, error) {
+		close(probeStarted)
+		<-ctx.Done()
+		close(probeCancelled)
+		<-releaseProbe
+		return videoCharacteristics{}, ctx.Err()
+	})
+	configured := srtChannel("channel", "raw")
+	runtime := srtRuntime("generation-a", []mediamtx.Track{{Codec: "H264"}})
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	waitClosed(t, probeStarted, "probe start")
+
+	closed := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closed)
+	}()
+	waitClosed(t, probeCancelled, "probe cancellation")
+	assertNoSignal(t, closed, "Close returned before probe exit")
+	close(releaseProbe)
+	waitClosed(t, closed, "Close")
+}
+
+func TestPathRetryHonorsDeadlineAndPreservesWorkerError(t *testing.T) {
+	clock := newTestClock()
+	media := &pathRetryMedia{replaceErrors: []error{errors.New("temporary path failure"), nil}}
+	result := decision{required: true, transcodeVideo: true, workerUnits: 1, reasons: []string{"conversion required"}}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), media: media, now: clock.Now,
+		workerCapacity: 1, entries: map[string]*entry{
+			"channel": {
+				fingerprint: "source", srt: true, classified: true, decision: result,
+				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
+			},
+			"blocker": {worker: &worker{units: 1}},
+		},
+	}
+	configured := channel.Channel{ID: "channel"}
+
+	manager.ensureTranscoded(context.Background(), configured, result, mediamtx.Channel{})
+	failed := manager.Snapshot(configured.ID)
+	if failed.State != StateError || !strings.Contains(failed.LastError, "temporary path failure") || media.ReplaceCount() != 1 {
+		t.Fatalf("initial path failure state = %#v, replacements = %d", failed, media.ReplaceCount())
+	}
+	clock.Advance(probeRetryDelay - time.Nanosecond)
+	manager.ensureTranscoded(context.Background(), configured, result, mediamtx.Channel{})
+	if media.ReplaceCount() != 1 {
+		t.Fatalf("ReplacePath called before retry deadline: %d calls", media.ReplaceCount())
+	}
+
+	clock.Advance(time.Nanosecond)
+	manager.ensureTranscoded(context.Background(), configured, result, mediamtx.Channel{})
+	queued := manager.Snapshot(configured.ID)
+	if media.ReplaceCount() != 2 || !queued.Worker.Queued || queued.LastError != failed.LastError || queued.Worker.Error == "" {
+		t.Fatalf("queued retry state = %#v, replacements = %d", queued, media.ReplaceCount())
+	}
+
+	manager.mu.Lock()
+	manager.entries["blocker"].worker = nil
+	manager.entries[configured.ID].worker = &worker{cancel: func() {}, started: clock.Now(), units: 1}
+	manager.mu.Unlock()
+	manager.ensureTranscoded(context.Background(), configured, result, mediamtx.Channel{Name: CompatibilityPath(configured.ID)})
+	restarting := manager.Snapshot(configured.ID)
+	if restarting.State != StateError || !restarting.Worker.Running || restarting.LastError != failed.LastError || restarting.Worker.Error == "" {
+		t.Fatalf("restarting worker state = %#v", restarting)
+	}
+
+	manager.ensureTranscoded(context.Background(), configured, result, mediamtx.Channel{
+		Name: CompatibilityPath(configured.ID), Available: true, Online: true,
+	})
+	ready := manager.Snapshot(configured.ID)
+	if ready.State != StateReady || ready.LastError != "" || ready.Worker.Error != "" || ready.Worker.Queued {
+		t.Fatalf("ready worker state = %#v", ready)
+	}
+}
+
+func TestStaleOutputDoesNotBecomeReadyWithoutCurrentWorker(t *testing.T) {
+	result := decision{required: true, transcodeVideo: true, workerUnits: 1, reasons: []string{"conversion required"}}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), workerCapacity: 1,
+		entries: map[string]*entry{
+			"channel": {
+				fingerprint: "new-source", srt: true, classified: true, decision: result,
+				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
+			},
+			"blocker": {worker: &worker{units: 1}},
+		},
+	}
+
+	manager.ensureTranscoded(context.Background(), channel.Channel{ID: "channel"}, result, mediamtx.Channel{
+		Name: CompatibilityPath("channel"), Available: true, Online: true,
+	})
+	state := manager.Snapshot("channel")
+	if state.State == StateReady || state.Worker.Running || !state.Worker.Queued {
+		t.Fatalf("stale output state = %#v", state)
+	}
+}
+
+func TestSourceGenerationChangeDeletesStaleCompatibilityOutput(t *testing.T) {
+	media := &reconcileMediaManager{}
+	workerCancelled := false
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), media: media,
+		entries: map[string]*entry{
+			"channel": {
+				fingerprint: "old-source", srt: true, classified: true,
+				worker: &worker{cancel: func() { workerCancelled = true }},
+				state:  State{State: StateReady, Mode: ModeTranscoded, Required: true},
+			},
+		},
+	}
+	configured := srtChannel("channel", "raw")
+	raw := srtRuntime("new-source", []mediamtx.Track{{Codec: "H264"}})
+	compatPath := CompatibilityPath(configured.ID)
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{
+		configured.Path: raw,
+		compatPath:      {Name: compatPath, Available: true, Online: true},
+	})
+	if !workerCancelled || !reflect.DeepEqual(media.deleted, []string{compatPath}) {
+		t.Fatalf("worker cancelled = %v, deleted paths = %#v", workerCancelled, media.deleted)
+	}
+	state := manager.Snapshot(configured.ID)
+	if state.State != StateProbing || state.InputFingerprint != fingerprint(raw) {
+		t.Fatalf("new generation state = %#v", state)
+	}
+}
+
 func TestNextIntervalAcceleratesTransientStates(t *testing.T) {
 	manager := &Manager{
 		interval: 2 * time.Second, activeInterval: 250 * time.Millisecond,
@@ -467,7 +796,9 @@ func TestWorkerStartupTimeoutStopsWorkerAndSchedulesRetry(t *testing.T) {
 		},
 	}
 
-	manager.ensureTranscoded(context.Background(), channel.Channel{ID: "channel-id"}, result, mediamtx.Channel{Name: "compat-channel-id"})
+	manager.ensureTranscoded(context.Background(), channel.Channel{ID: "channel-id"}, result, mediamtx.Channel{
+		Name: "compat-channel-id", Available: true, Online: false,
+	})
 
 	state := manager.Snapshot("channel-id")
 	if !cancelled || state.State != StateError || state.Worker.Running || state.Worker.Restarts != 3 {
@@ -493,6 +824,149 @@ type reconcileMediaManager struct {
 	status       mediamtx.Status
 	deleteErrors []error
 	deleted      []string
+}
+
+type testClock struct {
+	mu    sync.Mutex
+	value time.Time
+}
+
+func newTestClock() *testClock {
+	return &testClock{value: time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+func (c *testClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.value = c.value.Add(duration)
+	c.mu.Unlock()
+}
+
+type probeResult struct {
+	characteristics videoCharacteristics
+	err             error
+}
+
+type controlledProbe struct {
+	result chan probeResult
+	done   chan struct{}
+}
+
+type pathRetryMedia struct {
+	mu            sync.Mutex
+	replaceErrors []error
+	replaceCount  int
+}
+
+func (m *pathRetryMedia) Status(context.Context) (mediamtx.Status, error) {
+	return mediamtx.Status{}, nil
+}
+
+func (m *pathRetryMedia) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.replaceCount++
+	if len(m.replaceErrors) == 0 {
+		return nil
+	}
+	err := m.replaceErrors[0]
+	m.replaceErrors = m.replaceErrors[1:]
+	return err
+}
+
+func (m *pathRetryMedia) DeletePath(context.Context, string) error {
+	return nil
+}
+
+func (m *pathRetryMedia) ReplaceCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.replaceCount
+}
+
+func newProbeTestManager(t *testing.T, clock *testClock, probe func(context.Context, string) (videoCharacteristics, error)) *Manager {
+	t.Helper()
+	rtspURL, err := url.Parse("rtsp://127.0.0.1:8554")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), rtspURL: rtspURL,
+		entries: make(map[string]*entry), workerCapacity: 1, now: clock.Now, probeVideo: probe,
+	}
+}
+
+func srtChannel(id, path string) channel.Channel {
+	return channel.Channel{ID: id, Path: path, Enabled: true, Input: channel.Input{Mode: channel.InputSRTPush}}
+}
+
+func srtRuntime(generation string, tracks []mediamtx.Track) mediamtx.Channel {
+	return mediamtx.Channel{
+		Name: "raw", Available: true, Online: true, AvailableTime: &generation,
+		Source: &mediamtx.PathSource{Type: "srtConn", ID: generation}, Tracks: tracks,
+	}
+}
+
+func waitForState(t *testing.T, manager *Manager, channelID string, ready func(State) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready(manager.Snapshot(channelID)) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("state did not converge: %#v", manager.Snapshot(channelID))
+}
+
+func waitClosed(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func receiveProbeCall(t *testing.T, calls <-chan map[string]any) map[string]any {
+	t.Helper()
+	select {
+	case call := <-calls:
+		return call
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe call")
+		return nil
+	}
+}
+
+func receiveControlledProbe(t *testing.T, calls <-chan *controlledProbe) *controlledProbe {
+	t.Helper()
+	select {
+	case call := <-calls:
+		return call
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for controlled probe")
+		return nil
+	}
+}
+
+func assertNoProbeCall(t *testing.T, calls <-chan map[string]any) {
+	t.Helper()
+	assertNoSignal(t, calls, "unexpected probe")
+}
+
+func assertNoSignal[T any](t *testing.T, signal <-chan T, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+		t.Fatal(description)
+	default:
+	}
 }
 
 func (m *reconcileMediaManager) Status(context.Context) (mediamtx.Status, error) {
