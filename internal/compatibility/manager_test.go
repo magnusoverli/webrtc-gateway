@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -406,6 +407,47 @@ func TestFingerprintIgnoresMetadataEnrichment(t *testing.T) {
 	}
 }
 
+func TestFingerprintEncodingSeparatesNullableAndVariableLengthFields(t *testing.T) {
+	empty := ""
+	tests := []struct {
+		name   string
+		first  mediamtx.Channel
+		second mediamtx.Channel
+	}{
+		{
+			name:   "nil and empty source",
+			first:  mediamtx.Channel{},
+			second: mediamtx.Channel{Source: &mediamtx.PathSource{}},
+		},
+		{
+			name:   "nil and empty availability",
+			first:  mediamtx.Channel{},
+			second: mediamtx.Channel{AvailableTime: &empty},
+		},
+		{
+			name:   "source field boundaries",
+			first:  mediamtx.Channel{Source: &mediamtx.PathSource{Type: "a", ID: "bc"}},
+			second: mediamtx.Channel{Source: &mediamtx.PathSource{Type: "ab", ID: "c"}},
+		},
+		{
+			name:   "codec boundaries",
+			first:  mediamtx.Channel{Tracks: []mediamtx.Track{{Codec: "a"}, {Codec: "bc"}}},
+			second: mediamtx.Channel{Tracks: []mediamtx.Track{{Codec: "ab"}, {Codec: "c"}}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			first := Fingerprint(test.first)
+			if first == Fingerprint(test.second) {
+				t.Fatalf("fingerprint collision: %q", first)
+			}
+			if first != Fingerprint(test.first) {
+				t.Fatal("fingerprint encoding is not deterministic")
+			}
+		})
+	}
+}
+
 func TestTracksMetadataReadyWaitsForVideoProperties(t *testing.T) {
 	if tracksMetadataReady(nil) {
 		t.Fatal("empty tracks reported ready")
@@ -748,10 +790,12 @@ func TestSourceGenerationChangeDeletesStaleCompatibilityOutput(t *testing.T) {
 	}
 }
 
-func TestNextIntervalAcceleratesTransientStates(t *testing.T) {
+func TestNextIntervalUsesEventsDeadlinesAndFallback(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	manager := &Manager{
 		interval: 2 * time.Second, activeInterval: 250 * time.Millisecond,
-		entries: map[string]*entry{"channel": {state: State{State: StateReady}}},
+		now:     func() time.Time { return now },
+		entries: map[string]*entry{"channel": {classified: true, state: State{State: StateReady}}},
 	}
 	if got := manager.nextInterval(); got != 2*time.Second {
 		t.Fatalf("stable interval = %v", got)
@@ -759,6 +803,332 @@ func TestNextIntervalAcceleratesTransientStates(t *testing.T) {
 	manager.entries["channel"].state.State = StateStarting
 	if got := manager.nextInterval(); got != 250*time.Millisecond {
 		t.Fatalf("active interval = %v", got)
+	}
+	manager.entries["channel"].state.Worker.Queued = true
+	if got := manager.nextInterval(); got != 2*time.Second {
+		t.Fatalf("capacity-queued interval = %v, want periodic fallback", got)
+	}
+	manager.entries["channel"] = &entry{
+		state: State{State: StateProbing},
+		probe: &probeTask{},
+	}
+	if got := manager.nextInterval(); got != 2*time.Second {
+		t.Fatalf("in-flight probe interval = %v, want event-driven fallback", got)
+	}
+	manager.entries["channel"] = &entry{
+		state:            State{State: StateProbing},
+		metadataDeadline: now.Add(40 * time.Millisecond),
+	}
+	if got := manager.nextInterval(); got != 40*time.Millisecond {
+		t.Fatalf("metadata deadline interval = %v", got)
+	}
+	manager.entries["channel"] = &entry{
+		classified: true,
+		state:      State{State: StateError},
+		retryAt:    now.Add(60 * time.Millisecond),
+	}
+	if got := manager.nextInterval(); got != 60*time.Millisecond {
+		t.Fatalf("retry deadline interval = %v", got)
+	}
+	manager.entries["channel"].retryAt = now.Add(-time.Millisecond)
+	if got := manager.nextInterval(); got != 250*time.Millisecond {
+		t.Fatalf("elapsed retry deadline interval = %v, want active interval", got)
+	}
+	manager.entries["channel"] = &entry{
+		classified: true,
+		state:      State{State: StateStarting},
+		worker: &worker{
+			started: now.Add(-workerStartupTimeout + 80*time.Millisecond),
+		},
+	}
+	if got := manager.nextInterval(); got != 80*time.Millisecond {
+		t.Fatalf("startup deadline interval = %v", got)
+	}
+	manager.entries["channel"].worker.started = now.Add(-workerStartupTimeout)
+	if got := manager.nextInterval(); got != 250*time.Millisecond {
+		t.Fatalf("elapsed startup deadline interval = %v, want active interval", got)
+	}
+	manager.entries["channel"] = &entry{
+		state:            State{State: StateProbing},
+		metadataDeadline: now.Add(-time.Millisecond),
+	}
+	if got := manager.nextInterval(); got != 250*time.Millisecond {
+		t.Fatalf("elapsed metadata deadline interval = %v, want active interval", got)
+	}
+}
+
+func TestRunWakesImmediatelyWhenProbeCompletes(t *testing.T) {
+	configured := srtChannel("channel", "raw")
+	media := &wakeMediaManager{
+		status: mediamtx.Status{Channels: []mediamtx.Channel{srtRuntime("generation-a", []mediamtx.Track{{
+			Codec: "H264", CodecProps: map[string]any{"width": 1920, "height": 1080, "profile": "Baseline"},
+		}})}},
+		statusCalls: make(chan struct{}, 4),
+	}
+	manager, err := New(Options{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Channels: reconcileChannelReader{items: []channel.Channel{configured}}, MediaMTX: media,
+		MediaRTSPURL: "rtsp://127.0.0.1:8554", Interval: 3 * time.Second, ActiveInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	manager.probeVideo = func(context.Context, string) (videoCharacteristics, error) {
+		close(probeStarted)
+		<-releaseProbe
+		return progressiveVideo("h264", "yuv420p", 1920, 1080), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(runDone)
+	}()
+	waitClosed(t, probeStarted, "probe start")
+	waitClosed(t, media.statusCalls, "initial status")
+	close(releaseProbe)
+	select {
+	case <-media.statusCalls:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("probe completion did not wake reconciliation before fallback interval")
+	}
+	cancel()
+	waitClosed(t, runDone, "manager run")
+}
+
+func TestCloseStopsWakeReconcileBeforeMediaMutation(t *testing.T) {
+	media := &wakeMediaManager{
+		statusCalls: make(chan struct{}, 2),
+		deleteCalls: make(chan string, 1),
+	}
+	manager, err := New(Options{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Channels: reconcileChannelReader{}, MediaMTX: media,
+		MediaRTSPURL: "rtsp://127.0.0.1:8554", Interval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(runDone)
+	}()
+	waitClosed(t, media.statusCalls, "initial reconciliation")
+
+	media.mu.Lock()
+	media.status.Channels = []mediamtx.Channel{{Name: "compat-orphan"}}
+	media.mu.Unlock()
+	manager.Close()
+	manager.notify()
+
+	select {
+	case path := <-media.deleteCalls:
+		t.Fatalf("wake reconciliation deleted %q after Close returned", path)
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit promptly after Close")
+	}
+	assertNoSignal(t, media.deleteCalls, "MediaMTX mutation after Close")
+}
+
+func TestCloseCancelsBlockedReconciliation(t *testing.T) {
+	channels := &cancelBlockingChannelReader{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+	manager, err := New(Options{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Channels: channels, MediaMTX: &reconcileMediaManager{},
+		MediaRTSPURL: "rtsp://127.0.0.1:8554",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(runDone)
+	}()
+	waitClosed(t, channels.started, "blocked reconciliation")
+
+	closeDone := make(chan struct{}, 3)
+	for range 3 {
+		go func() {
+			manager.Close()
+			closeDone <- struct{}{}
+		}()
+	}
+	waitClosed(t, channels.canceled, "reconciliation context cancellation")
+	for range 3 {
+		waitClosed(t, closeDone, "concurrent Close")
+	}
+	waitClosed(t, runDone, "Run after reconciliation cancellation")
+
+	afterClose := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(afterClose)
+	}()
+	waitClosed(t, afterClose, "Run after Close")
+}
+
+func TestWorkerExitWakesCapacityWaiters(t *testing.T) {
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(workerCtx, "/bin/sh", "-c", "exit 0")
+	stderr := newRingWriter(128)
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	running := &worker{cancel: cancelWorker, cmd: cmd, stderr: stderr, started: time.Now(), units: 1}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), wake: make(chan struct{}, 1),
+		entries: map[string]*entry{
+			"running": {worker: running, state: State{State: StateReady}},
+			"queued":  {state: State{State: StateStarting, Worker: WorkerState{Queued: true}}},
+		},
+	}
+	manager.workers.Add(1)
+	go manager.waitWorker("running", running)
+	waitClosed(t, manager.wake, "worker-exit capacity wake")
+	manager.workers.Wait()
+	manager.mu.RLock()
+	used := manager.usedWorkerCapacityLocked()
+	worker := manager.entries["running"].worker
+	manager.mu.RUnlock()
+	if used != 0 || worker != nil {
+		t.Fatalf("worker capacity after exit = %d, worker = %#v", used, worker)
+	}
+}
+
+func TestCloseWaitsForSpawnOutsideManagerLock(t *testing.T) {
+	rtspURL, err := url.Parse("rtsp://127.0.0.1:8554")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spawnEntered := make(chan struct{})
+	releaseSpawn := make(chan struct{})
+	result := decision{required: true, transcodeVideo: true, workerUnits: 1}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), rtspURL: rtspURL, ffmpeg: "/bin/true",
+		workerCapacity: 1, entries: map[string]*entry{
+			"channel": {
+				fingerprint: "source", generation: 7, classified: true, decision: result,
+				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
+			},
+		},
+		wake: make(chan struct{}, 1),
+		startCommand: func(cmd *exec.Cmd) error {
+			close(spawnEntered)
+			<-releaseSpawn
+			return cmd.Start()
+		},
+	}
+	spawnDone := make(chan struct{})
+	go func() {
+		manager.ensureTranscoded(context.Background(), channel.Channel{ID: "channel", Path: "raw"}, result, mediamtx.Channel{Name: CompatibilityPath("channel")})
+		close(spawnDone)
+	}()
+	waitClosed(t, spawnEntered, "worker spawn")
+	snapshotDone := make(chan struct{})
+	go func() {
+		_ = manager.Snapshot("channel")
+		close(snapshotDone)
+	}()
+	waitClosed(t, snapshotDone, "snapshot during worker spawn")
+
+	closeDone := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closeDone)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		manager.mu.RLock()
+		closed := manager.closed
+		manager.mu.RUnlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not synchronize with spawn reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertNoSignal(t, closeDone, "Close returned while spawn was in flight")
+	close(releaseSpawn)
+	waitClosed(t, spawnDone, "worker spawn completion")
+	waitClosed(t, closeDone, "Close after worker spawn")
+	manager.mu.RLock()
+	worker := manager.entries["channel"].worker
+	restarts := manager.entries["channel"].state.Worker.Restarts
+	manager.mu.RUnlock()
+	if worker != nil || restarts != 0 {
+		t.Fatalf("closed spawn committed worker %#v or changed restarts to %d", worker, restarts)
+	}
+}
+
+func TestWorkerStartFailureCommitsCoherentErrorState(t *testing.T) {
+	clock := newTestClock()
+	rtspURL, err := url.Parse("rtsp://127.0.0.1:8554")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startErr := errors.New("start failed")
+	result := decision{required: true, transcodeVideo: true, workerUnits: 1, reasons: []string{"conversion required"}}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), rtspURL: rtspURL,
+		ffmpeg: "/bin/true", workerCapacity: 1, now: clock.Now,
+		startCommand: func(*exec.Cmd) error { return startErr },
+		entries: map[string]*entry{"channel": {
+			fingerprint: "source", generation: 7, classified: true, decision: result,
+			state: State{State: StateStarting, Worker: WorkerState{Restarts: 2}},
+		}},
+	}
+	manager.mu.Lock()
+	running := manager.reserveWorkerLocked(context.Background(), channel.Channel{ID: "channel", Path: "raw"}, manager.entries["channel"], result, 1)
+	manager.mu.Unlock()
+	manager.startReservedWorker("channel", running, result)
+	state := manager.Snapshot("channel")
+	manager.mu.RLock()
+	retryAt := manager.entries["channel"].retryAt
+	worker := manager.entries["channel"].worker
+	manager.mu.RUnlock()
+	if state.State != StateError || state.Mode != ModeTranscoded || !state.Required ||
+		!reflect.DeepEqual(state.Reasons, result.reasons) || state.LastError != startErr.Error() ||
+		state.Worker.Running || state.Worker.Queued || state.Worker.Restarts != 3 || state.Worker.Error != startErr.Error() ||
+		state.OutputPath != CompatibilityPath("channel") || state.InputFingerprint != "source" || worker != nil {
+		t.Fatalf("start failure state = %#v", state)
+	}
+	if want := clock.Now().Add(retryDelay(2)); !retryAt.Equal(want) {
+		t.Fatalf("start failure retry = %v, want %v", retryAt, want)
+	}
+}
+
+func TestRingWriterKeepsExactTailAcrossWraps(t *testing.T) {
+	writer := newRingWriter(7)
+	var reference []byte
+	for _, chunk := range [][]byte{[]byte("  ab"), []byte("c"), []byte("defgh"), []byte("ij\n"), []byte("0123456789 "), []byte("XY")} {
+		written, err := writer.Write(chunk)
+		if err != nil || written != len(chunk) {
+			t.Fatalf("Write(%q) = %d, %v", chunk, written, err)
+		}
+		reference = append(reference, chunk...)
+		if len(reference) > 7 {
+			reference = reference[len(reference)-7:]
+		}
+		if got, want := writer.String(), string(bytes.TrimSpace(reference)); got != want {
+			t.Fatalf("tail after %q = %q, want %q", chunk, got, want)
+		}
+	}
+	zero := newRingWriter(0)
+	if written, err := zero.Write([]byte("discarded")); err != nil || written != len("discarded") || zero.String() != "" {
+		t.Fatalf("zero-limit writer = %d, %v, %q", written, err, zero.String())
 	}
 }
 
@@ -820,10 +1190,47 @@ func (r reconcileChannelReader) List(context.Context) ([]channel.Channel, error)
 	return r.items, nil
 }
 
+type cancelBlockingChannelReader struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (r *cancelBlockingChannelReader) List(ctx context.Context) ([]channel.Channel, error) {
+	close(r.started)
+	<-ctx.Done()
+	close(r.canceled)
+	return nil, ctx.Err()
+}
+
 type reconcileMediaManager struct {
 	status       mediamtx.Status
 	deleteErrors []error
 	deleted      []string
+}
+
+type wakeMediaManager struct {
+	mu          sync.Mutex
+	status      mediamtx.Status
+	statusCalls chan struct{}
+	deleteCalls chan string
+}
+
+func (m *wakeMediaManager) Status(context.Context) (mediamtx.Status, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.statusCalls <- struct{}{}
+	return m.status, nil
+}
+
+func (m *wakeMediaManager) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
+	return nil
+}
+
+func (m *wakeMediaManager) DeletePath(_ context.Context, path string) error {
+	if m.deleteCalls != nil {
+		m.deleteCalls <- path
+	}
+	return nil
 }
 
 type testClock struct {

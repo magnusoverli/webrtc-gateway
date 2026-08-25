@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -22,11 +23,11 @@ func TestParseCPUSet(t *testing.T) {
 
 func TestParsesHostSources(t *testing.T) {
 	stat := "cpu  100 10 40 800 20 5 15 10 0 0\ncpu0 1 0 0 1\ncpu1 1 0 0 1\n"
-	total, idle, cores, err := parseProcStat(stat)
+	total, idle, cores, err := parseProcStat([]byte(stat))
 	if err != nil || total != 1000 || idle != 820 || cores != 2 {
 		t.Fatalf("parseProcStat() = %d, %d, %d, %v", total, idle, cores, err)
 	}
-	memoryTotal, memoryAvailable, err := parseMeminfo("MemTotal: 16384 kB\nMemAvailable: 12288 kB\n")
+	memoryTotal, memoryAvailable, err := parseMeminfo([]byte("MemTotal: 16384 kB\nMemAvailable: 12288 kB\n"))
 	if err != nil || memoryTotal != 16*1024*1024 || memoryAvailable != 12*1024*1024 {
 		t.Fatalf("parseMeminfo() = %d, %d, %v", memoryTotal, memoryAvailable, err)
 	}
@@ -131,6 +132,78 @@ func TestGatewayUsesTightestAncestorLimits(t *testing.T) {
 	}
 	if sample.capacityCores != 1 || sample.memoryLimit == nil || *sample.memoryLimit != 1500 {
 		t.Fatalf("effective limits = CPU %v, memory %v", sample.capacityCores, sample.memoryLimit)
+	}
+}
+
+func TestSamplerRefreshesCachedCgroupLimitsAtBoundedInterval(t *testing.T) {
+	mount := t.TempDir()
+	parent := filepath.Join(mount, "workload.slice")
+	cgroup := filepath.Join(parent, "gateway.scope")
+	proc := t.TempDir()
+	if err := os.MkdirAll(cgroup, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTelemetryFixtures(t, cgroup, proc, 1_000_000, "cpu 100 0 100 800 0 0 0 0", 1_000, 100)
+	writeTelemetryFile(t, filepath.Join(parent, "cpu.max"), "100000 100000\n")
+	writeTelemetryFile(t, filepath.Join(parent, "memory.max"), "1500\n")
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	sampler := newSampler(nil, time.Hour, sourcePaths{cgroup: cgroup, cgroupMount: mount, proc: proc}, func() time.Time { return now })
+
+	writeTelemetryFile(t, filepath.Join(parent, "cpu.max"), "50000 100000\n")
+	writeTelemetryFile(t, filepath.Join(parent, "memory.max"), "1200\n")
+	now = now.Add(cgroupLimitRefreshInterval - time.Second)
+	writeTelemetryFixtures(t, cgroup, proc, 2_000_000, "cpu 200 0 200 900 0 0 0 0", 1_100, 100)
+	sampler.sample()
+	beforeRefresh := sampler.Snapshot()
+	if beforeRefresh.Gateway.CPU.CapacityCores != 1 || beforeRefresh.Gateway.Memory.TotalBytes == nil || *beforeRefresh.Gateway.Memory.TotalBytes != 1500 {
+		t.Fatalf("cached limits = CPU %v, memory %v", beforeRefresh.Gateway.CPU.CapacityCores, beforeRefresh.Gateway.Memory.TotalBytes)
+	}
+
+	now = now.Add(time.Second)
+	writeTelemetryFixtures(t, cgroup, proc, 3_000_000, "cpu 300 0 300 1000 0 0 0 0", 1_100, 100)
+	sampler.sample()
+	afterRefresh := sampler.Snapshot()
+	if afterRefresh.Gateway.CPU.CapacityCores != 0.5 || afterRefresh.Gateway.Memory.TotalBytes == nil || *afterRefresh.Gateway.Memory.TotalBytes != 1200 {
+		t.Fatalf("refreshed limits = CPU %v, memory %v", afterRefresh.Gateway.CPU.CapacityCores, afterRefresh.Gateway.Memory.TotalBytes)
+	}
+}
+
+func TestSamplerSynchronizesConcurrentCgroupLimitRefresh(t *testing.T) {
+	mount := t.TempDir()
+	parent := filepath.Join(mount, "workload.slice")
+	cgroup := filepath.Join(parent, "gateway.scope")
+	proc := t.TempDir()
+	if err := os.MkdirAll(cgroup, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTelemetryFixtures(t, cgroup, proc, 1_000_000, "cpu 100 0 100 800 0 0 0 0", 1_000, 100)
+	writeTelemetryFile(t, filepath.Join(parent, "cpu.max"), "100000 100000\n")
+	writeTelemetryFile(t, filepath.Join(parent, "memory.max"), "1500\n")
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	sampler := newSampler(nil, time.Hour, sourcePaths{cgroup: cgroup, cgroupMount: mount, proc: proc}, func() time.Time { return now })
+
+	writeTelemetryFile(t, filepath.Join(parent, "cpu.max"), "50000 100000\n")
+	writeTelemetryFile(t, filepath.Join(parent, "memory.max"), "1200\n")
+	now = now.Add(cgroupLimitRefreshInterval)
+	writeTelemetryFixtures(t, cgroup, proc, 2_000_000, "cpu 200 0 200 900 0 0 0 0", 1_100, 100)
+
+	const samples = 16
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for range samples {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			sampler.sample()
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	snapshot := sampler.Snapshot()
+	if snapshot.Gateway.CPU.CapacityCores != 0.5 || snapshot.Gateway.Memory.TotalBytes == nil || *snapshot.Gateway.Memory.TotalBytes != 1200 {
+		t.Fatalf("refreshed limits = CPU %v, memory %v", snapshot.Gateway.CPU.CapacityCores, snapshot.Gateway.Memory.TotalBytes)
 	}
 }
 

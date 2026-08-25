@@ -1,5 +1,16 @@
 import { useEffect, useState } from "react";
-import { channelHasFault, channelPlaybackReady, channelStateLabel, type Channel } from "./channel";
+import {
+  channelHasFault,
+  channelPlaybackReady,
+  channelStateLabel,
+  mergeChannelRuntime,
+  mergeChannelRuntimes,
+  readChannelRuntime,
+  readChannelRuntimes,
+  readChannelSnapshot,
+  readChannelSnapshots,
+  type Channel,
+} from "./channel";
 import { startSerialPolling } from "./polling";
 import { requestJSON } from "./request";
 import { useWHEPPlayer } from "./useWHEPPlayer";
@@ -37,13 +48,33 @@ export function ChannelViewer() {
 
   useEffect(() => {
     let disposed = false;
+    let initialized = false;
+    let snapshot: Channel[] | null = null;
+
+    const loadFull = async (signal: AbortSignal) => {
+      const { response, body } = await requestJSON<unknown>("/api/v1/channels", { cache: "no-store", signal });
+      if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+      const channels = readChannelSnapshots(body);
+      if (!channels) throw new Error("Gateway channel response was malformed");
+      return channels;
+    };
+
     const load = async (signal: AbortSignal) => {
       try {
-        const { response, body } = await requestJSON<unknown>("/api/v1/channels", { cache: "no-store", signal });
-        if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
-        if (!isChannelList(body)) throw new Error("Gateway channel response was malformed");
+        let next: Channel[];
+        if (!initialized || !snapshot) {
+          next = await loadFull(signal);
+        } else {
+          const { response, body } = await requestJSON<unknown>("/api/v1/channels/runtime", { cache: "no-store", signal });
+          if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+          const runtime = readChannelRuntimes(body);
+          if (!runtime) throw new Error("Gateway runtime channel response was malformed");
+          next = mergeChannelRuntimes(snapshot, runtime) ?? await loadFull(signal);
+        }
         if (disposed) return;
-        setChannels(body.channels);
+        initialized = true;
+        snapshot = next;
+        setChannels(next);
         setLoaded(true);
         setLoadError("");
       } catch (error) {
@@ -102,22 +133,44 @@ export function StandalonePlayer({ channelID }: { channelID: string }) {
 
   useEffect(() => {
     let disposed = false;
+    let initialized = false;
+    let snapshot: Channel | null = null;
+
+    const loadFull = async (signal: AbortSignal) => {
+      const { response, body } = await requestJSON<unknown>(`/api/v1/channels/${encodeURIComponent(channelID)}`, {
+        cache: "no-store",
+        signal,
+      });
+      if (response.status === 404 || response.status === 410) return null;
+      if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+      const channel = readChannelSnapshot(body);
+      if (!channel) throw new Error("Gateway channel response was malformed");
+      return channel;
+    };
+
     const load = async (signal: AbortSignal) => {
       try {
-        const { response, body } = await requestJSON<unknown>(`/api/v1/channels/${encodeURIComponent(channelID)}`, {
-          cache: "no-store",
-          signal,
-        });
-        if (response.status === 404 || response.status === 410) {
-          if (!disposed) setChannel(null);
-          return;
+        let next: Channel | null;
+        if (!initialized) {
+          next = await loadFull(signal);
+        } else {
+          const { response, body } = await requestJSON<unknown>(`/api/v1/channels/${encodeURIComponent(channelID)}/runtime`, {
+            cache: "no-store",
+            signal,
+          });
+          if (response.status === 404 || response.status === 410) {
+            next = null;
+          } else {
+            if (!response.ok) throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
+            const runtime = readChannelRuntime(body);
+            if (!runtime) throw new Error("Gateway runtime channel response was malformed");
+            next = snapshot ? mergeChannelRuntime(snapshot, runtime) ?? await loadFull(signal) : await loadFull(signal);
+          }
         }
-        if (!response.ok) {
-          throw new Error(apiErrorMessage(body, response.status, "Channel request failed"));
-        }
-        if (!isChannel(body)) throw new Error("Gateway channel response was malformed");
         if (disposed) return;
-        setChannel(body);
+        initialized = true;
+        snapshot = next;
+        setChannel(next);
       } catch (error) {
         if (disposed || signal.aborted) throw error;
         // Retain the last definitive state so an established WHEP session is not interrupted.
@@ -206,23 +259,6 @@ function offlineDetail(channel: Channel) {
   if (channel.relay?.state === "retrying" || channel.relay?.state === "stopped") return channel.relay.lastError ?? "The SRT listener process is unavailable.";
   if (channel.available && channel.online) return "The encoder is connected and the browser-compatible output is being prepared.";
   return "The player will start automatically when output becomes ready.";
-}
-
-function isChannelList(value: unknown): value is { channels: Channel[] } {
-  if (!value || typeof value !== "object" || !Array.isArray((value as { channels?: unknown }).channels)) return false;
-  return (value as { channels: unknown[] }).channels.every(isChannel);
-}
-
-function isChannel(value: unknown): value is Channel {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<Channel>;
-  return typeof item.id === "string" && typeof item.revision === "number" && item.revision >= 1 &&
-    typeof item.createdAt === "string" && typeof item.updatedAt === "string" && typeof item.name === "string" &&
-    typeof item.whepPath === "string" && typeof item.enabled === "boolean" &&
-    typeof item.outputReady === "boolean" && item.applyState !== undefined &&
-    Boolean(item.input && typeof item.input.mode === "string") &&
-    Boolean(item.compatibility && typeof item.compatibility.state === "string" && Array.isArray(item.compatibility.reasons) && item.compatibility.worker) &&
-    Array.isArray(item.readers);
 }
 
 function apiErrorMessage(body: unknown, status: number, fallback: string) {

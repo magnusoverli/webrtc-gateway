@@ -19,6 +19,7 @@ import (
 const (
 	runtimeCacheTTL = 350 * time.Millisecond
 	staticCacheTTL  = 2 * time.Second
+	statusCacheKey  = "\x00status"
 )
 
 type Client struct {
@@ -38,10 +39,16 @@ type cacheEntry struct {
 }
 
 type cacheCall struct {
-	done  chan struct{}
-	value any
-	err   error
-	epoch uint64
+	done      chan struct{}
+	value     any
+	err       error
+	expiresAt time.Time
+	epoch     uint64
+}
+
+type cachedResult[T any] struct {
+	value     T
+	expiresAt time.Time
 }
 
 type Info struct {
@@ -137,6 +144,31 @@ type Status struct {
 	Channels []Channel `json:"channels"`
 }
 
+// StatusSnapshot provides isolated reads from one immutable MediaMTX status
+// generation. Values returned by its methods do not share mutable data with
+// the cached snapshot.
+type StatusSnapshot interface {
+	Status() Status
+	Channel(name string) (Channel, bool)
+}
+
+type statusSnapshot struct {
+	status Status
+	byPath map[string]int
+}
+
+func (s *statusSnapshot) Status() Status {
+	return cloneStatus(s.status)
+}
+
+func (s *statusSnapshot) Channel(name string) (Channel, bool) {
+	index, ok := s.byPath[name]
+	if !ok {
+		return Channel{}, false
+	}
+	return cloneChannel(s.status.Channels[index]), true
+}
+
 func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
 	baseURL, err := url.Parse(rawURL)
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
@@ -154,23 +186,85 @@ func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
 }
 
 func (c *Client) Status(ctx context.Context) (Status, error) {
-	info, err := c.Info(ctx)
+	snapshot, err := c.Snapshot(ctx)
 	if err != nil {
 		return Status{}, err
 	}
+	return snapshot.Status(), nil
+}
 
-	configs, err := getAllPages(ctx, c, "/v3/config/paths/list", staticCacheTTL, clonePageResponse[PathConfig])
+func (c *Client) Snapshot(ctx context.Context) (StatusSnapshot, error) {
+	return c.getStatusSnapshot(ctx)
+}
+
+// Channel returns the current MediaMTX channel for a path without cloning the
+// complete status. The returned value is isolated from the cached snapshot.
+func (c *Client) Channel(ctx context.Context, name string) (Channel, bool, error) {
+	snapshot, err := c.Snapshot(ctx)
 	if err != nil {
-		return Status{}, err
+		return Channel{}, false, err
+	}
+	channel, ok := snapshot.Channel(name)
+	return channel, ok, nil
+}
+
+func (c *Client) getStatusSnapshot(ctx context.Context) (*statusSnapshot, error) {
+	now := time.Now()
+	c.cacheMu.Lock()
+	if cached, ok := c.cache[statusCacheKey]; ok && now.Before(cached.expiresAt) {
+		snapshot := cached.value.(*statusSnapshot)
+		c.cacheMu.Unlock()
+		return snapshot, nil
+	}
+	if call := c.inflight[statusCacheKey]; call != nil && call.epoch == c.epoch {
+		c.cacheMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+			if call.err != nil {
+				return nil, call.err
+			}
+			return call.value.(*statusSnapshot), nil
+		}
+	}
+	epoch := c.epoch
+	call := &cacheCall{done: make(chan struct{}), epoch: epoch}
+	c.inflight[statusCacheKey] = call
+	c.cacheMu.Unlock()
+
+	snapshot, expiresAt, err := c.buildStatusSnapshot(ctx)
+	c.cacheMu.Lock()
+	call.value = snapshot
+	call.err = err
+	call.expiresAt = expiresAt
+	if c.inflight[statusCacheKey] == call {
+		delete(c.inflight, statusCacheKey)
+	}
+	if err == nil && c.epoch == epoch {
+		c.cache[statusCacheKey] = cacheEntry{value: snapshot, expiresAt: expiresAt}
+	}
+	close(call.done)
+	c.cacheMu.Unlock()
+	return snapshot, err
+}
+
+func (c *Client) buildStatusSnapshot(ctx context.Context) (*statusSnapshot, time.Time, error) {
+	info, err := getCachedResult(ctx, c, "/v3/info", staticCacheTTL, func(info Info) Info { return info })
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	configs, err := getAllPagesResult(ctx, c, "/v3/config/paths/list", staticCacheTTL, clonePageResponse[PathConfig])
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	runtimePaths, err := getAllPagesResult(ctx, c, "/v3/paths/list", runtimeCacheTTL, clonePathPage)
+	if err != nil {
+		return nil, time.Time{}, err
 	}
 
-	runtimePaths, err := getAllPages(ctx, c, "/v3/paths/list", runtimeCacheTTL, clonePathPage)
-	if err != nil {
-		return Status{}, err
-	}
-
-	channels := make(map[string]Channel, len(configs)+len(runtimePaths))
-	for _, item := range configs {
+	channels := make(map[string]Channel, len(configs.value)+len(runtimePaths.value))
+	for _, item := range configs.value {
 		channels[item.Name] = Channel{
 			Name:             item.Name,
 			ConfiguredSource: item.Source,
@@ -179,7 +273,7 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		}
 	}
 
-	for _, item := range runtimePaths {
+	for _, item := range runtimePaths.value {
 		channel := channels[item.Name]
 		channel.Name = item.Name
 		channel.Available = item.Available
@@ -203,7 +297,21 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		return ordered[i].Name < ordered[j].Name
 	})
 
-	return Status{Info: info, Channels: ordered}, nil
+	byPath := make(map[string]int, len(ordered))
+	for i := range ordered {
+		byPath[ordered[i].Name] = i
+	}
+	expiresAt := info.expiresAt
+	if configs.expiresAt.Before(expiresAt) {
+		expiresAt = configs.expiresAt
+	}
+	if runtimePaths.expiresAt.Before(expiresAt) {
+		expiresAt = runtimePaths.expiresAt
+	}
+	return &statusSnapshot{
+		status: Status{Info: info.value, Channels: ordered},
+		byPath: byPath,
+	}, expiresAt, nil
 }
 
 func (c *Client) Info(ctx context.Context) (Info, error) {
@@ -233,16 +341,26 @@ func (c *Client) PatchGlobal(ctx context.Context, config GlobalConfig) error {
 }
 
 func getCached[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(T) T) (T, error) {
+	result, err := getCachedResult(ctx, c, endpoint, ttl, clone)
+	return result.value, err
+}
+
+func getCachedResult[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(T) T) (cachedResult[T], error) {
 	requestURL := c.endpointURL(endpoint)
-	return getURLCached(ctx, c, endpoint, requestURL, ttl, clone)
+	return getURLCachedResult(ctx, c, endpoint, requestURL, ttl, clone)
 }
 
 func getPage[T any](ctx context.Context, c *Client, endpoint string, pageNumber int, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (pageResponse[T], error) {
+	result, err := getPageResult(ctx, c, endpoint, pageNumber, ttl, clone)
+	return result.value, err
+}
+
+func getPageResult[T any](ctx context.Context, c *Client, endpoint string, pageNumber int, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (cachedResult[pageResponse[T]], error) {
 	requestURL := c.endpointURL(endpoint)
 	query := requestURL.Query()
 	query.Set("page", strconv.Itoa(pageNumber))
 	requestURL.RawQuery = query.Encode()
-	return getURLCached(ctx, c, endpoint, requestURL, ttl, clone)
+	return getURLCachedResult(ctx, c, endpoint, requestURL, ttl, clone)
 }
 
 func (c *Client) endpointURL(endpoint string) url.URL {
@@ -252,29 +370,33 @@ func (c *Client) endpointURL(endpoint string) url.URL {
 }
 
 func getURLCached[T any](ctx context.Context, c *Client, endpoint string, requestURL url.URL, ttl time.Duration, clone func(T) T) (T, error) {
-	var zero T
+	result, err := getURLCachedResult(ctx, c, endpoint, requestURL, ttl, clone)
+	return result.value, err
+}
+
+func getURLCachedResult[T any](ctx context.Context, c *Client, endpoint string, requestURL url.URL, ttl time.Duration, clone func(T) T) (cachedResult[T], error) {
 	key := requestURL.String()
 	now := time.Now()
 	c.cacheMu.Lock()
 	if cached, ok := c.cache[key]; ok && now.Before(cached.expiresAt) {
 		if cached.err != nil {
 			c.cacheMu.Unlock()
-			return zero, cached.err
+			return cachedResult[T]{}, cached.err
 		}
 		value := cached.value.(T)
 		c.cacheMu.Unlock()
-		return clone(value), nil
+		return cachedResult[T]{value: clone(value), expiresAt: cached.expiresAt}, nil
 	}
 	if call := c.inflight[key]; call != nil && call.epoch == c.epoch {
 		c.cacheMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return zero, ctx.Err()
+			return cachedResult[T]{}, ctx.Err()
 		case <-call.done:
 			if call.err != nil {
-				return zero, call.err
+				return cachedResult[T]{}, call.err
 			}
-			return clone(call.value.(T)), nil
+			return cachedResult[T]{value: clone(call.value.(T)), expiresAt: call.expiresAt}, nil
 		}
 	}
 	epoch := c.epoch
@@ -288,21 +410,26 @@ func getURLCached[T any](ctx context.Context, c *Client, endpoint string, reques
 	if fetched {
 		err = decodeResponse(endpoint, data, &value)
 	}
+	expiresAt := time.Time{}
+	if fetched {
+		expiresAt = time.Now().Add(ttl)
+	}
 	c.cacheMu.Lock()
 	call.value = value
 	call.err = err
+	call.expiresAt = expiresAt
 	if c.inflight[key] == call {
 		delete(c.inflight, key)
 	}
 	if fetched && c.epoch == epoch {
-		c.cache[key] = cacheEntry{value: value, err: err, expiresAt: time.Now().Add(ttl)}
+		c.cache[key] = cacheEntry{value: value, err: err, expiresAt: expiresAt}
 	}
 	close(call.done)
 	c.cacheMu.Unlock()
 	if err != nil {
-		return zero, err
+		return cachedResult[T]{}, err
 	}
-	return clone(value), nil
+	return cachedResult[T]{value: clone(value), expiresAt: expiresAt}, nil
 }
 
 func (c *Client) fetch(ctx context.Context, endpoint string, requestURL url.URL) ([]byte, error) {
@@ -341,12 +468,22 @@ type pageResponse[T any] struct {
 }
 
 func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) ([]T, error) {
+	result, err := getAllPagesResult(ctx, c, endpoint, ttl, clone)
+	return result.value, err
+}
+
+func getAllPagesResult[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (cachedResult[[]T], error) {
 	items := []T(nil)
 	pageCount := 1
+	var expiresAt time.Time
 	for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
-		response, err := getPage(ctx, c, endpoint, pageNumber, ttl, clone)
+		result, err := getPageResult(ctx, c, endpoint, pageNumber, ttl, clone)
 		if err != nil {
-			return nil, err
+			return cachedResult[[]T]{}, err
+		}
+		response := result.value
+		if expiresAt.IsZero() || result.expiresAt.Before(expiresAt) {
+			expiresAt = result.expiresAt
 		}
 		if pageNumber == 0 {
 			if response.ItemCount > 0 {
@@ -358,7 +495,7 @@ func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl tim
 		}
 		items = append(items, response.Items...)
 	}
-	return items, nil
+	return cachedResult[[]T]{value: items, expiresAt: expiresAt}, nil
 }
 
 func clonePageResponse[T any](response pageResponse[T]) pageResponse[T] {
@@ -378,6 +515,35 @@ func cloneGlobalConfig(config GlobalConfig) GlobalConfig {
 	config.WebRTCIPsFromInterfacesList = slices.Clone(config.WebRTCIPsFromInterfacesList)
 	config.WebRTCAdditionalHosts = slices.Clone(config.WebRTCAdditionalHosts)
 	return config
+}
+
+func cloneStatus(status Status) Status {
+	status.Channels = slices.Clone(status.Channels)
+	for i := range status.Channels {
+		status.Channels[i] = cloneChannel(status.Channels[i])
+	}
+	return status
+}
+
+func cloneChannel(item Channel) Channel {
+	if item.AvailableTime != nil {
+		value := *item.AvailableTime
+		item.AvailableTime = &value
+	}
+	if item.OnlineTime != nil {
+		value := *item.OnlineTime
+		item.OnlineTime = &value
+	}
+	if item.Source != nil {
+		value := *item.Source
+		item.Source = &value
+	}
+	item.Readers = slices.Clone(item.Readers)
+	item.Tracks = slices.Clone(item.Tracks)
+	for i := range item.Tracks {
+		item.Tracks[i].CodecProps = cloneJSONMap(item.Tracks[i].CodecProps)
+	}
+	return item
 }
 
 func clonePath(item Path) Path {

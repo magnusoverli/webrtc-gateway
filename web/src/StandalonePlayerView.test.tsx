@@ -2,7 +2,7 @@
 
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Channel } from "./channel";
+import type { Channel, ChannelRuntime } from "./channel";
 
 const playerHarness = vi.hoisted(() => ({
   calls: vi.fn(),
@@ -85,6 +85,37 @@ describe("ChannelViewer", () => {
     expect(playerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
   });
 
+  it("falls back to a full multiview snapshot in the same poll on revision mismatch", async () => {
+    vi.useFakeTimers();
+    const original = fixtureChannel("studio-a", 1, "Studio A", true);
+    const latest = { ...original, revision: 2, name: "Studio A Remote" };
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/channels/runtime") {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ channels: [runtimeFor(latest)] }) });
+      }
+      if (url === "/api/v1/channels") {
+        const fullReads = fetch.mock.calls.filter(([candidate]) => String(candidate) === url).length;
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ channels: [fullReads === 1 ? original : latest] }) });
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    render(<ChannelViewer />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByRole("heading", { name: "Studio A Remote" })).toBeDefined();
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/channels",
+      "/api/v1/channels/runtime",
+      "/api/v1/channels",
+    ]);
+    expect(playerHarness.stopped).toEqual([]);
+  });
+
   it("preserves keyed sessions through reorder and cleans up removed or unready channels", () => {
     const north = fixtureChannel("north", 1, "North", true);
     const south = fixtureChannel("south", 2, "South", true);
@@ -137,6 +168,72 @@ describe("ChannelViewer", () => {
     expect(playerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
   });
 
+  it("uses focused runtime polling and treats deletion as definitive", async () => {
+    vi.useFakeTimers();
+    const channel = fixtureChannel("studio-a", 7, "Studio A", true);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/channels/7") {
+        return Promise.resolve({ ok: true, status: 200, json: async () => channel });
+      }
+      if (url === "/api/v1/channels/7/runtime") {
+        return Promise.resolve({ ok: false, status: 404, json: async () => ({ error: "channel not found" }) });
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    render(<StandalonePlayer channelID="7" />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByLabelText("Studio A embedded video")).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByLabelText("Embedded channel video")).toBeDefined();
+    expect(playerHarness.stopped).toEqual([channel.whepPath]);
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/channels/7",
+      "/api/v1/channels/7/runtime",
+    ]);
+  });
+
+  it("keeps using focused runtime polling after a full fallback confirms absence", async () => {
+    vi.useFakeTimers();
+    const original = fixtureChannel("studio-a", 7, "Studio A", true);
+    const changed = { ...original, revision: 2 };
+    let fullReads = 0;
+    let runtimeReads = 0;
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/channels/7") {
+        fullReads += 1;
+        return Promise.resolve(fullReads === 1
+          ? { ok: true, status: 200, json: async () => original }
+          : { ok: false, status: 404, json: async () => ({ error: "channel not found" }) });
+      }
+      if (url === "/api/v1/channels/7/runtime") {
+        runtimeReads += 1;
+        return Promise.resolve(runtimeReads === 1
+          ? { ok: true, status: 200, json: async () => runtimeFor(changed) }
+          : { ok: false, status: 404, json: async () => ({ error: "channel not found" }) });
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    render(<StandalonePlayer channelID="7" />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(screen.getByLabelText("Embedded channel video")).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/channels/7",
+      "/api/v1/channels/7/runtime",
+      "/api/v1/channels/7",
+      "/api/v1/channels/7/runtime",
+    ]);
+  });
+
   it("initializes document mode from the routed pathname", () => {
     expect(initializeStandaloneRoute("/embed/studio-a")).toEqual({ kind: "embed", channelID: "studio-a" });
     expect(document.documentElement.classList.contains("embed-document")).toBe(true);
@@ -165,11 +262,14 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
     embedPath: `/embed/${number}`,
     available: outputReady,
     online: outputReady,
+    inputGeneration: outputReady ? "input:" : ":",
     inboundBytes: 0,
     outputInboundBytes: 0,
+    outputGeneration: outputReady ? "output:direct" : ":direct",
     outboundBytes: 0,
     inboundFramesInError: 0,
     readers: [],
+    readerCount: 0,
     tracks: [],
     outputReady,
     outputTracks: [],
@@ -180,5 +280,31 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
       reasons: [],
       worker: { running: false, restarts: 0 },
     },
+  };
+}
+
+function runtimeFor(channel: Channel): ChannelRuntime {
+  return {
+    id: channel.id,
+    revision: channel.revision,
+    applyState: channel.applyState,
+    applyError: channel.applyError,
+    available: channel.available,
+    availableTime: channel.availableTime,
+    online: channel.online,
+    onlineTime: channel.onlineTime,
+    inputGeneration: channel.inputGeneration,
+    inboundBytes: channel.inboundBytes,
+    outputInboundBytes: channel.outputInboundBytes,
+    outputAvailableTime: channel.outputAvailableTime,
+    outputGeneration: channel.outputGeneration,
+    outboundBytes: channel.outboundBytes,
+    inboundFramesInError: channel.inboundFramesInError,
+    readerCount: channel.readerCount,
+    tracks: channel.tracks,
+    outputReady: channel.outputReady,
+    outputTracks: channel.outputTracks,
+    compatibility: channel.compatibility,
+    relay: channel.relay,
   };
 }

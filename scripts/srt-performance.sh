@@ -3,6 +3,10 @@
 set -uo pipefail
 
 GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:8080}"
+SRT_HOST="${SRT_HOST:-127.0.0.1}"
+if [[ "$SRT_HOST" == *:* && "$SRT_HOST" != \[*\] ]]; then
+  SRT_HOST="[$SRT_HOST]"
+fi
 SRT_PORT="${SRT_PORT:-11997}"
 READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-35}"
 RESOURCE_SAMPLES="${RESOURCE_SAMPLES:-3}"
@@ -138,11 +142,11 @@ start_sender() {
   local -a codecs=()
   local input_index=0
 
-  if [[ "$transport" == streamid ]]; then
-    target="srt://127.0.0.1:8890?pkt_size=1316&streamid=publish:$channel_path"
-  else
-    target="srt://127.0.0.1:$SRT_PORT?pkt_size=1316"
-  fi
+	if [[ "$transport" == streamid ]]; then
+		target="srt://$SRT_HOST:8890?pkt_size=1316&streamid=publish:$channel_path"
+	else
+		target="srt://$SRT_HOST:$SRT_PORT?pkt_size=1316"
+	fi
 
   if [[ "$case_name" == full-h265-2160p30-* && -n "$FOUR_K_SOURCE_FILE" ]]; then
     ffmpeg -hide_banner -loglevel error -nostdin -re -stream_loop -1 -i "$FOUR_K_SOURCE_FILE" \

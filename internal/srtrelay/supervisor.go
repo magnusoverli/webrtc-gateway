@@ -22,14 +22,15 @@ import (
 )
 
 const (
-	startupGrace            = 150 * time.Millisecond
-	maximumRestartDelay     = 30 * time.Second
-	listenerCapacityWarning = 40
-	classificationLimit     = 64 * 1024
-	maximumUDPPacketSize    = 64 * 1024
-	bridgeReadBufferSize    = 4 * 1024 * 1024
-	bridgeWriteBufferSize   = 1 * 1024 * 1024
-	rtpMP2TPayloadType      = 33
+	startupGrace               = 150 * time.Millisecond
+	maximumRestartDelay        = 30 * time.Second
+	listenerCapacityWarning    = 40
+	classificationLimit        = 64 * 1024
+	classificationMessageLimit = classificationLimit
+	maximumUDPPacketSize       = 64 * 1024
+	bridgeReadBufferSize       = 4 * 1024 * 1024
+	bridgeWriteBufferSize      = 1 * 1024 * 1024
+	rtpMP2TPayloadType         = 33
 )
 
 const (
@@ -590,7 +591,10 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		for {
 			packet, err := reader.read(buffer)
 			if err != nil {
-				return "elementary-rtp", errors.Join(err, <-input.wait)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return "elementary-rtp", errors.Join(err, <-input.wait)
+				}
+				return "elementary-rtp", errors.Join(err, terminateInput(input))
 			}
 			if isRTCP(packet) {
 				continue
@@ -675,57 +679,64 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 }
 
 func classifyPayload(reader *packetReader) (payloadMode, []byte, error) {
-	var messages [][]byte
-	total := 0
+	var rawInitial []byte
+	var rtpMP2TInitial []byte
+	total, messageCount := 0, 0
+	allRTP, allRTPMP2T := true, true
+	rawPossible := false
+	nextTSSyncOffset := 0
+	firstPayloadType := uint8(0)
 	buffer := make([]byte, maximumUDPPacketSize)
-	for total < classificationLimit {
+	for total < classificationLimit && messageCount < classificationMessageLimit {
 		packet, err := reader.read(buffer)
 		if err != nil {
 			return payloadUnknown, nil, err
 		}
-		message := append([]byte(nil), packet...)
-		messages = append(messages, message)
-		total += len(message)
+		messageCount++
+		total += len(packet)
 
-		allRTPMP2T := true
-		for _, candidate := range messages {
-			packet, err := parseRTP(candidate)
-			if err != nil || packet.payloadType != rtpMP2TPayloadType || !validTSPayload(packet.payload) {
+		var parsed rtpPacket
+		var rtpErr error
+		if allRTP {
+			parsed, rtpErr = parseRTP(packet)
+			if rtpErr != nil {
+				allRTP = false
+			} else if messageCount == 1 {
+				firstPayloadType = parsed.payloadType
+			}
+		}
+		if allRTPMP2T {
+			if rtpErr != nil || parsed.payloadType != rtpMP2TPayloadType || !validTSPayload(parsed.payload) {
 				allRTPMP2T = false
-				break
+				rtpMP2TInitial = nil
+			} else {
+				rtpMP2TInitial = append(rtpMP2TInitial, parsed.payload...)
 			}
 		}
-		if allRTPMP2T && len(messages) >= 2 {
-			initial := make([]byte, 0, total)
-			for _, candidate := range messages {
-				packet, _ := parseRTP(candidate)
-				initial = append(initial, packet.payload...)
-			}
-			return payloadRTPMP2T, initial, nil
+		if allRTPMP2T && messageCount >= 2 {
+			return payloadRTPMP2T, rtpMP2TInitial, nil
 		}
 
-		joined := joinPackets(messages)
-		if _, err := parseRTP(messages[0]); err != nil {
-			if offset := findTSSync(joined); offset >= 0 {
-				return payloadMPEGTS, joined[offset:], nil
+		if messageCount == 1 {
+			rawPossible = rtpErr != nil
+		}
+		if rawPossible {
+			rawInitial = append(rawInitial, packet...)
+			eligibleOffsets := min(188, len(rawInitial)-2*188)
+			for nextTSSyncOffset < eligibleOffsets {
+				offset := nextTSSyncOffset
+				nextTSSyncOffset++
+				if rawInitial[offset] == 0x47 && rawInitial[offset+188] == 0x47 && rawInitial[offset+2*188] == 0x47 {
+					return payloadMPEGTS, rawInitial[offset:], nil
+				}
+			}
+			if nextTSSyncOffset == 188 {
+				rawPossible = false
+				rawInitial = nil
 			}
 		}
-		if len(messages) >= 3 {
-			allRTP := true
-			payloadType := uint8(0)
-			for index, candidate := range messages {
-				packet, err := parseRTP(candidate)
-				if err != nil {
-					allRTP = false
-					break
-				}
-				if index == 0 {
-					payloadType = packet.payloadType
-				}
-			}
-			if allRTP {
-				return payloadUnknown, nil, fmt.Errorf("elementary RTP payload type %d requires an SDP in the channel SRT settings", payloadType)
-			}
+		if messageCount >= 3 && allRTP {
+			return payloadUnknown, nil, fmt.Errorf("elementary RTP payload type %d requires an SDP in the channel SRT settings", firstPayloadType)
 		}
 	}
 	return payloadUnknown, nil, fmt.Errorf("SRT payload is neither MPEG-TS nor RTP/MP2T payload type 33 after %d bytes", classificationLimit)
@@ -876,18 +887,6 @@ func findTSSync(value []byte) int {
 		}
 	}
 	return -1
-}
-
-func joinPackets(messages [][]byte) []byte {
-	total := 0
-	for _, message := range messages {
-		total += len(message)
-	}
-	result := make([]byte, 0, total)
-	for _, message := range messages {
-		result = append(result, message...)
-	}
-	return result
 }
 
 func elementaryPayloadTypes(sdp string) (map[uint8]bool, error) {
@@ -1049,11 +1048,11 @@ func internalPassphrase() (string, error) {
 	return hex.EncodeToString(value), nil
 }
 
-func terminateInput(input inputSession) {
-	if input.cmd.Process != nil {
+func terminateInput(input inputSession) error {
+	if input.cmd != nil && input.cmd.Process != nil {
 		_ = input.cmd.Process.Kill()
 	}
-	<-input.wait
+	return <-input.wait
 }
 
 func terminate(cmd *exec.Cmd, wait <-chan error) error {
@@ -1084,24 +1083,56 @@ type boundedWriter struct {
 	mu    sync.Mutex
 	limit int
 	data  []byte
+	start int
+	size  int
 }
 
 func newBoundedWriter(limit int) *boundedWriter {
-	return &boundedWriter{limit: limit}
+	writer := &boundedWriter{limit: limit}
+	if limit > 0 {
+		writer.data = make([]byte, limit)
+	}
+	return writer
 }
 
 func (w *boundedWriter) Write(value []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.data = append(w.data, value...)
-	if len(w.data) > w.limit {
-		w.data = append([]byte(nil), w.data[len(w.data)-w.limit:]...)
+	written := len(value)
+	if w.limit <= 0 || written == 0 {
+		return written, nil
 	}
-	return len(value), nil
+	if written >= w.limit {
+		copy(w.data, value[written-w.limit:])
+		w.start = 0
+		w.size = w.limit
+		return written, nil
+	}
+
+	writeAt := (w.start + w.size) % w.limit
+	first := min(written, w.limit-writeAt)
+	copy(w.data[writeAt:], value[:first])
+	copy(w.data, value[first:])
+	if overflow := w.size + written - w.limit; overflow > 0 {
+		w.start = (w.start + overflow) % w.limit
+		w.size = w.limit
+	} else {
+		w.size += written
+	}
+	return written, nil
 }
 
 func (w *boundedWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return string(bytes.TrimSpace(w.data))
+	if w.size == 0 {
+		return ""
+	}
+	if w.start+w.size <= w.limit {
+		return string(bytes.TrimSpace(w.data[w.start : w.start+w.size]))
+	}
+	value := make([]byte, w.size)
+	first := copy(value, w.data[w.start:])
+	copy(value[first:], w.data[:w.size-first])
+	return string(bytes.TrimSpace(value))
 }

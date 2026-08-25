@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -157,6 +158,82 @@ func TestFindTSSyncAllowsInitialPartialPacket(t *testing.T) {
 	}
 }
 
+func TestClassifyPayloadFindsRawTSSyncAcrossMessages(t *testing.T) {
+	stream := append([]byte{1, 2, 3}, make([]byte, 188*3)...)
+	stream[3], stream[3+188], stream[3+2*188] = 0x47, 0x47, 0x47
+	reader := packetReaderForMessages(stream[:100], stream[100:300], stream[300:])
+	defer reader.close()
+
+	mode, initial, err := classifyPayload(reader)
+	if err != nil {
+		t.Fatalf("classifyPayload() error = %v", err)
+	}
+	if mode != payloadMPEGTS || !slices.Equal(initial, stream[3:]) {
+		t.Fatalf("classifyPayload() = %v, %d initial bytes", mode, len(initial))
+	}
+}
+
+func TestClassifyPayloadRequiresTwoRTPMP2TMessages(t *testing.T) {
+	payload := make([]byte, 188)
+	payload[0] = 0x47
+	packet := testRTPPacket(rtpMP2TPayloadType, payload)
+
+	t.Run("one message", func(t *testing.T) {
+		wantErr := errors.New("input stopped")
+		packets := &fakePacketConn{reads: make(chan packetRead, 2)}
+		packets.reads <- packetRead{data: packet}
+		packets.reads <- packetRead{err: wantErr}
+		reader := newPacketReader(context.Background(), packets)
+		defer reader.close()
+		if _, _, err := classifyPayload(reader); !errors.Is(err, wantErr) {
+			t.Fatalf("classifyPayload() error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("two messages", func(t *testing.T) {
+		reader := packetReaderForMessages(packet, packet)
+		defer reader.close()
+		mode, initial, err := classifyPayload(reader)
+		if err != nil {
+			t.Fatalf("classifyPayload() error = %v", err)
+		}
+		if mode != payloadRTPMP2T || !slices.Equal(initial, append(append([]byte(nil), payload...), payload...)) {
+			t.Fatalf("classifyPayload() = %v, %d initial bytes", mode, len(initial))
+		}
+	})
+}
+
+func TestClassifyPayloadDetectsElementaryRTPAfterThreeMessages(t *testing.T) {
+	packet := testRTPPacket(96, []byte{1})
+	reader := packetReaderForMessages(packet, packet, packet)
+	defer reader.close()
+	_, _, err := classifyPayload(reader)
+	if err == nil || err.Error() != "elementary RTP payload type 96 requires an SDP in the channel SRT settings" {
+		t.Fatalf("classifyPayload() error = %v", err)
+	}
+}
+
+func TestClassifyPayloadBoundsTinyMalformedMessages(t *testing.T) {
+	for name, packet := range map[string][]byte{
+		"one byte": {0},
+		"empty":    {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			packets := &repeatingPacketConn{packet: packet}
+			reader := newPacketReader(context.Background(), packets)
+			defer reader.close()
+			_, _, err := classifyPayload(reader)
+			want := "SRT payload is neither MPEG-TS nor RTP/MP2T payload type 33 after 65536 bytes"
+			if err == nil || err.Error() != want {
+				t.Fatalf("classifyPayload() error = %v", err)
+			}
+			if packets.reads != classificationMessageLimit {
+				t.Fatalf("packet reads = %d, want %d", packets.reads, classificationMessageLimit)
+			}
+		})
+	}
+}
+
 func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
 	const passphrase = "plus+percent%secret"
 	args := remuxArgs("srt://127.0.0.1:8890?streamid=publish:test", passphrase)
@@ -187,6 +264,27 @@ func TestWriteFullHandlesShortWrites(t *testing.T) {
 	}
 	if got := output.value.String(); got != "complete payload" {
 		t.Fatalf("written payload = %q", got)
+	}
+}
+
+func TestBoundedWriterPreservesTrimmedTailAcrossWraps(t *testing.T) {
+	writer := newBoundedWriter(8)
+	var all []byte
+	for _, chunk := range [][]byte{[]byte("ab"), []byte("cdefgh"), []byte("ijk"), []byte("  oversized tail \n")} {
+		written, err := writer.Write(chunk)
+		if err != nil || written != len(chunk) {
+			t.Fatalf("Write() = %d, %v", written, err)
+		}
+		all = append(all, chunk...)
+		tail := all[max(0, len(all)-8):]
+		if got, want := writer.String(), strings.TrimSpace(string(tail)); got != want {
+			t.Fatalf("String() = %q, want %q", got, want)
+		}
+	}
+
+	empty := newBoundedWriter(0)
+	if written, err := empty.Write([]byte("discarded")); written != 9 || err != nil || empty.String() != "" {
+		t.Fatalf("zero-limit writer = %d, %v, %q", written, err, empty.String())
 	}
 }
 
@@ -245,6 +343,43 @@ func TestPacketReaderReturnsSocketErrors(t *testing.T) {
 	}
 	if got := packets.deadlines.Load(); got != 0 {
 		t.Fatalf("SetReadDeadline calls = %d, want 0", got)
+	}
+}
+
+func TestElementaryRelayTerminatesInputAfterSocketError(t *testing.T) {
+	packets, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := packets.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	input := inputSession{cmd: cmd, packets: packets, wait: wait}
+	plan := channel.SRTIngestPlan{
+		OutputAddress: "127.0.0.1:9",
+		RTPSDP:        "v=0\nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
+	}
+	supervisor := newTestSupervisor(t, "unused")
+	result := make(chan error, 1)
+	go func() {
+		_, relayErr := supervisor.relayConnection(context.Background(), plan, input)
+		result <- relayErr
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("relayConnection() error = nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relayConnection waited indefinitely for the running input process")
 	}
 }
 
@@ -735,8 +870,38 @@ type fakePacketConn struct {
 	deadlines atomic.Int32
 }
 
+type repeatingPacketConn struct {
+	packet []byte
+	reads  int
+}
+
+func (p *repeatingPacketConn) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, error) {
+	p.reads++
+	return copy(buffer, p.packet), nil, nil
+}
+
+func (p *repeatingPacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
 func newFakePacketConn() *fakePacketConn {
 	return &fakePacketConn{reads: make(chan packetRead, 8)}
+}
+
+func packetReaderForMessages(messages ...[]byte) *packetReader {
+	packets := &fakePacketConn{reads: make(chan packetRead, len(messages))}
+	for _, message := range messages {
+		packets.reads <- packetRead{data: message}
+	}
+	return newPacketReader(context.Background(), packets)
+}
+
+func testRTPPacket(payloadType uint8, payload []byte) []byte {
+	packet := make([]byte, 12+len(payload))
+	packet[0] = 0x80
+	packet[1] = payloadType
+	copy(packet[12:], payload)
+	return packet
 }
 
 func (p *fakePacketConn) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, error) {

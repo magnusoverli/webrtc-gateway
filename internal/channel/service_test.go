@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,22 @@ type fakePathManager struct {
 	replacements   int
 	deletedName    string
 	err            error
+}
+
+type countingRepository struct {
+	*SQLiteStore
+	lists        int
+	pendingLists int
+}
+
+func (r *countingRepository) List(ctx context.Context) ([]Channel, error) {
+	r.lists++
+	return r.SQLiteStore.List(ctx)
+}
+
+func (r *countingRepository) ListPending(ctx context.Context) ([]Channel, error) {
+	r.pendingLists++
+	return r.SQLiteStore.ListPending(ctx)
 }
 
 type fakeRTPPolicy struct {
@@ -287,6 +304,135 @@ func TestServicePersistsApplyFailureForRetry(t *testing.T) {
 	persisted, _ = store.Get(context.Background(), item.ID)
 	if persisted.ApplyState != ApplyApplied {
 		t.Fatalf("ApplyState = %q, want applied", persisted.ApplyState)
+	}
+}
+
+func TestServicePendingReconcileUsesPendingStoreQuery(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repository := &countingRepository{SQLiteStore: store}
+	media := &fakePathManager{}
+	service := NewService(repository, media, nil, nil, nil)
+	if _, err := service.Create(context.Background(), Draft{
+		Name: "Already applied", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	repository.lists = 0
+	media.replacements = 0
+
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if repository.pendingLists != 1 || repository.lists != 0 || media.replacements != 0 {
+		t.Fatalf("pending reconcile calls = pending lists %d, lists %d, replacements %d", repository.pendingLists, repository.lists, media.replacements)
+	}
+}
+
+func TestServicePendingReconcileRetriesUnknownState(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item, err := New(Draft{
+		Name: "Unknown state", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item.Number = 1
+	item.ApplyState = ApplyState("unknown")
+	if err := store.Create(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	media := &fakePathManager{}
+	service := NewService(store, media, nil, nil, nil)
+
+	if err := service.ReconcilePending(context.Background()); err != nil {
+		t.Fatalf("ReconcilePending() error = %v", err)
+	}
+	persisted, err := store.Get(context.Background(), item.ID)
+	if err != nil || persisted.ApplyState != ApplyApplied || media.replacedName != item.Path {
+		t.Fatalf("reconciled channel = %#v, %v; path = %q", persisted, err, media.replacedName)
+	}
+}
+
+func TestServicePendingReconcileContinuesAfterMalformedRow(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	malformed, err := New(Draft{
+		Name: "Malformed", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformed.Number = 1
+	semanticMalformed, err := New(Draft{
+		Name: "Semantic malformed", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9001}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semanticMalformed.Number = 2
+	healthy, err := New(Draft{
+		Name: "Healthy", Enabled: true,
+		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9002}},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy.Number = 3
+	if err := store.Create(context.Background(), malformed); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), semanticMalformed); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), healthy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE channels SET input_json = 'invalid' WHERE id = ?`, malformed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE channels SET input_json = '{"mode":"rtp-unicast"}' WHERE id = ?`, semanticMalformed.ID); err != nil {
+		t.Fatal(err)
+	}
+	media := &fakePathManager{}
+	service := NewService(store, media, nil, nil, nil)
+
+	err = service.ReconcilePending(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "decode channel input") || !strings.Contains(err.Error(), "validate persisted channel") {
+		t.Fatalf("ReconcilePending() error = %v", err)
+	}
+	persisted, err := store.Get(context.Background(), healthy.ID)
+	if err != nil || persisted.ApplyState != ApplyApplied || media.replacedName != healthy.Path || media.replacements != 1 {
+		t.Fatalf("healthy channel = %#v, %v; path = %q, replacements = %d", persisted, err, media.replacedName, media.replacements)
+	}
+	var malformedState ApplyState
+	if err := store.db.QueryRowContext(context.Background(), `SELECT apply_state FROM channels WHERE id = ?`, malformed.ID).Scan(&malformedState); err != nil {
+		t.Fatal(err)
+	}
+	if malformedState != ApplyPending {
+		t.Fatalf("malformed apply state = %q, want pending", malformedState)
+	}
+	var semanticMalformedState ApplyState
+	if err := store.db.QueryRowContext(context.Background(), `SELECT apply_state FROM channels WHERE id = ?`, semanticMalformed.ID).Scan(&semanticMalformedState); err != nil {
+		t.Fatal(err)
+	}
+	if semanticMalformedState != ApplyPending {
+		t.Fatalf("semantic malformed apply state = %q, want pending", semanticMalformedState)
 	}
 }
 

@@ -63,13 +63,16 @@ export type Channel = {
   availableTime?: string;
   online: boolean;
   onlineTime?: string;
+  inputGeneration: string;
   inboundBytes: number;
   outputInboundBytes: number;
   outputAvailableTime?: string;
+  outputGeneration: string;
   outboundBytes: number;
   inboundFramesInError: number;
   source?: { type: string; id: string };
   readers: Array<{ type: string; id: string }>;
+  readerCount: number;
   tracks: Track[];
   outputReady: boolean;
   outputTracks: Track[];
@@ -90,6 +93,31 @@ export type Channel = {
     worker: { running: boolean; queued?: boolean; restarts: number; error?: string };
   };
 };
+
+export type ChannelRuntime = Pick<
+  Channel,
+  | "id"
+  | "revision"
+  | "applyState"
+  | "applyError"
+  | "available"
+  | "availableTime"
+  | "online"
+  | "onlineTime"
+  | "inputGeneration"
+  | "inboundBytes"
+  | "outputInboundBytes"
+  | "outputAvailableTime"
+  | "outputGeneration"
+  | "outboundBytes"
+  | "inboundFramesInError"
+  | "readerCount"
+  | "tracks"
+  | "outputReady"
+  | "outputTracks"
+  | "compatibility"
+  | "relay"
+>;
 
 export type BrowserLocation = {
   protocol: string;
@@ -204,6 +232,107 @@ export function channelPlaybackReady(channel: Pick<Channel, "enabled" | "applySt
   return Boolean(channel?.enabled && channel.applyState === "applied" && channel.outputReady);
 }
 
+export function readChannelSnapshot(value: unknown): Channel | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Partial<Channel>;
+  if (typeof item.id !== "string" || typeof item.revision !== "number" || item.revision < 1 ||
+    typeof item.number !== "number" || typeof item.name !== "string" || typeof item.path !== "string" ||
+    typeof item.enabled !== "boolean" || typeof item.automaticPreview !== "boolean" ||
+    typeof item.createdAt !== "string" || typeof item.updatedAt !== "string" ||
+    typeof item.whepPath !== "string" || typeof item.viewerPath !== "string" || typeof item.embedPath !== "string" ||
+    typeof item.outputReady !== "boolean" || typeof item.applyState !== "string" ||
+    !item.input || typeof item.input.mode !== "string" || !isCompatibility(item.compatibility) ||
+    !Array.isArray(item.readers) || !Array.isArray(item.tracks) || !Array.isArray(item.outputTracks)) return null;
+  const sourceID = item.source && typeof item.source.id === "string" ? item.source.id : "";
+  return {
+    ...item,
+    readerCount: item.readers.length,
+    inputGeneration: `${item.availableTime ?? item.onlineTime ?? ""}:${sourceID}`,
+    outputGeneration: `${item.outputAvailableTime ?? ""}:${item.compatibility.mode ?? ""}`,
+  } as Channel;
+}
+
+export function readChannelSnapshots(value: unknown): Channel[] | null {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { channels?: unknown }).channels)) return null;
+  const channels: Channel[] = [];
+  for (const candidate of (value as { channels: unknown[] }).channels) {
+    const channel = readChannelSnapshot(candidate);
+    if (!channel) return null;
+    channels.push(channel);
+  }
+  return channels;
+}
+
+export function readChannelRuntime(value: unknown): ChannelRuntime | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Partial<ChannelRuntime>;
+  if (typeof item.id !== "string" || typeof item.revision !== "number" || item.revision < 1 ||
+    typeof item.applyState !== "string" || typeof item.available !== "boolean" || typeof item.online !== "boolean" ||
+    typeof item.inputGeneration !== "string" || typeof item.outputGeneration !== "string" ||
+    typeof item.inboundBytes !== "number" || typeof item.outputInboundBytes !== "number" ||
+    typeof item.outboundBytes !== "number" || typeof item.inboundFramesInError !== "number" ||
+    typeof item.readerCount !== "number" || !Number.isInteger(item.readerCount) || item.readerCount < 0 ||
+    !Array.isArray(item.tracks) || typeof item.outputReady !== "boolean" || !Array.isArray(item.outputTracks) ||
+    !isCompatibility(item.compatibility)) return null;
+  if (item.applyError !== undefined && typeof item.applyError !== "string") return null;
+  if (item.availableTime !== undefined && typeof item.availableTime !== "string") return null;
+  if (item.onlineTime !== undefined && typeof item.onlineTime !== "string") return null;
+  if (item.outputAvailableTime !== undefined && typeof item.outputAvailableTime !== "string") return null;
+  return item as ChannelRuntime;
+}
+
+export function readChannelRuntimes(value: unknown): ChannelRuntime[] | null {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { channels?: unknown }).channels)) return null;
+  const channels: ChannelRuntime[] = [];
+  for (const candidate of (value as { channels: unknown[] }).channels) {
+    const channel = readChannelRuntime(candidate);
+    if (!channel) return null;
+    channels.push(channel);
+  }
+  return channels;
+}
+
+export function mergeChannelRuntime(channel: Channel, runtime: ChannelRuntime): Channel | null {
+  if (channel.id !== runtime.id || channel.revision !== runtime.revision) return null;
+  return {
+    ...channel,
+    applyState: runtime.applyState,
+    applyError: runtime.applyError,
+    available: runtime.available,
+    availableTime: runtime.availableTime,
+    online: runtime.online,
+    onlineTime: runtime.onlineTime,
+    inputGeneration: runtime.inputGeneration,
+    inboundBytes: runtime.inboundBytes,
+    outputInboundBytes: runtime.outputInboundBytes,
+    outputAvailableTime: runtime.outputAvailableTime,
+    outputGeneration: runtime.outputGeneration,
+    outboundBytes: runtime.outboundBytes,
+    inboundFramesInError: runtime.inboundFramesInError,
+    readerCount: runtime.readerCount,
+    tracks: runtime.tracks,
+    outputReady: runtime.outputReady,
+    outputTracks: runtime.outputTracks,
+    compatibility: runtime.compatibility,
+    relay: runtime.relay,
+  };
+}
+
+export function mergeChannelRuntimes(channels: Channel[], runtimes: ChannelRuntime[]): Channel[] | null {
+  if (channels.length !== runtimes.length) return null;
+  const byID = new Map(runtimes.map((runtime) => [runtime.id, runtime]));
+  if (byID.size !== runtimes.length) return null;
+  const merged: Channel[] = [];
+  for (const channel of channels) {
+    const runtime = byID.get(channel.id);
+    if (!runtime) return null;
+    const next = mergeChannelRuntime(channel, runtime);
+    if (!next) return null;
+    merged.push(next);
+  }
+  return merged;
+}
+
 export function sampleChannelRates(
   channels: Channel[],
   previous: ReadonlyMap<string, ChannelRateSample>,
@@ -213,8 +342,8 @@ export function sampleChannelRates(
   const rates: Record<string, ChannelStreamRates> = {};
 
   for (const item of channels) {
-    const inputGeneration = `${item.availableTime ?? item.onlineTime ?? ""}:${item.source?.id ?? ""}`;
-    const outputGeneration = `${item.outputAvailableTime ?? ""}:${item.compatibility.mode ?? ""}`;
+    const inputGeneration = item.inputGeneration;
+    const outputGeneration = item.outputGeneration;
     const sample: ChannelRateSample = { sampledAt, inputGeneration, outputGeneration };
     if (item.available && item.online) sample.inputBytes = item.inboundBytes;
     if (item.outputReady) {
@@ -239,6 +368,13 @@ export function sampleChannelRates(
   }
 
   return { rates, samples };
+}
+
+function isCompatibility(value: unknown): value is Channel["compatibility"] {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<Channel["compatibility"]>;
+  return typeof item.state === "string" && Array.isArray(item.reasons) &&
+    Boolean(item.worker && typeof item.worker.running === "boolean" && typeof item.worker.restarts === "number");
 }
 
 export function trackKind(track: Track): TrackKind {

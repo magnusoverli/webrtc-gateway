@@ -387,6 +387,101 @@ func TestClientCachedResponsesIsolateCallers(t *testing.T) {
 	}
 }
 
+func TestClientCachesIndexedFinalStatusSnapshot(t *testing.T) {
+	var runtimeReads atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"standby","source":"publisher"},{"name":"demo","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		runtimeReads.Add(1)
+		fmt.Fprint(w, `{"items":[{"name":"demo","available":true,"online":true,"tracks2":[{"codec":"H264","codecProps":{"profile":"High"}}]}]}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.getStatusSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := client.getStatusSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second || first.byPath["demo"] != 0 || first.byPath["standby"] != 1 || runtimeReads.Load() != 1 {
+		t.Fatalf("snapshot cache/index = same %t, index %#v, reads %d", first == second, first.byPath, runtimeReads.Load())
+	}
+
+	value, found, err := client.Channel(context.Background(), "demo")
+	if err != nil || !found {
+		t.Fatalf("Channel(demo) = %#v, %t, %v", value, found, err)
+	}
+	value.Tracks[0].CodecProps["profile"] = "changed"
+	value, found, err = client.Channel(context.Background(), "demo")
+	if err != nil || !found || value.Tracks[0].CodecProps["profile"] != "High" || runtimeReads.Load() != 1 {
+		t.Fatalf("cached Channel(demo) = %#v, %t, %v, reads %d", value, found, err, runtimeReads.Load())
+	}
+	if _, found, err := client.Channel(context.Background(), "missing"); err != nil || found {
+		t.Fatalf("Channel(missing) found = %t, error %v", found, err)
+	}
+}
+
+func TestStatusSnapshotKeepsPairedLookupsInOneGeneration(t *testing.T) {
+	var runtimeReads atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"raw","source":"publisher"},{"name":"compat","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		generation := runtimeReads.Add(1)
+		fmt.Fprintf(w, `{"items":[{"name":"raw","available":true,"online":true,"inboundBytes":%d},{"name":"compat","available":true,"online":true,"inboundBytes":%d}]}`,
+			generation*100+1, generation*100+2)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, found := first.Channel("raw")
+	if !found {
+		t.Fatal("first snapshot omitted raw path")
+	}
+
+	client.invalidate()
+	second, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw, found := second.Channel("raw")
+	if !found {
+		t.Fatal("second snapshot omitted raw path")
+	}
+	compat, found := first.Channel("compat")
+	if !found {
+		t.Fatal("first snapshot omitted compatibility path")
+	}
+	if runtimeReads.Load() != 2 || raw.InboundBytes != 101 || compat.InboundBytes != 102 || secondRaw.InboundBytes != 201 {
+		t.Fatalf("snapshot generations: reads %d, first raw %d, first compat %d, second raw %d",
+			runtimeReads.Load(), raw.InboundBytes, compat.InboundBytes, secondRaw.InboundBytes)
+	}
+}
+
 func TestClientCoalescedResponsesIsolateCallers(t *testing.T) {
 	var reads atomic.Int32
 	started := make(chan struct{})

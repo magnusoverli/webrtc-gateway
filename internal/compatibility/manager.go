@@ -23,6 +23,8 @@ import (
 
 const pathPrefix = "compat-"
 
+var codecNormalizer = strings.NewReplacer(" ", "", "-", "", "_", "", "/", "")
+
 const (
 	metadataGrace        = 8 * time.Second
 	probeRetryDelay      = 3 * time.Second
@@ -93,13 +95,17 @@ type Manager struct {
 	encoderThreads int
 	workerCapacity int
 	probeVideo     func(context.Context, string) (videoCharacteristics, error)
+	startCommand   func(*exec.Cmd) error
 	now            func() time.Time
 
 	mu             sync.RWMutex
+	reconcileMu    sync.Mutex
 	entries        map[string]*entry
 	nextGeneration uint64
 	nextProbeTask  uint64
 	closed         bool
+	runCancel      context.CancelFunc
+	wake           chan struct{}
 	workers        sync.WaitGroup
 }
 
@@ -128,12 +134,14 @@ type probeTask struct {
 }
 
 type worker struct {
-	cancel   context.CancelFunc
-	cmd      *exec.Cmd
-	stderr   *ringWriter
-	started  time.Time
-	stopping bool
-	units    int
+	cancel     context.CancelFunc
+	cmd        *exec.Cmd
+	stderr     *ringWriter
+	started    time.Time
+	stopping   bool
+	spawning   bool
+	generation uint64
+	units      int
 }
 
 type decision struct {
@@ -201,7 +209,7 @@ func New(options Options) (*Manager, error) {
 		rtspURL: parsed, ffmpeg: options.FFmpeg, ffprobe: options.FFprobe,
 		interval: options.Interval, activeInterval: options.ActiveInterval,
 		encoderThreads: options.EncoderThreads, workerCapacity: options.WorkerCapacity,
-		entries: make(map[string]*entry),
+		entries: make(map[string]*entry), wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -222,49 +230,125 @@ func (m *Manager) Snapshot(channelID string) State {
 }
 
 func (m *Manager) Run(ctx context.Context) {
-	defer m.Close()
-	m.reconcile(ctx)
+	m.mu.Lock()
+	if m.closed || m.runCancel != nil {
+		m.mu.Unlock()
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	m.runCancel = cancel
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		m.Close()
+	}()
+
+	m.reconcile(runCtx)
+	if m.isClosed() {
+		return
+	}
 	timer := time.NewTimer(m.nextInterval())
 	defer timer.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return
+		case <-m.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		case <-timer.C:
-			m.reconcile(ctx)
-			timer.Reset(m.nextInterval())
 		}
+		if m.isClosed() {
+			return
+		}
+		m.reconcile(runCtx)
+		if m.isClosed() {
+			return
+		}
+		timer.Reset(m.nextInterval())
 	}
+}
+
+func (m *Manager) isClosed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.closed
 }
 
 func (m *Manager) nextInterval() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, item := range m.entries {
-		if item.state.State == StateProbing || item.state.State == StateStarting || item.probe != nil {
-			return m.activeInterval
+	now := m.nowTime()
+	next := m.interval
+	shorten := func(candidate time.Duration) {
+		if candidate > 0 && candidate < next {
+			next = candidate
 		}
 	}
-	return m.interval
+	shortenDeadline := func(deadline time.Time) {
+		candidate := deadline.Sub(now)
+		if candidate <= 0 {
+			shorten(m.activeInterval)
+			return
+		}
+		shorten(candidate)
+	}
+	for _, item := range m.entries {
+		if !item.retryAt.IsZero() {
+			shortenDeadline(item.retryAt)
+		}
+		if !item.classified && item.probe == nil && item.retryAt.IsZero() && !item.metadataDeadline.IsZero() {
+			shorten(m.activeInterval)
+			shortenDeadline(item.metadataDeadline)
+		}
+		if item.worker != nil && !item.worker.stopping && !item.worker.spawning && item.state.State != StateReady {
+			shorten(m.activeInterval)
+			shortenDeadline(item.worker.started.Add(workerStartupTimeout))
+		}
+		if item.state.State == StateStarting && item.worker == nil && !item.state.Worker.Queued && item.retryAt.IsZero() {
+			shorten(m.activeInterval)
+		}
+	}
+	return next
+}
+
+func (m *Manager) notify() {
+	select {
+	case m.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) Close() {
 	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		m.workers.Wait()
-		return
-	}
-	m.closed = true
-	for _, item := range m.entries {
-		cancelProbeLocked(item)
-		stopWorkerLocked(item)
+	cancel := m.runCancel
+	if !m.closed {
+		m.closed = true
+		for _, item := range m.entries {
+			cancelProbeLocked(item)
+			stopWorkerLocked(item)
+		}
 	}
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	m.notify()
+	m.reconcileMu.Lock()
+	m.reconcileMu.Unlock()
 	m.workers.Wait()
 }
 
 func (m *Manager) reconcile(ctx context.Context) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	if m.isClosed() {
+		return
+	}
 	configured, err := m.channels.List(ctx)
 	if err != nil {
 		m.logger.Warn("compatibility channel list unavailable", "error", err)
@@ -331,7 +415,6 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 
 	fingerprint := fingerprint(raw)
 	now := m.nowTime()
-	tracks := cloneTracks(raw.Tracks)
 	m.mu.Lock()
 	current := m.entryLocked(item.ID)
 	if current.fingerprint != fingerprint || !current.srt {
@@ -384,7 +467,7 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 		}
 		return
 	}
-	if current.probe != nil || (!tracksMetadataReady(tracks) && now.Before(current.metadataDeadline)) || (!current.retryAt.IsZero() && now.Before(current.retryAt)) {
+	if current.probe != nil || (!tracksMetadataReady(raw.Tracks) && now.Before(current.metadataDeadline)) || (!current.retryAt.IsZero() && now.Before(current.retryAt)) {
 		m.mu.Unlock()
 		return
 	}
@@ -400,6 +483,7 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
 	}
 	m.workers.Add(1)
+	tracks := cloneTracks(raw.Tracks)
 	m.mu.Unlock()
 	go m.runProbe(item.ID, item.Path, fingerprint, task, tracks)
 }
@@ -417,9 +501,9 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	})
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	current := m.entries[channelID]
 	if current == nil || current.generation != task.generation || current.fingerprint != fingerprint || current.probe != task || current.probe.id != task.id || task.ctx.Err() != nil {
+		m.mu.Unlock()
 		return
 	}
 	current.probe = nil
@@ -428,6 +512,8 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 		current.retryAt = m.nowTime().Add(probeRetryDelay)
 		current.state.State = StateError
 		current.state.LastError = err.Error()
+		m.mu.Unlock()
+		m.notify()
 		return
 	}
 	current.classified = true
@@ -439,9 +525,13 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 			Reasons: append([]string(nil), result.reasons...), OutputPath: CompatibilityPath(channelID),
 			InputFingerprint: fingerprint,
 		}
+		m.mu.Unlock()
+		m.notify()
 		return
 	}
 	current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
+	m.mu.Unlock()
+	m.notify()
 }
 
 func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, result decision, output mediamtx.Channel) {
@@ -450,8 +540,10 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	current := m.entries[item.ID]
 	refreshPath := current == nil || current.compatLimit != item.MaxReaders || current.compatAbsoluteTimestamp != item.UseAbsoluteTimestamp
 	retryAt := time.Time{}
+	generation := uint64(0)
 	if current != nil {
 		retryAt = current.retryAt
+		generation = current.generation
 	}
 	m.mu.RUnlock()
 	if !retryAt.IsZero() && m.nowTime().Before(retryAt) {
@@ -461,11 +553,11 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		if err := m.media.ReplacePath(ctx, compatPath, mediamtx.PathConfig{
 			Source: "publisher", MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
 		}); err != nil {
-			m.setWorkerError(item.ID, compatPath, result, fmt.Errorf("create compatibility path: %w", err))
+			m.setWorkerError(item.ID, generation, compatPath, result, fmt.Errorf("create compatibility path: %w", err))
 			return
 		}
 		m.mu.Lock()
-		if current := m.entries[item.ID]; current != nil {
+		if current := m.entries[item.ID]; current != nil && current.generation == generation && !m.closed {
 			current.compatLimit = item.MaxReaders
 			current.compatAbsoluteTimestamp = item.UseAbsoluteTimestamp
 			current.retryAt = time.Time{}
@@ -475,11 +567,11 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 
 	m.mu.Lock()
 	current = m.entries[item.ID]
-	if m.closed || current == nil || current.fingerprint == "" {
+	if m.closed || current == nil || current.generation != generation || current.fingerprint == "" {
 		m.mu.Unlock()
 		return
 	}
-	workerRunning := current.worker != nil && !current.worker.stopping
+	workerRunning := workerIsRunning(current.worker)
 	if workerRunning && output.Available && output.Online {
 		current.state = State{
 			State: StateReady, Mode: ModeTranscoded, Required: true,
@@ -491,10 +583,11 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		return
 	}
 	waitingCapacity := false
+	var reserved *worker
 	if current.worker == nil && (current.retryAt.IsZero() || !m.nowTime().Before(current.retryAt)) {
 		reservation := m.workerReservation(result.workerUnits)
 		if m.usedWorkerCapacityLocked()+reservation <= m.workerCapacity {
-			m.startWorkerLocked(ctx, item, current, result, reservation)
+			reserved = m.reserveWorkerLocked(ctx, item, current, result, reservation)
 		} else {
 			waitingCapacity = true
 			if !current.state.Worker.Queued {
@@ -502,7 +595,17 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 			}
 		}
 	}
-	if current.worker != nil && !current.worker.stopping && (!output.Available || !output.Online) && m.nowTime().Sub(current.worker.started) >= workerStartupTimeout {
+	if reserved != nil {
+		m.mu.Unlock()
+		m.startReservedWorker(item.ID, reserved, result)
+		m.mu.Lock()
+		current = m.entries[item.ID]
+		if m.closed || current == nil || current.generation != generation || current.fingerprint == "" {
+			m.mu.Unlock()
+			return
+		}
+	}
+	if current.worker != nil && !current.worker.stopping && !current.worker.spawning && (!output.Available || !output.Online) && m.nowTime().Sub(current.worker.started) >= workerStartupTimeout {
 		detail := fmt.Sprintf("compatibility output did not become ready within %s", workerStartupTimeout)
 		restarts := current.state.Worker.Restarts + 1
 		current.state = State{
@@ -517,7 +620,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		m.mu.Unlock()
 		return
 	}
-	workerRunning = current.worker != nil && !current.worker.stopping
+	workerRunning = workerIsRunning(current.worker)
 	workerState := StateStarting
 	if current.state.LastError != "" {
 		workerState = StateError
@@ -536,7 +639,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	m.mu.Unlock()
 }
 
-func (m *Manager) startWorkerLocked(ctx context.Context, item channel.Channel, current *entry, result decision, reservation int) {
+func (m *Manager) reserveWorkerLocked(ctx context.Context, item channel.Channel, current *entry, result decision, reservation int) *worker {
 	workerCtx, cancel := context.WithCancel(ctx)
 	stderr := newRingWriter(8192)
 	args := ffmpegArgs(m.pathURL(item.Path), m.pathURL(CompatibilityPath(item.ID)), result, m.encoderThreads)
@@ -550,20 +653,71 @@ func (m *Manager) startWorkerLocked(ctx context.Context, item channel.Channel, c
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 3 * time.Second
-	if err := cmd.Start(); err != nil {
-		cancel()
-		current.retryAt = m.nowTime().Add(retryDelay(current.state.Worker.Restarts))
-		current.state.LastError = err.Error()
-		current.state.Worker.Error = err.Error()
-		current.state.Worker.Restarts++
+	running := &worker{
+		cancel: cancel, cmd: cmd, stderr: stderr, spawning: true,
+		generation: current.generation, units: reservation,
+	}
+	current.worker = running
+	m.workers.Add(1)
+	return running
+}
+
+func (m *Manager) startReservedWorker(channelID string, running *worker, result decision) {
+	start := m.startCommand
+	if start == nil {
+		start = (*exec.Cmd).Start
+	}
+	if err := start(running.cmd); err != nil {
+		running.cancel()
+		m.mu.Lock()
+		current := m.entries[channelID]
+		if current != nil && current.worker == running {
+			current.worker = nil
+			if !m.closed && current.generation == running.generation && !running.stopping {
+				restarts := current.state.Worker.Restarts
+				detail := err.Error()
+				current.retryAt = m.nowTime().Add(retryDelay(restarts))
+				current.state = State{
+					State: StateError, Mode: ModeTranscoded, Required: true,
+					Reasons: append([]string(nil), result.reasons...), LastError: detail,
+					Worker: WorkerState{Restarts: restarts + 1, Error: detail}, OutputPath: CompatibilityPath(channelID),
+					InputFingerprint: current.fingerprint,
+				}
+			}
+		}
+		m.mu.Unlock()
+		m.workers.Done()
+		m.notify()
 		return
 	}
-	running := &worker{cancel: cancel, cmd: cmd, stderr: stderr, started: m.nowTime(), units: reservation}
-	current.worker = running
-	current.retryAt = time.Time{}
-	m.workers.Add(1)
-	m.logger.Info("compatibility worker started", "channel", item.ID, "videoTranscode", result.transcodeVideo, "audioTranscode", result.transcodeAudio, "capacityUnits", reservation)
-	go m.waitWorker(item.ID, running)
+
+	m.mu.Lock()
+	current := m.entries[channelID]
+	stale := m.closed || running.stopping || current == nil || current.worker != running || current.generation != running.generation
+	if !stale {
+		running.spawning = false
+		running.started = m.nowTime()
+		current.retryAt = time.Time{}
+	}
+	m.mu.Unlock()
+	if stale {
+		running.cancel()
+		_ = running.cmd.Wait()
+		m.mu.Lock()
+		if current := m.entries[channelID]; current != nil && current.worker == running {
+			current.worker = nil
+		}
+		m.mu.Unlock()
+		m.workers.Done()
+		m.notify()
+		return
+	}
+	m.logger.Info("compatibility worker started", "channel", channelID, "videoTranscode", result.transcodeVideo, "audioTranscode", result.transcodeAudio, "capacityUnits", running.units)
+	go m.waitWorker(channelID, running)
+}
+
+func workerIsRunning(running *worker) bool {
+	return running != nil && !running.stopping && !running.spawning
 }
 
 func (m *Manager) workerReservation(units int) int {
@@ -588,13 +742,16 @@ func (m *Manager) waitWorker(channelID string, running *worker) {
 	err := running.cmd.Wait()
 	running.cancel()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	current := m.entries[channelID]
 	if current == nil || current.worker != running {
+		m.mu.Unlock()
+		m.notify()
 		return
 	}
 	current.worker = nil
 	if running.stopping {
+		m.mu.Unlock()
+		m.notify()
 		return
 	}
 	detail := strings.TrimSpace(running.stderr.String())
@@ -611,6 +768,8 @@ func (m *Manager) waitWorker(channelID string, running *worker) {
 	current.state.Worker.Restarts++
 	current.retryAt = m.nowTime().Add(retryDelay(current.state.Worker.Restarts))
 	m.logger.Warn("compatibility worker stopped", "channel", channelID, "error", detail)
+	m.mu.Unlock()
+	m.notify()
 }
 
 func (m *Manager) setInactive(channelID, path, state string) {
@@ -646,10 +805,13 @@ func (m *Manager) setDirect(channelID, path, fingerprint string, result decision
 	current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
 }
 
-func (m *Manager) setWorkerError(channelID, outputPath string, result decision, err error) {
+func (m *Manager) setWorkerError(channelID string, generation uint64, outputPath string, result decision, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current := m.entryLocked(channelID)
+	current := m.entries[channelID]
+	if m.closed || current == nil || current.generation != generation {
+		return
+	}
 	current.state = State{
 		State: StateError, Mode: ModeTranscoded, Required: true,
 		Reasons: append([]string(nil), result.reasons...), LastError: err.Error(),
@@ -1035,19 +1197,34 @@ func (m *Manager) pathURL(mediaPath string) string {
 }
 
 func Fingerprint(runtime mediamtx.Channel) string {
-	value := struct {
-		Source        *mediamtx.PathSource `json:"source"`
-		AvailableTime *string              `json:"availableTime"`
-		Codecs        []string             `json:"codecs"`
-	}{
-		Source: runtime.Source, AvailableTime: runtime.AvailableTime,
-		Codecs: make([]string, 0, len(runtime.Tracks)),
+	var encoded strings.Builder
+	encoded.WriteByte('S')
+	if runtime.Source == nil {
+		encoded.WriteByte('0')
+	} else {
+		encoded.WriteByte('1')
+		writeFingerprintField(&encoded, runtime.Source.Type)
+		writeFingerprintField(&encoded, runtime.Source.ID)
 	}
+	encoded.WriteByte('A')
+	if runtime.AvailableTime == nil {
+		encoded.WriteByte('0')
+	} else {
+		encoded.WriteByte('1')
+		writeFingerprintField(&encoded, *runtime.AvailableTime)
+	}
+	encoded.WriteByte('C')
+	writeFingerprintField(&encoded, strconv.Itoa(len(runtime.Tracks)))
 	for _, track := range runtime.Tracks {
-		value.Codecs = append(value.Codecs, normalizeCodec(track.Codec))
+		writeFingerprintField(&encoded, normalizeCodec(track.Codec))
 	}
-	encoded, _ := json.Marshal(value)
-	return string(encoded)
+	return encoded.String()
+}
+
+func writeFingerprintField(encoded *strings.Builder, value string) {
+	encoded.WriteString(strconv.Itoa(len(value)))
+	encoded.WriteByte(':')
+	encoded.WriteString(value)
 }
 
 func fingerprint(runtime mediamtx.Channel) string {
@@ -1055,7 +1232,7 @@ func fingerprint(runtime mediamtx.Channel) string {
 }
 
 func normalizeCodec(codec string) string {
-	return strings.NewReplacer(" ", "", "-", "", "_", "", "/", "").Replace(strings.ToLower(codec))
+	return codecNormalizer.Replace(strings.ToLower(codec))
 }
 
 func tracksMetadataReady(tracks []mediamtx.Track) bool {
@@ -1108,24 +1285,51 @@ type ringWriter struct {
 	mu    sync.Mutex
 	limit int
 	data  []byte
+	start int
+	size  int
 }
 
 func newRingWriter(limit int) *ringWriter {
-	return &ringWriter{limit: limit}
+	if limit < 0 {
+		limit = 0
+	}
+	return &ringWriter{limit: limit, data: make([]byte, limit)}
 }
 
 func (w *ringWriter) Write(value []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.data = append(w.data, value...)
-	if len(w.data) > w.limit {
-		w.data = append([]byte(nil), w.data[len(w.data)-w.limit:]...)
+	written := len(value)
+	if w.limit == 0 || written == 0 {
+		return written, nil
 	}
-	return len(value), nil
+	if written >= w.limit {
+		copy(w.data, value[written-w.limit:])
+		w.start = 0
+		w.size = w.limit
+		return written, nil
+	}
+	end := (w.start + w.size) % w.limit
+	first := min(written, w.limit-end)
+	copy(w.data[end:], value[:first])
+	copy(w.data, value[first:])
+	overflow := max(0, w.size+written-w.limit)
+	w.start = (w.start + overflow) % w.limit
+	w.size = min(w.limit, w.size+written)
+	return written, nil
 }
 
 func (w *ringWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return string(bytes.TrimSpace(w.data))
+	if w.size == 0 {
+		return ""
+	}
+	if w.start+w.size <= w.limit {
+		return string(bytes.TrimSpace(w.data[w.start : w.start+w.size]))
+	}
+	ordered := make([]byte, w.size)
+	first := copy(ordered, w.data[w.start:])
+	copy(ordered[first:], w.data[:w.size-first])
+	return string(bytes.TrimSpace(ordered))
 }

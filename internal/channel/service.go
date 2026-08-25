@@ -428,20 +428,17 @@ func (s *Service) ReconcilePending(ctx context.Context) error {
 	}
 	defer release()
 
-	items, err := s.store.List(ctx)
+	items, err := s.store.ListPending(ctx)
+	var failures []error
 	if err != nil {
-		return err
+		failures = append(failures, err)
 	}
 
-	var failures []error
 	for _, item := range items {
 		if item.ApplyState == ApplyDeleting {
 			if err := s.finishDelete(ctx, item); err != nil {
 				failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, err))
 			}
-			continue
-		}
-		if item.ApplyState == ApplyApplied {
 			continue
 		}
 		if _, err := s.apply(ctx, item); err != nil {

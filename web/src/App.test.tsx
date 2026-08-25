@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, ConnectionRow, dashboardChannelID, dashboardURL, InputConnectionPanel, ResourceFooter } from "./App";
-import type { Channel, InputMode } from "./channel";
+import type { Channel, ChannelRuntime, InputMode } from "./channel";
 
 const appPlayerHarness = vi.hoisted(() => ({ calls: vi.fn() }));
 
@@ -37,11 +37,14 @@ function channelWithMode(mode: InputMode): Channel {
     embedPath: "/embed/1",
     available: false,
     online: false,
+    inputGeneration: ":",
     inboundBytes: 0,
     outputInboundBytes: 0,
+    outputGeneration: ":direct",
     outboundBytes: 0,
     inboundFramesInError: 0,
     readers: [],
+    readerCount: 0,
     tracks: [],
     outputReady: false,
     outputTracks: [],
@@ -92,6 +95,47 @@ function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
+function runtimeChannel(channel: Channel, overrides: Partial<ChannelRuntime> = {}): ChannelRuntime {
+  return {
+    id: channel.id,
+    revision: channel.revision,
+    applyState: channel.applyState,
+    applyError: channel.applyError,
+    available: channel.available,
+    availableTime: channel.availableTime,
+    online: channel.online,
+    onlineTime: channel.onlineTime,
+    inputGeneration: channel.inputGeneration,
+    inboundBytes: channel.inboundBytes,
+    outputInboundBytes: channel.outputInboundBytes,
+    outputAvailableTime: channel.outputAvailableTime,
+    outputGeneration: channel.outputGeneration,
+    outboundBytes: channel.outboundBytes,
+    inboundFramesInError: channel.inboundFramesInError,
+    readerCount: channel.readerCount,
+    tracks: channel.tracks,
+    outputReady: channel.outputReady,
+    outputTracks: channel.outputTracks,
+    compatibility: channel.compatibility,
+    relay: channel.relay,
+    ...overrides,
+  };
+}
+
+function runtimeStatus(status: ReturnType<typeof statusWith>, channels: ChannelRuntime[], settings: Record<string, unknown> = {}) {
+  return {
+    gateway: status.gateway,
+    media: status.media,
+    settings: {
+      revision: status.settings.revision,
+      applyState: status.settings.applyState,
+      ...settings,
+    },
+    network: status.network,
+    channels,
+  };
+}
+
 describe("dashboard navigation", () => {
   beforeEach(() => {
     appPlayerHarness.calls.mockClear();
@@ -139,6 +183,141 @@ describe("dashboard navigation", () => {
     expect(fireEvent.keyDown(window, { key: "ArrowRight" })).toBe(true);
     expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
     expect(window.location.search).toBe(`?channel=${item.id}`);
+  });
+
+  it("uses compact runtime polling after the full snapshot", async () => {
+    vi.useFakeTimers();
+    const item = {
+      ...channelWithMode("srt-push"),
+      available: true,
+      online: true,
+      outputReady: true,
+      inputGeneration: "input-one:source-one",
+      outputGeneration: "output-one:direct",
+      readers: [{ type: "webRTCSession", id: "reader-one" }],
+      readerCount: 1,
+      tracks: [{ codec: "H264" }],
+      outputTracks: [{ codec: "H264" }],
+      compatibility: { ...channelWithMode("srt-push").compatibility, state: "ready" as const },
+    };
+    const full = statusWith([item]);
+    const compact = runtimeStatus(full, [runtimeChannel(item, {
+      inboundBytes: 2_000,
+      outputInboundBytes: 1_500,
+      outboundBytes: 3_000,
+      readerCount: 4,
+    })]);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(compact));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText("1", { selector: ".metric-strip .metric strong" })).toBeDefined();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(screen.getByText("4", { selector: ".metric-strip .metric strong" })).toBeDefined();
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status", "/api/v1/status/runtime"]);
+  });
+
+  it("adopts the latest polling interval without restarting with a duplicate full fetch", async () => {
+    vi.useFakeTimers();
+    const item = channelWithMode("srt-push");
+    const full = statusWith([item], { settings: { statisticsIntervalMs: 500 } });
+    const compact = runtimeStatus(full, [runtimeChannel(item)]);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(compact));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status"]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(499); });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status", "/api/v1/status/runtime"]);
+  });
+
+  it("does not let a compact poll started before a mutation overwrite its result", async () => {
+    vi.useFakeTimers();
+    const item = { ...channelWithMode("srt-push"), revision: 7, automaticPreview: false };
+    const full = statusWith([item]);
+    let resolveRuntime!: (response: Response) => void;
+    const pendingRuntime = new Promise<Response>((resolve) => { resolveRuntime = resolve; });
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (url === "/api/v1/status/runtime") return pendingRuntime;
+      if (init?.method === "PATCH") return Promise.resolve(jsonResponse({
+        automaticPreview: true,
+        revision: 8,
+        updatedAt: "2026-08-25T09:00:00Z",
+      }));
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    act(() => { vi.advanceTimersByTime(2_000); });
+    expect(fetch.mock.calls.some(([input]) => String(input) === "/api/v1/status/runtime")).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Enable preview for Studio" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).getAttribute("aria-pressed")).toBe("true");
+
+    await act(async () => {
+      resolveRuntime(jsonResponse(runtimeStatus(full, [runtimeChannel(item)])));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("fetches a full status in the same poll on revision mismatch and preserves an open form", async () => {
+    vi.useFakeTimers();
+    const opened = { ...channelWithMode("srt-push"), revision: 3 };
+    const latest = { ...opened, revision: 4, name: "Remote Studio", updatedAt: "2026-08-25T09:00:00Z" };
+    const first = statusWith([opened]);
+    const remote = statusWith([latest], { settings: { revision: 3 } });
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/status/runtime") {
+        return Promise.resolve(jsonResponse(runtimeStatus(first, [runtimeChannel(opened)], { revision: 3 })));
+      }
+      if (url === "/api/v1/status") {
+        const fullReads = fetch.mock.calls.filter(([candidate]) => String(candidate) === "/api/v1/status").length;
+        return Promise.resolve(jsonResponse(fullReads === 1 ? first : remote));
+      }
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${opened.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Unsaved local name" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Unsaved local name");
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/status",
+      "/api/v1/status/runtime",
+      "/api/v1/status",
+    ]);
   });
 
   it("focuses page headings after card navigation and return", async () => {
@@ -276,6 +455,240 @@ describe("dashboard navigation", () => {
 
     await user.click(screen.getByRole("button", { name: "Reload latest" }));
     await waitFor(() => expect((screen.getByRole("combobox", { name: /Media server log level/ }) as HTMLSelectElement).value).toBe("debug"));
+  });
+
+  it("does not let an older channel poll overwrite a completed reload", async () => {
+    vi.useFakeTimers();
+    const opened = { ...channelWithMode("srt-push"), revision: 3 };
+    const latest = { ...opened, revision: 4, name: "Reloaded Studio", updatedAt: "2026-08-25T09:00:00Z" };
+    const openedStatus = statusWith([opened]);
+    const latestStatus = statusWith([latest]);
+    let resolveRuntime!: (response: Response) => void;
+    const pendingRuntime = new Promise<Response>((resolve) => { resolveRuntime = resolve; });
+    let statusReads = 0;
+    let channelWrites = 0;
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/status") {
+        statusReads += 1;
+        return Promise.resolve(jsonResponse(statusReads === 1 ? openedStatus : latestStatus));
+      }
+      if (url === "/api/v1/status/runtime") return pendingRuntime;
+      if (url === `/api/v1/channels/${opened.id}` && init?.method === "PUT") {
+        channelWrites += 1;
+        return Promise.resolve(channelWrites === 1
+          ? jsonResponse({ error: { code: "revision_conflict", message: "channel changed since it was read" } }, 412)
+          : jsonResponse({ error: "test stopped after revision assertion" }, 400));
+      }
+      if (url === `/api/v1/channels/${opened.id}`) return Promise.resolve(jsonResponse(latest));
+      throw new Error(`Unexpected request ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${opened.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    act(() => { vi.advanceTimersByTime(2_000); });
+    expect(fetch.mock.calls.some(([input]) => String(input) === "/api/v1/status/runtime")).toBe(true);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText(/opened at revision 3/)).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reload latest" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Reloaded Studio");
+    await act(async () => {
+      resolveRuntime(jsonResponse(runtimeStatus(openedStatus, [runtimeChannel(opened)])));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Reloaded Studio");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const putCalls = fetch.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(new Headers(putCalls[1]?.[1]?.headers).get("If-Match")).toBe('"4"');
+  });
+
+  it("opens a newer polled channel revision instead of a delayed reload response", async () => {
+    vi.useFakeTimers();
+    const opened = { ...channelWithMode("srt-push"), revision: 3 };
+    const reloaded = { ...opened, revision: 4, name: "Reload Response", updatedAt: "2026-08-25T09:00:00Z" };
+    const newest = { ...opened, revision: 5, name: "Polled Studio", updatedAt: "2026-08-25T10:00:00Z" };
+    const statuses = [statusWith([opened]), statusWith([reloaded]), statusWith([newest])];
+    let resolveReload!: (response: Response) => void;
+    const pendingReload = new Promise<Response>((resolve) => { resolveReload = resolve; });
+    let statusReads = 0;
+    let channelWrites = 0;
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/status") return Promise.resolve(jsonResponse(statuses[Math.min(statusReads++, statuses.length - 1)]));
+      if (url === "/api/v1/status/runtime") {
+        return Promise.resolve(jsonResponse(runtimeStatus(statuses[2], [runtimeChannel(newest)])));
+      }
+      if (url === `/api/v1/channels/${opened.id}` && init?.method === "PUT") {
+        channelWrites += 1;
+        return Promise.resolve(channelWrites === 1
+          ? jsonResponse({ error: { code: "revision_conflict", message: "channel changed since it was read" } }, 412)
+          : jsonResponse({ error: "test stopped after revision assertion" }, 400));
+      }
+      if (url === `/api/v1/channels/${opened.id}`) return pendingReload;
+      throw new Error(`Unexpected request ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${opened.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText(/opened at revision 3/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toContain("/api/v1/status/runtime");
+    await act(async () => {
+      resolveReload(jsonResponse(reloaded));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Polled Studio");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const putCalls = fetch.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(new Headers(putCalls[1]?.[1]?.headers).get("If-Match")).toBe('"5"');
+  });
+
+  it("does not let an older settings poll overwrite a completed reload", async () => {
+    vi.useFakeTimers();
+    const item = channelWithMode("srt-push");
+    const openedStatus = statusWith([item], { settings: { revision: 6, logLevel: "info" } });
+    const latestSettings = { ...openedStatus.settings, revision: 7, logLevel: "debug", updatedAt: "2026-08-25T10:00:00Z" };
+    const latestStatus = statusWith([item], { settings: latestSettings });
+    let resolveRuntime!: (response: Response) => void;
+    const pendingRuntime = new Promise<Response>((resolve) => { resolveRuntime = resolve; });
+    let statusReads = 0;
+    let settingsWrites = 0;
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/status") {
+        statusReads += 1;
+        return Promise.resolve(jsonResponse(statusReads === 1 ? openedStatus : latestStatus));
+      }
+      if (url === "/api/v1/status/runtime") return pendingRuntime;
+      if (url === "/api/v1/settings" && init?.method === "PUT") {
+        settingsWrites += 1;
+        return Promise.resolve(settingsWrites === 1
+          ? jsonResponse({ error: { code: "revision_conflict", message: "settings changed since they were read" } }, 412)
+          : jsonResponse({ error: "test stopped after revision assertion" }, 400));
+      }
+      if (url === "/api/v1/settings") return Promise.resolve(jsonResponse(latestSettings));
+      throw new Error(`Unexpected request ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    act(() => { vi.advanceTimersByTime(2_000); });
+    expect(fetch.mock.calls.some(([input]) => String(input) === "/api/v1/status/runtime")).toBe(true);
+    fireEvent.change(screen.getByRole("combobox", { name: /Media server log level/ }), { target: { value: "warn" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText(/opened at revision 6/)).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reload latest" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect((screen.getByRole("combobox", { name: /Media server log level/ }) as HTMLSelectElement).value).toBe("debug");
+    await act(async () => {
+      resolveRuntime(jsonResponse(runtimeStatus(openedStatus, [runtimeChannel(item)])));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByRole("combobox", { name: /Media server log level/ }) as HTMLSelectElement).value).toBe("debug");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const putCalls = fetch.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(new Headers(putCalls[1]?.[1]?.headers).get("If-Match")).toBe('"7"');
+  });
+
+  it("opens newer polled settings instead of a delayed reload response", async () => {
+    vi.useFakeTimers();
+    const item = channelWithMode("srt-push");
+    const openedStatus = statusWith([item], { settings: { revision: 6, logLevel: "info" } });
+    const reloadedSettings = { ...openedStatus.settings, revision: 7, logLevel: "debug", updatedAt: "2026-08-25T10:00:00Z" };
+    const newestSettings = { ...openedStatus.settings, revision: 8, logLevel: "error", updatedAt: "2026-08-25T11:00:00Z" };
+    const statuses = [
+      openedStatus,
+      statusWith([item], { settings: reloadedSettings }),
+      statusWith([item], { settings: newestSettings }),
+    ];
+    let resolveReload!: (response: Response) => void;
+    const pendingReload = new Promise<Response>((resolve) => { resolveReload = resolve; });
+    let statusReads = 0;
+    let settingsWrites = 0;
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/status") return Promise.resolve(jsonResponse(statuses[Math.min(statusReads++, statuses.length - 1)]));
+      if (url === "/api/v1/status/runtime") {
+        return Promise.resolve(jsonResponse(runtimeStatus(statuses[2], [runtimeChannel(item)])));
+      }
+      if (url === "/api/v1/settings" && init?.method === "PUT") {
+        settingsWrites += 1;
+        return Promise.resolve(settingsWrites === 1
+          ? jsonResponse({ error: { code: "revision_conflict", message: "settings changed since they were read" } }, 412)
+          : jsonResponse({ error: "test stopped after revision assertion" }, 400));
+      }
+      if (url === "/api/v1/settings") return pendingReload;
+      throw new Error(`Unexpected request ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText(/opened at revision 6/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toContain("/api/v1/status/runtime");
+    await act(async () => {
+      resolveReload(jsonResponse(reloadedSettings));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect((screen.getByRole("combobox", { name: /Media server log level/ }) as HTMLSelectElement).value).toBe("error");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const putCalls = fetch.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(new Headers(putCalls[1]?.[1]?.headers).get("If-Match")).toBe('"8"');
   });
 
   it("PATCHes only preview preference and preserves retained runtime fields", async () => {

@@ -14,8 +14,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"webrtc-gateway/internal/channel"
@@ -29,7 +31,7 @@ import (
 )
 
 type mediaStatusReader interface {
-	Status(context.Context) (mediamtx.Status, error)
+	Snapshot(context.Context) (mediamtx.StatusSnapshot, error)
 	GetGlobal(context.Context) (mediamtx.GlobalConfig, error)
 }
 
@@ -96,12 +98,19 @@ type server struct {
 	resources   resourceReader
 	version     string
 	startedAt   time.Time
-	whepTarget  *url.URL
+	whepProxy   *httputil.ReverseProxy
 	staticFiles fs.FS
 	management  ManagementBinding
 	restart     func()
 	interfaces  func() ([]networkbind.InterfaceAddress, error)
+
+	interfaceCacheMu        sync.Mutex
+	interfaceCache          []networkbind.InterfaceAddress
+	interfaceCacheErr       error
+	interfaceCacheExpiresAt time.Time
 }
+
+const interfaceCacheTTL = 500 * time.Millisecond
 
 type statusResponse struct {
 	Gateway   gatewayStatus       `json:"gateway"`
@@ -110,6 +119,21 @@ type statusResponse struct {
 	Network   networkStatus       `json:"network"`
 	Resources *telemetry.Snapshot `json:"resources,omitempty"`
 	Channels  []channelResponse   `json:"channels"`
+}
+
+type runtimeStatusResponse struct {
+	Gateway   gatewayStatus            `json:"gateway"`
+	Media     mediaStatus              `json:"media"`
+	Settings  runtimeSettingsResponse  `json:"settings"`
+	Network   networkStatus            `json:"network"`
+	Resources *telemetry.Snapshot      `json:"resources,omitempty"`
+	Channels  []runtimeChannelResponse `json:"channels"`
+}
+
+type runtimeSettingsResponse struct {
+	Revision   int                 `json:"revision"`
+	ApplyState settings.ApplyState `json:"applyState"`
+	ApplyError string              `json:"applyError,omitempty"`
 }
 
 type networkStatus struct {
@@ -208,6 +232,30 @@ type channelResponse struct {
 	OutputTracks         []mediamtx.Track      `json:"outputTracks"`
 	Compatibility        compatibility.State   `json:"compatibility"`
 	Relay                *srtrelay.Status      `json:"relay,omitempty"`
+}
+
+type runtimeChannelResponse struct {
+	ID                   string              `json:"id"`
+	Revision             int                 `json:"revision"`
+	ApplyState           channel.ApplyState  `json:"applyState"`
+	ApplyError           string              `json:"applyError,omitempty"`
+	Available            bool                `json:"available"`
+	AvailableTime        *string             `json:"availableTime,omitempty"`
+	Online               bool                `json:"online"`
+	OnlineTime           *string             `json:"onlineTime,omitempty"`
+	InputGeneration      string              `json:"inputGeneration"`
+	InboundBytes         uint64              `json:"inboundBytes"`
+	OutputInboundBytes   uint64              `json:"outputInboundBytes"`
+	OutputAvailableTime  *string             `json:"outputAvailableTime,omitempty"`
+	OutputGeneration     string              `json:"outputGeneration"`
+	OutboundBytes        uint64              `json:"outboundBytes"`
+	InboundFramesInError uint64              `json:"inboundFramesInError"`
+	ReaderCount          int                 `json:"readerCount"`
+	Tracks               []mediamtx.Track    `json:"tracks"`
+	OutputReady          bool                `json:"outputReady"`
+	OutputTracks         []mediamtx.Track    `json:"outputTracks"`
+	Compatibility        compatibility.State `json:"compatibility"`
+	Relay                *srtrelay.Status    `json:"relay,omitempty"`
 }
 
 type inputResponse struct {
@@ -358,21 +406,24 @@ func New(options Options) (http.Handler, error) {
 		resources:   options.Resources,
 		version:     options.Version,
 		startedAt:   options.StartedAt,
-		whepTarget:  whepTarget,
 		staticFiles: staticFiles,
 		management:  options.Management,
 		restart:     options.Restart,
 		interfaces:  interfaces,
 	}
+	s.whepProxy = newWHEPProxy(whepTarget, options.Logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/status", s.status)
+	mux.HandleFunc("GET /api/v1/status/runtime", s.runtimeStatus)
 	mux.HandleFunc("GET /api/v1/diagnostics", s.diagnostics)
 	mux.HandleFunc("GET /api/v1/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/v1/settings", s.updateSettings)
 	mux.HandleFunc("POST /api/v1/restart", s.restartGateway)
 	mux.HandleFunc("GET /api/v1/channels", s.listChannels)
+	mux.HandleFunc("GET /api/v1/channels/runtime", s.listRuntimeChannels)
+	mux.HandleFunc("GET /api/v1/channels/{id}/runtime", s.getRuntimeChannel)
 	mux.HandleFunc("POST /api/v1/channels", s.createChannel)
 	mux.HandleFunc("/api/v1/channels/", s.channelAction)
 	mux.Handle("/", s.spaHandler())
@@ -401,17 +452,46 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) status(w http.ResponseWriter, r *http.Request) {
-	configured, err := s.channels.List(r.Context())
+	response, message, err := s.statusSnapshot(r.Context())
 	if err != nil {
-		s.logger.Error("channel list unavailable", "error", err)
-		writeError(w, http.StatusInternalServerError, "channel configuration is unavailable")
+		s.logger.Error(message, "error", err)
+		writeError(w, http.StatusInternalServerError, message)
 		return
 	}
-	globalSettings, err := s.settings.Get(r.Context())
+	if !response.Media.Reachable {
+		markResponseDegraded(w)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *server) runtimeStatus(w http.ResponseWriter, r *http.Request) {
+	response, message, err := s.statusSnapshot(r.Context())
 	if err != nil {
-		s.logger.Error("global settings unavailable", "error", err)
-		writeError(w, http.StatusInternalServerError, "global settings are unavailable")
+		s.logger.Error(message, "error", err)
+		writeError(w, http.StatusInternalServerError, message)
 		return
+	}
+	if !response.Media.Reachable {
+		markResponseDegraded(w)
+	}
+	writeJSON(w, http.StatusOK, runtimeStatusResponse{
+		Gateway: response.Gateway,
+		Media:   response.Media,
+		Settings: runtimeSettingsResponse{
+			Revision: response.Settings.Revision, ApplyState: response.Settings.ApplyState, ApplyError: response.Settings.ApplyError,
+		},
+		Network: response.Network, Resources: response.Resources, Channels: runtimeChannels(response.Channels),
+	})
+}
+
+func (s *server) statusSnapshot(ctx context.Context) (statusResponse, string, error) {
+	configured, err := s.channels.List(ctx)
+	if err != nil {
+		return statusResponse{}, "channel configuration is unavailable", err
+	}
+	globalSettings, err := s.settings.Get(ctx)
+	if err != nil {
+		return statusResponse{}, "global settings are unavailable", err
 	}
 
 	response := statusResponse{
@@ -423,7 +503,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		resources := s.resources.Snapshot()
 		response.Resources = &resources
 	}
-	interfaceAddresses, interfaceErr := s.interfaces()
+	interfaceAddresses, interfaceErr := s.cachedInterfaces()
 	if interfaceErr == nil {
 		response.Network.Interfaces = interfaceAddresses
 	}
@@ -449,16 +529,18 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 	} else {
 		response.Network.Media.ResolvedAddress = resolved
 	}
-	if mediaGlobal, globalErr := s.mediaMTX.GetGlobal(r.Context()); globalErr == nil {
+	if mediaGlobal, globalErr := s.mediaMTX.GetGlobal(ctx); globalErr == nil {
 		response.Network.Media.ActiveAddress = networkbind.LegacyMediaBinding(
 			mediaGlobal.SRTAddress, mediaGlobal.WebRTCLocalUDPAddress, mediaGlobal.WebRTCLocalTCPAddress,
 		)
 		response.Network.Media.ActiveListeners = listenersFromGlobal(mediaGlobal)
 	}
-	mediaRuntime, mediaErr := s.mediaMTX.Status(r.Context())
+	mediaSnapshot, mediaErr := s.mediaMTX.Snapshot(ctx)
+	var mediaRuntime mediamtx.Status
 	if mediaErr != nil {
 		response.Media.Error = "MediaMTX is unavailable"
 	} else {
+		mediaRuntime = mediaSnapshot.Status()
 		response.Media = mediaStatus{
 			Reachable: true,
 			Version:   mediaRuntime.Info.Version,
@@ -466,7 +548,7 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	response.Channels = s.mergeChannels(configured, mediaRuntime.Channels)
-	writeJSON(w, http.StatusOK, response)
+	return response, "", nil
 }
 
 func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
@@ -496,10 +578,12 @@ func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	} else {
 		response.Media.Error = "MediaMTX listener configuration is unavailable"
 	}
-	runtime, runtimeErr := s.mediaMTX.Status(r.Context())
+	mediaSnapshot, runtimeErr := s.mediaMTX.Snapshot(r.Context())
+	var runtime mediamtx.Status
 	if runtimeErr != nil {
 		response.Media.Error = "MediaMTX is unavailable"
 	} else {
+		runtime = mediaSnapshot.Status()
 		response.Media.Reachable = true
 		response.Media.Version = runtime.Info.Version
 		response.Media.Started = runtime.Info.Started
@@ -556,6 +640,19 @@ func listenersFromGlobal(global mediamtx.GlobalConfig) *activeMediaListeners {
 	return &activeMediaListeners{
 		SRT: global.SRTAddress, WebRTCUDP: global.WebRTCLocalUDPAddress, WebRTCTCP: global.WebRTCLocalTCPAddress,
 	}
+}
+
+func (s *server) cachedInterfaces() ([]networkbind.InterfaceAddress, error) {
+	s.interfaceCacheMu.Lock()
+	defer s.interfaceCacheMu.Unlock()
+	if time.Now().Before(s.interfaceCacheExpiresAt) {
+		return slices.Clone(s.interfaceCache), s.interfaceCacheErr
+	}
+	interfaces, err := s.interfaces()
+	s.interfaceCache = slices.Clone(interfaces)
+	s.interfaceCacheErr = err
+	s.interfaceCacheExpiresAt = time.Now().Add(interfaceCacheTTL)
+	return slices.Clone(s.interfaceCache), err
 }
 
 func (s *server) restartGateway(w http.ResponseWriter, _ *http.Request) {
@@ -717,13 +814,29 @@ func (s *server) listChannels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "channel configuration is unavailable")
 		return
 	}
-	runtime, err := s.mediaMTX.Status(r.Context())
+	snapshot, err := s.mediaMTX.Snapshot(r.Context())
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
 		return
 	}
+	runtime := snapshot.Status()
 	responses := s.mergeChannels(items, runtime.Channels)
 	writeJSON(w, http.StatusOK, map[string]any{"channels": responses})
+}
+
+func (s *server) listRuntimeChannels(w http.ResponseWriter, r *http.Request) {
+	items, err := s.channels.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "channel configuration is unavailable")
+		return
+	}
+	snapshot, err := s.mediaMTX.Snapshot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
+		return
+	}
+	runtime := snapshot.Status()
+	writeJSON(w, http.StatusOK, map[string]any{"channels": runtimeChannels(s.mergeChannels(items, runtime.Channels))})
 }
 
 func (s *server) createChannel(w http.ResponseWriter, r *http.Request) {
@@ -847,18 +960,12 @@ func (s *server) channelAction(w http.ResponseWriter, r *http.Request) {
 	} else if s.compat != nil {
 		state := s.compat.Snapshot(item.ID)
 		if r.Method != http.MethodOptions && state.InputFingerprint != "" {
-			runtime, err := s.mediaMTX.Status(r.Context())
+			snapshot, err := s.mediaMTX.Snapshot(r.Context())
 			if err != nil {
 				writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
 				return
 			}
-			var raw mediamtx.Channel
-			for _, candidate := range runtime.Channels {
-				if candidate.Name == item.Path {
-					raw = candidate
-					break
-				}
-			}
+			raw, _ := snapshot.Channel(item.Path)
 			state = stateForRuntime(state, raw, item.Path)
 		}
 		if r.Method != http.MethodOptions && (state.State != compatibility.StateReady || state.OutputPath == "") {
@@ -895,15 +1002,11 @@ func whepSessionDelete(method string, parts []string) (bool, string, string) {
 }
 
 func (s *server) operationalWHEPTarget(ctx context.Context, item channel.Channel) (string, string, error) {
-	runtime, err := s.mediaMTX.Status(ctx)
+	snapshot, err := s.mediaMTX.Snapshot(ctx)
 	if err != nil {
 		return "", "", errors.New("media status is unavailable")
 	}
-	byPath := make(map[string]mediamtx.Channel, len(runtime.Channels))
-	for _, candidate := range runtime.Channels {
-		byPath[candidate.Name] = candidate
-	}
-	raw := byPath[item.Path]
+	raw, _ := snapshot.Channel(item.Path)
 	state := compatibility.State{State: compatibility.StateOffline, Mode: compatibility.ModeDirect, Reasons: []string{}, OutputPath: item.Path}
 	if raw.Available && raw.Online {
 		state.State = compatibility.StateReady
@@ -913,7 +1016,7 @@ func (s *server) operationalWHEPTarget(ctx context.Context, item channel.Channel
 	}
 	output := raw
 	if state.OutputPath != "" && state.OutputPath != item.Path {
-		output = byPath[state.OutputPath]
+		output, _ = snapshot.Channel(state.OutputPath)
 	}
 	if !channelRuntimeView(item, raw, output, state).OutputReady {
 		if state.LastError != "" {
@@ -941,14 +1044,44 @@ func (s *server) getChannel(id string, w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
-	runtime, err := s.mediaMTX.Status(r.Context())
+	view, err := s.focusedRuntimeChannel(r.Context(), item)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
 		return
 	}
-	view := s.mergeChannels([]channel.Channel{item}, runtime.Channels)
 	w.Header().Set("ETag", revisionETag(item.Revision))
-	writeJSON(w, http.StatusOK, view[0])
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *server) getRuntimeChannel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	item, err := s.channels.Get(r.Context(), id)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	view, err := s.focusedRuntimeChannel(r.Context(), item)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "media status is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, runtimeChannel(view))
+}
+
+func (s *server) focusedRuntimeChannel(ctx context.Context, item channel.Channel) (channelResponse, error) {
+	snapshot, err := s.mediaMTX.Snapshot(ctx)
+	if err != nil {
+		return channelResponse{}, err
+	}
+	raw, _ := snapshot.Channel(item.Path)
+	state := s.channelRuntimeState(item, raw)
+	output := raw
+	if state.OutputPath != "" && state.OutputPath != item.Path {
+		output, _ = snapshot.Channel(state.OutputPath)
+	}
+	view := channelRuntimeView(item, raw, output, state)
+	s.attachRelayStatus(item, &view)
+	return view, nil
 }
 
 func (s *server) getSRTPassphrase(id string, w http.ResponseWriter, r *http.Request) {
@@ -1029,17 +1162,28 @@ func (s *server) deleteChannel(id string, w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *server) proxyWHEP(channelID, mediaPath, route, suffix string, w http.ResponseWriter, r *http.Request) {
-	target := *s.whepTarget
-	proxy := httputil.NewSingleHostReverseProxy(&target)
+type whepRouting struct {
+	channelID string
+	mediaPath string
+	route     string
+	suffix    string
+}
+
+type whepRoutingContextKey struct{}
+
+func newWHEPProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
+	targetCopy := *target
+	proxy := httputil.NewSingleHostReverseProxy(&targetCopy)
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		req.URL.Path = strings.TrimSuffix(target.Path, "/") + "/" + url.PathEscape(mediaPath) + "/whep" + suffix
-		req.Host = target.Host
+		routing := req.Context().Value(whepRoutingContextKey{}).(whepRouting)
+		req.URL.Path = strings.TrimSuffix(targetCopy.Path, "/") + "/" + url.PathEscape(routing.mediaPath) + "/whep" + routing.suffix
+		req.Host = targetCopy.Host
 	}
 	proxy.ModifyResponse = func(res *http.Response) error {
-		if r.Method == http.MethodDelete && (res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusGone) {
+		routing := res.Request.Context().Value(whepRoutingContextKey{}).(whepRouting)
+		if res.Request.Method == http.MethodDelete && (res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusGone) {
 			res.StatusCode = http.StatusNoContent
 			res.Status = "204 " + http.StatusText(http.StatusNoContent)
 			res.Body.Close()
@@ -1057,24 +1201,31 @@ func (s *server) proxyWHEP(channelID, mediaPath, route, suffix string, w http.Re
 		if err != nil {
 			return nil
 		}
-		mediaPrefix := strings.TrimSuffix(target.Path, "/") + "/" + url.PathEscape(mediaPath) + "/whep"
+		mediaPrefix := strings.TrimSuffix(targetCopy.Path, "/") + "/" + url.PathEscape(routing.mediaPath) + "/whep"
 		if strings.HasPrefix(parsed.Path, mediaPrefix) {
 			parsed.Scheme = ""
 			parsed.Host = ""
-			publicPrefix := "/api/v1/channels/" + url.PathEscape(channelID) + "/whep"
-			if route != "" {
-				publicPrefix += "/" + route
+			publicPrefix := "/api/v1/channels/" + url.PathEscape(routing.channelID) + "/whep"
+			if routing.route != "" {
+				publicPrefix += "/" + routing.route
 			}
 			parsed.Path = publicPrefix + strings.TrimPrefix(parsed.Path, mediaPrefix)
 			res.Header.Set("Location", parsed.String())
 		}
 		return nil
 	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		s.logger.Warn("WHEP proxy failed", "channel", channelID, "error", err)
+	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+		routing := req.Context().Value(whepRoutingContextKey{}).(whepRouting)
+		logger.Warn("WHEP proxy failed", "channel", routing.channelID, "error", err)
 		writeError(w, http.StatusBadGateway, "WebRTC signaling is unavailable")
 	}
-	proxy.ServeHTTP(w, r)
+	return proxy
+}
+
+func (s *server) proxyWHEP(channelID, mediaPath, route, suffix string, w http.ResponseWriter, r *http.Request) {
+	routing := whepRouting{channelID: channelID, mediaPath: mediaPath, route: route, suffix: suffix}
+	request := r.WithContext(context.WithValue(r.Context(), whepRoutingContextKey{}, routing))
+	s.whepProxy.ServeHTTP(w, request)
 }
 
 func (s *server) spaHandler() http.Handler {
@@ -1203,11 +1354,70 @@ func (s *server) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		requestPath := r.URL.Path
-		next.ServeHTTP(w, r)
-		if requestPath != "/healthz" {
-			s.logger.Info("HTTP request", "method", r.Method, "path", requestPath, "duration", time.Since(started))
+		if requestPath == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
 		}
+		if routinePoll(r.Method, requestPath) {
+			response := &requestLogResponseWriter{ResponseWriter: w}
+			next.ServeHTTP(response, r)
+			if response.statusCode() < http.StatusBadRequest && !response.degraded {
+				return
+			}
+		} else {
+			next.ServeHTTP(w, r)
+		}
+		s.logger.Info("HTTP request", "method", r.Method, "path", requestPath, "duration", time.Since(started))
 	})
+}
+
+type requestLogResponseWriter struct {
+	http.ResponseWriter
+	status   int
+	degraded bool
+}
+
+func markResponseDegraded(w http.ResponseWriter) {
+	if marker, ok := w.(interface{ markDegraded() }); ok {
+		marker.markDegraded()
+	}
+}
+
+func (w *requestLogResponseWriter) markDegraded() {
+	w.degraded = true
+}
+
+func (w *requestLogResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *requestLogResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *requestLogResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func routinePoll(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	switch path {
+	case "/api/v1/status", "/api/v1/status/runtime", "/api/v1/channels", "/api/v1/channels/runtime":
+		return true
+	}
+	remainder := strings.TrimSuffix(strings.TrimPrefix(path, "/api/v1/channels/"), "/runtime")
+	return remainder != path && remainder != "" && !strings.Contains(remainder, "/") && path == "/api/v1/channels/"+remainder+"/runtime"
 }
 
 func decodeChannelRequest(r *http.Request) (channelRequest, error) {
@@ -1312,16 +1522,7 @@ func (s *server) mergeChannels(configured []channel.Channel, runtime []mediamtx.
 	responses := make([]channelResponse, 0, len(configured))
 	for _, item := range configured {
 		raw := byPath[item.Path]
-		state := compatibility.State{
-			State: compatibility.StateOffline, Mode: compatibility.ModeDirect,
-			Reasons: []string{}, OutputPath: item.Path,
-		}
-		if raw.Available && raw.Online {
-			state.State = compatibility.StateReady
-		}
-		if s.compat != nil {
-			state = stateForRuntime(s.compat.Snapshot(item.ID), raw, item.Path)
-		}
+		state := s.channelRuntimeState(item, raw)
 		output := raw
 		if state.OutputPath != "" && state.OutputPath != item.Path {
 			output = byPath[state.OutputPath]
@@ -1331,6 +1532,20 @@ func (s *server) mergeChannels(configured []channel.Channel, runtime []mediamtx.
 		responses = append(responses, view)
 	}
 	return responses
+}
+
+func (s *server) channelRuntimeState(item channel.Channel, runtime mediamtx.Channel) compatibility.State {
+	state := compatibility.State{
+		State: compatibility.StateOffline, Mode: compatibility.ModeDirect,
+		Reasons: []string{}, OutputPath: item.Path,
+	}
+	if runtime.Available && runtime.Online {
+		state.State = compatibility.StateReady
+	}
+	if s.compat != nil {
+		state = stateForRuntime(s.compat.Snapshot(item.ID), runtime, item.Path)
+	}
+	return state
 }
 
 func stateForRuntime(state compatibility.State, runtime mediamtx.Channel, directPath string) compatibility.State {
@@ -1431,6 +1646,54 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		view.Compatibility.Reasons = []string{}
 	}
 	return view
+}
+
+func runtimeChannels(channels []channelResponse) []runtimeChannelResponse {
+	result := make([]runtimeChannelResponse, 0, len(channels))
+	for _, item := range channels {
+		result = append(result, runtimeChannel(item))
+	}
+	return result
+}
+
+func runtimeChannel(item channelResponse) runtimeChannelResponse {
+	sourceID := ""
+	if item.Source != nil {
+		sourceID = item.Source.ID
+	}
+	return runtimeChannelResponse{
+		ID:                   item.ID,
+		Revision:             item.Revision,
+		ApplyState:           item.ApplyState,
+		ApplyError:           item.ApplyError,
+		Available:            item.Available,
+		AvailableTime:        item.AvailableTime,
+		Online:               item.Online,
+		OnlineTime:           item.OnlineTime,
+		InputGeneration:      generationMarker(item.AvailableTime, item.OnlineTime) + ":" + sourceID,
+		InboundBytes:         item.InboundBytes,
+		OutputInboundBytes:   item.OutputInboundBytes,
+		OutputAvailableTime:  item.OutputAvailableTime,
+		OutputGeneration:     generationMarker(item.OutputAvailableTime, nil) + ":" + item.Compatibility.Mode,
+		OutboundBytes:        item.OutboundBytes,
+		InboundFramesInError: item.InboundFramesInError,
+		ReaderCount:          len(item.Readers),
+		Tracks:               item.Tracks,
+		OutputReady:          item.OutputReady,
+		OutputTracks:         item.OutputTracks,
+		Compatibility:        item.Compatibility,
+		Relay:                item.Relay,
+	}
+}
+
+func generationMarker(primary, fallback *string) string {
+	if primary != nil {
+		return *primary
+	}
+	if fallback != nil {
+		return *fallback
+	}
+	return ""
 }
 
 func inputView(input channel.Input) inputResponse {

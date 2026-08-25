@@ -12,7 +12,11 @@ import {
   listenerPort,
   managementOrigin,
   mediaHost,
+  mergeChannelRuntimes,
   parseInterfaceBinding,
+  readChannelRuntimes,
+  readChannelSnapshot,
+  readChannelSnapshots,
   resolveBinding,
   resolveInterfaceBinding,
   sampleChannelRates,
@@ -23,6 +27,7 @@ import {
   type ChannelRateSample,
   type BindingInterface,
   type Channel,
+  type ChannelRuntime,
   type InputMode,
   type Track,
 } from "./channel";
@@ -95,6 +100,11 @@ type Status = {
   };
   resources?: ResourceSnapshot;
   channels: Channel[];
+};
+
+type RuntimeStatus = Omit<Status, "settings" | "channels"> & {
+  settings: Pick<GlobalSettings, "revision" | "applyState" | "applyError">;
+  channels: ChannelRuntime[];
 };
 
 type ResourceStatus = "ok" | "warming" | "stale" | "unavailable";
@@ -238,6 +248,10 @@ function Dashboard() {
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
   const statusPollingRef = useRef<ReturnType<typeof startSerialPolling> | null>(null);
+  const statusRef = useRef<Status | null>(null);
+  const pollIntervalRef = useRef(2_000);
+  const statusMutationGenerationRef = useRef(0);
+  const forceFullStatusRef = useRef(false);
   const selectedRevisionRef = useRef<{ id: string; revision: number } | null>(null);
   const overviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const detailHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -249,7 +263,7 @@ function Dashboard() {
   const previousMediaReachableRef = useRef<boolean | null>(null);
   const previousPreviewAnnouncementRef = useRef("");
 
-  const pollInterval = status?.settings.statisticsIntervalMs ?? 2000;
+  statusRef.current = status;
 
   useEffect(() => writeOverviewLayout(overviewLayout), [overviewLayout]);
 
@@ -280,16 +294,38 @@ function Dashboard() {
 
   useEffect(() => {
     let disposed = false;
+    let initialized = false;
+
+    const loadFull = async (signal: AbortSignal) => {
+      const { response, body } = await requestJSON<unknown>("/api/v1/status", { cache: "no-store", signal });
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Gateway status request failed"));
+      const snapshot = readStatusSnapshot(body);
+      if (!snapshot) throw new Error("Gateway returned malformed status data");
+      return snapshot;
+    };
 
     const load = async (signal: AbortSignal) => {
+      const mutationGeneration = statusMutationGenerationRef.current;
+      const forced = forceFullStatusRef.current;
+      if (forced) forceFullStatusRef.current = false;
       try {
-        const { response, body } = await requestJSON<unknown>("/api/v1/status", { cache: "no-store", signal });
-        if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Gateway status request failed"));
-        if (!isStatus(body)) throw new Error("Gateway returned malformed status data");
-        const nextStatus = body;
-        if (disposed) return;
+        let nextStatus: Status;
+        const current = statusRef.current;
+        if (!initialized || forced || !current) {
+          nextStatus = await loadFull(signal);
+        } else {
+          const { response, body } = await requestJSON<unknown>("/api/v1/status/runtime", { cache: "no-store", signal });
+          if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Gateway status request failed"));
+          const runtime = readRuntimeStatus(body);
+          if (!runtime) throw new Error("Gateway returned malformed runtime status data");
+          nextStatus = mergeRuntimeStatus(current, runtime) ?? await loadFull(signal);
+        }
+        if (disposed || mutationGeneration !== statusMutationGenerationRef.current) return;
+        initialized = true;
+        pollIntervalRef.current = nextStatus.settings.statisticsIntervalMs;
         const sampledRates = sampleChannelRates(nextStatus.channels, rateSamplesRef.current, performance.now());
         rateSamplesRef.current = sampledRates.samples;
+        statusRef.current = nextStatus;
         setStreamRates(sampledRates.rates);
         setStatus(nextStatus);
         setStatusError("");
@@ -299,19 +335,21 @@ function Dashboard() {
             : nextStatus.channels[0]?.id ?? "",
         );
       } catch (error) {
+        if (mutationGeneration !== statusMutationGenerationRef.current) return;
+        if (forced) forceFullStatusRef.current = true;
         if (!disposed && !signal.aborted) setStatusError(statusErrorMessage(error));
         throw error;
       }
     };
 
-    const stopPolling = startSerialPolling(load, pollInterval);
+    const stopPolling = startSerialPolling(load, { intervalMs: () => pollIntervalRef.current });
     statusPollingRef.current = stopPolling;
     return () => {
       disposed = true;
       stopPolling();
       if (statusPollingRef.current === stopPolling) statusPollingRef.current = null;
     };
-  }, [pollInterval, refreshToken]);
+  }, [refreshToken]);
 
   useEffect(() => setDeleteError(""), [selectedID]);
 
@@ -476,6 +514,7 @@ function Dashboard() {
   };
 
   const refreshStatus = () => {
+    forceFullStatusRef.current = true;
     if (statusPollingRef.current) statusPollingRef.current.runNow();
     else setRefreshToken((current) => current + 1);
   };
@@ -501,6 +540,7 @@ function Dashboard() {
       if (response.status !== 202) {
         throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Restart request failed"));
       }
+      statusMutationGenerationRef.current += 1;
       showToast({ kind: "info", message: "Gateway restart requested." });
       window.setTimeout(() => {
         if (destination.origin === window.location.origin && window.location.pathname === "/" && !window.location.search && !window.location.hash) {
@@ -591,6 +631,8 @@ function Dashboard() {
       }
       if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Settings request failed"));
       if (!isGlobalSettings(result)) throw new Error("Gateway returned malformed settings data");
+      statusMutationGenerationRef.current += 1;
+      pollIntervalRef.current = result.statisticsIntervalMs;
       setStatus((current) => current ? { ...current, settings: result } : current);
       setSettingsRevision(result.revision);
       if (result.applyState === "error") {
@@ -633,6 +675,7 @@ function Dashboard() {
       }
       if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Preview request failed"));
       if (!isChannelPreference(result)) throw new Error("Gateway returned a malformed preview preference");
+      statusMutationGenerationRef.current += 1;
       setStatus((current) => current ? {
         ...current,
         channels: current.channels.map((channel) => channel.id === item.id ? {
@@ -720,8 +763,9 @@ function Dashboard() {
       if (!response.ok) {
         throw new APIRequestError(response.status, apiErrorMessage(result, response.status, "Channel request failed"));
       }
-      if (!isChannel(result)) throw new Error("Gateway returned malformed channel data");
-      const saved = result;
+      const saved = readChannelSnapshot(result);
+      if (!saved) throw new Error("Gateway returned malformed channel data");
+      statusMutationGenerationRef.current += 1;
       setSelectedID(saved.id);
       setForm(null);
       refreshStatus();
@@ -753,6 +797,7 @@ function Dashboard() {
       if (!response.ok) {
         throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Unable to delete channel"));
       }
+      statusMutationGenerationRef.current += 1;
       if (response.status !== 202) {
         setSelectedID(status?.channels.find((channel) => channel.id !== item.id)?.id ?? "");
         showOverview("replace");
@@ -779,12 +824,22 @@ function Dashboard() {
     try {
       const { response, body } = await requestAPI(`/api/v1/channels/${encodeURIComponent(editingID)}`, { cache: "no-store" });
       if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Channel reload failed"));
-      if (!isChannel(body)) throw new Error("Gateway returned malformed channel data");
-      setStatus((current) => current ? {
-        ...current,
-        channels: current.channels.map((channel) => channel.id === body.id ? { ...channel, ...body } : channel),
-      } : current);
-      openEdit(body, true);
+      const latest = readChannelSnapshot(body);
+      if (!latest) throw new Error("Gateway returned malformed channel data");
+      const currentStatus = statusRef.current;
+      const currentChannel = currentStatus?.channels.find((channel) => channel.id === latest.id);
+      if (currentStatus && !currentChannel) throw new Error("The channel is no longer available");
+      const newest = currentChannel && currentChannel.revision >= latest.revision ? currentChannel : latest;
+      statusMutationGenerationRef.current += 1;
+      if (currentStatus && newest !== currentChannel) {
+        const nextStatus = {
+          ...currentStatus,
+          channels: currentStatus.channels.map((channel) => channel.id === newest.id ? newest : channel),
+        };
+        statusRef.current = nextStatus;
+        setStatus(nextStatus);
+      }
+      openEdit(newest, true);
       setFormError("");
       setFormConflict(false);
       setRevealedPassphrase(null);
@@ -804,12 +859,20 @@ function Dashboard() {
       const { response, body } = await requestAPI("/api/v1/settings", { cache: "no-store" });
       if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Settings reload failed"));
       if (!isGlobalSettings(body)) throw new Error("Gateway returned malformed settings data");
-      const { revision, applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = body;
+      const currentStatus = statusRef.current;
+      const newest = currentStatus && currentStatus.settings.revision >= body.revision ? currentStatus.settings : body;
+      statusMutationGenerationRef.current += 1;
+      pollIntervalRef.current = newest.statisticsIntervalMs;
+      if (currentStatus && newest !== currentStatus.settings) {
+        const nextStatus = { ...currentStatus, settings: newest };
+        statusRef.current = nextStatus;
+        setStatus(nextStatus);
+      }
+      const { revision, applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = newest;
       setSettingsRevision(revision);
-      setSettingsForm({ ...editable, webRTCAdditionalHosts: body.webRTCAdditionalHosts.join(", ") });
+      setSettingsForm({ ...editable, webRTCAdditionalHosts: newest.webRTCAdditionalHosts.join(", ") });
       setSettingsError("");
       setSettingsConflict(false);
-      setStatus((current) => current ? { ...current, settings: body } : current);
     } catch (error) {
       setSettingsError(isRequestTimeoutError(error)
         ? "Reloading the latest settings timed out. Your changes remain preserved."
@@ -1067,7 +1130,7 @@ function Dashboard() {
               <Metric label="Input rate" help="Current bitrate entering the channel, calculated from successive ingest byte counters." value={hasInput ? formatBitrate(selectedRates?.inputBitrateBps) : "—"} detail={hasInput ? `${formatBytes(selected.inboundBytes)} received` : "waiting for input"} />
               <Metric label="Output rate" help="Current bitrate published on the browser-compatible output path before viewer fan-out." value={hasOutput ? formatBitrate(selectedRates?.outputBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outputInboundBytes)} published` : "no active output"} />
               <Metric label="Delivery" help="Combined bitrate sent from the output path to all active readers. It can exceed output rate when multiple viewers are connected." value={hasOutput ? formatBitrate(selectedRates?.deliveryBitrateBps) : "—"} detail={hasOutput ? `${formatBytes(selected.outboundBytes)} sent` : "no active output"} />
-              <Metric label="Viewers" help="Readers currently attached to this channel's browser-compatible output path, including the dashboard preview." value={hasOutput ? String(selected.readers.length) : "—"} detail={hasOutput ? "active readers" : "no active output"} />
+              <Metric label="Viewers" help="Readers currently attached to this channel's browser-compatible output path, including the dashboard preview." value={hasOutput ? String(selected.readerCount) : "—"} detail={hasOutput ? "active readers" : "no active output"} />
             </section>
 
             <section className="stream-grid" aria-label="Input and output stream details">
@@ -2316,11 +2379,42 @@ function quoteRevision(revision: number) {
   return `"${revision}"`;
 }
 
-function isStatus(value: unknown): value is Status {
-  if (!value || typeof value !== "object") return false;
+function readStatusSnapshot(value: unknown): Status | null {
+  if (!value || typeof value !== "object") return null;
   const item = value as Partial<Status>;
-  return Boolean(item.gateway && item.media && item.network && isGlobalSettings(item.settings)) &&
-    Array.isArray(item.channels) && item.channels.every(isChannel);
+  if (!item.gateway || !item.media || !item.network || !isGlobalSettings(item.settings)) return null;
+  const channels = readChannelSnapshots({ channels: item.channels });
+  return channels ? { ...item, channels } as Status : null;
+}
+
+function readRuntimeStatus(value: unknown): RuntimeStatus | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Partial<RuntimeStatus>;
+  if (!item.gateway || !item.media || !item.network || !item.settings ||
+    typeof item.settings.revision !== "number" || item.settings.revision < 1 ||
+    typeof item.settings.applyState !== "string") return null;
+  if (item.settings.applyError !== undefined && typeof item.settings.applyError !== "string") return null;
+  const channels = readChannelRuntimes({ channels: item.channels });
+  return channels ? { ...item, channels } as RuntimeStatus : null;
+}
+
+function mergeRuntimeStatus(current: Status, runtime: RuntimeStatus): Status | null {
+  if (current.settings.revision !== runtime.settings.revision) return null;
+  const channels = mergeChannelRuntimes(current.channels, runtime.channels);
+  if (!channels) return null;
+  return {
+    ...current,
+    gateway: runtime.gateway,
+    media: runtime.media,
+    settings: {
+      ...current.settings,
+      applyState: runtime.settings.applyState,
+      applyError: runtime.settings.applyError,
+    },
+    network: runtime.network,
+    resources: runtime.resources,
+    channels,
+  };
 }
 
 function isGlobalSettings(value: unknown): value is GlobalSettings {
@@ -2330,18 +2424,6 @@ function isGlobalSettings(value: unknown): value is GlobalSettings {
     typeof item.managementBindAddress === "string" && typeof item.mediaBindAddress === "string" &&
     typeof item.applyState === "string" && typeof item.updatedAt === "string" &&
     Array.isArray(item.webRTCAdditionalHosts);
-}
-
-function isChannel(value: unknown): value is Channel {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<Channel>;
-  return typeof item.id === "string" && typeof item.revision === "number" && item.revision >= 1 &&
-    typeof item.name === "string" && typeof item.whepPath === "string" &&
-    typeof item.enabled === "boolean" && typeof item.automaticPreview === "boolean" &&
-    typeof item.outputReady === "boolean" && typeof item.applyState === "string" &&
-    Boolean(item.input && typeof item.input.mode === "string") &&
-    Boolean(item.compatibility && typeof item.compatibility.state === "string" && Array.isArray(item.compatibility.reasons)) &&
-    Array.isArray(item.readers) && Array.isArray(item.tracks) && Array.isArray(item.outputTracks);
 }
 
 function isChannelPreference(value: unknown): value is Pick<Channel, "automaticPreview" | "revision" | "updatedAt"> {

@@ -15,6 +15,7 @@ var ErrNotFound = errors.New("channel not found")
 
 type Repository interface {
 	List(context.Context) ([]Channel, error)
+	ListPending(context.Context) ([]Channel, error)
 	Get(context.Context, string) (Channel, error)
 	GetByNumber(context.Context, int) (Channel, error)
 	Create(context.Context, Channel) error
@@ -65,6 +66,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS channels_apply_state_index ON channels(apply_state)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -213,6 +215,34 @@ func (s *SQLiteStore) List(ctx context.Context) ([]Channel, error) {
 	return channels, nil
 }
 
+func (s *SQLiteStore) ListPending(ctx context.Context) ([]Channel, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		FROM channels
+		WHERE apply_state != ?
+		ORDER BY channel_number`, ApplyApplied)
+	if err != nil {
+		return nil, fmt.Errorf("list pending channels: %w", err)
+	}
+	defer rows.Close()
+
+	channels := make([]Channel, 0)
+	var failures []error
+	for rows.Next() {
+		item, err := scanChannel(rows)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		channels = append(channels, item)
+	}
+	if err := rows.Err(); err != nil {
+		failures = append(failures, fmt.Errorf("list pending channels: %w", err))
+	}
+	return channels, errors.Join(failures...)
+}
+
 func (s *SQLiteStore) Get(ctx context.Context, id string) (Channel, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
@@ -332,6 +362,16 @@ func scanChannel(row scanner) (Channel, error) {
 	item.UseAbsoluteTimestamp = useAbsoluteTimestamp
 	if err := json.Unmarshal([]byte(inputJSON), &item.Input); err != nil {
 		return Channel{}, fmt.Errorf("decode channel input: %w", err)
+	}
+	if _, err := ValidateDraft(Draft{
+		Name:                 item.Name,
+		Enabled:              item.Enabled,
+		AutomaticPreview:     item.AutomaticPreview,
+		Input:                item.Input,
+		MaxReaders:           item.MaxReaders,
+		UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
+	}); err != nil {
+		return Channel{}, fmt.Errorf("validate persisted channel: %w", err)
 	}
 	var err error
 	item.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)

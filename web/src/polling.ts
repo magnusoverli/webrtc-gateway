@@ -6,7 +6,7 @@ export type PollResult = {
 };
 
 export type SerialPollingOptions = {
-  intervalMs: number;
+  intervalMs: number | (() => number);
   maxFailureDelayMs?: number;
   jitterRatio?: number;
   random?: () => number;
@@ -38,9 +38,13 @@ export function startSerialPolling(
   const options = typeof intervalOrOptions === "number"
     ? { ...legacyOptions, intervalMs: intervalOrOptions }
     : intervalOrOptions;
-  const intervalMs = nonNegative(options.intervalMs, "Polling interval");
+  const intervalMs = () => nonNegative(
+    typeof options.intervalMs === "function" ? options.intervalMs() : options.intervalMs,
+    "Polling interval",
+  );
+  const initialIntervalMs = intervalMs();
   const maxFailureDelayMs = nonNegative(
-    options.maxFailureDelayMs ?? Math.max(intervalMs, 30_000),
+    options.maxFailureDelayMs ?? Math.max(initialIntervalMs, 30_000),
     "Maximum polling failure delay",
   );
   const jitterRatio = Math.min(1, Math.max(0, options.jitterRatio ?? 0.2));
@@ -65,7 +69,7 @@ export function startSerialPolling(
   };
   const failureDelay = () => {
     const exponent = Math.min(Math.max(0, failureCount - 1), 30);
-    const base = Math.min(maxFailureDelayMs, intervalMs * 2 ** exponent);
+    const base = Math.min(maxFailureDelayMs, intervalMs() * 2 ** exponent);
     const unit = Math.min(1, Math.max(0, random()));
     return Math.min(maxFailureDelayMs, Math.round(base * (1 - jitterRatio + unit * 2 * jitterRatio)));
   };
@@ -109,7 +113,7 @@ export function startSerialPolling(
             runPending = false;
             nextDelayMs = 0;
           } else if (status !== "aborted") {
-            nextDelayMs = status === "failure" ? failureDelay() : intervalMs;
+            nextDelayMs = status === "failure" ? failureDelay() : intervalMs();
           }
         }
         try {

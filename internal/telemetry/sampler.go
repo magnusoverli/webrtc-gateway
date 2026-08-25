@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,10 @@ const (
 	StatusStale       Status = "stale"
 	StatusUnavailable Status = "unavailable"
 )
+
+// cgroupLimitRefreshInterval bounds how long effective cpuset and controller
+// limit changes can remain cached while usage counters keep their one-second cadence.
+const cgroupLimitRefreshInterval = 30 * time.Second
 
 type Snapshot struct {
 	SampledAt time.Time            `json:"sampledAt"`
@@ -69,6 +74,7 @@ type Sampler struct {
 	snapshot        Snapshot
 	previousGateway *gatewaySample
 	previousHost    *hostSample
+	cgroupLimits    cgroupLimitCache
 }
 
 type sourcePaths struct {
@@ -85,6 +91,18 @@ type gatewaySample struct {
 	memoryCurrent uint64
 	memoryUsed    uint64
 	memoryLimit   *uint64
+}
+
+type gatewayLimits struct {
+	capacityCores float64
+	memoryLimit   *uint64
+}
+
+type cgroupLimitCache struct {
+	mu        sync.Mutex
+	value     gatewayLimits
+	refreshAt time.Time
+	valid     bool
 }
 
 type hostSample struct {
@@ -145,7 +163,7 @@ func (s *Sampler) sample() {
 		if cgroupMount == "" {
 			cgroupMount = s.paths.cgroup
 		}
-		gateway, gatewayErr = collectGateway(s.paths.cgroup, cgroupMount, now)
+		gateway, gatewayErr = s.collectGateway(s.paths.cgroup, cgroupMount, now)
 	}
 	host, hostErr := collectHost(s.paths.proc, now)
 
@@ -249,14 +267,42 @@ func hostScope(current hostSample, previous *hostSample) ResourceScope {
 	return result
 }
 
+func (s *Sampler) collectGateway(root, mount string, at time.Time) (gatewaySample, error) {
+	limits, err := s.cgroupLimits.get(root, mount, at)
+	if err != nil {
+		return gatewaySample{}, err
+	}
+	return collectGatewayUsage(root, at, limits)
+}
+
+func (c *cgroupLimitCache) get(root, mount string, at time.Time) (gatewayLimits, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.valid && at.Before(c.refreshAt) {
+		return c.value, nil
+	}
+	limits, err := readGatewayLimits(root, mount)
+	if err != nil {
+		return gatewayLimits{}, err
+	}
+	c.value = limits
+	c.refreshAt = at.Add(cgroupLimitRefreshInterval)
+	c.valid = true
+	return limits, nil
+}
+
 func collectGateway(root, mount string, at time.Time) (gatewaySample, error) {
+	limits, err := readGatewayLimits(root, mount)
+	if err != nil {
+		return gatewaySample{}, err
+	}
+	return collectGatewayUsage(root, at, limits)
+}
+
+func collectGatewayUsage(root string, at time.Time, limits gatewayLimits) (gatewaySample, error) {
 	usage, err := readUintField(filepath.Join(root, "cpu.stat"), "usage_usec")
 	if err != nil {
 		return gatewaySample{}, fmt.Errorf("read cpu usage: %w", err)
-	}
-	capacity, err := cpuCapacity(root, mount)
-	if err != nil {
-		return gatewaySample{}, fmt.Errorf("read cpu capacity: %w", err)
 	}
 	current, err := readUintFile(filepath.Join(root, "memory.current"))
 	if err != nil {
@@ -270,13 +316,9 @@ func collectGateway(root, mount string, at time.Time) (gatewaySample, error) {
 		return gatewaySample{}, fmt.Errorf("memory inactive file cache exceeds current usage")
 	}
 	used := current - inactive
-	limit, err := memoryLimit(root, mount)
-	if err != nil {
-		return gatewaySample{}, fmt.Errorf("read memory limit: %w", err)
-	}
 	return gatewaySample{
-		at: at, usageUsec: usage, capacityCores: capacity,
-		memoryCurrent: current, memoryUsed: used, memoryLimit: limit,
+		at: at, usageUsec: usage, capacityCores: limits.capacityCores,
+		memoryCurrent: current, memoryUsed: used, memoryLimit: limits.memoryLimit,
 	}, nil
 }
 
@@ -285,7 +327,7 @@ func collectHost(procRoot string, at time.Time) (hostSample, error) {
 	if err != nil {
 		return hostSample{}, fmt.Errorf("read cpu totals: %w", err)
 	}
-	total, idle, cores, err := parseProcStat(string(statData))
+	total, idle, cores, err := parseProcStat(statData)
 	if err != nil {
 		return hostSample{}, err
 	}
@@ -293,7 +335,7 @@ func collectHost(procRoot string, at time.Time) (hostSample, error) {
 	if err != nil {
 		return hostSample{}, fmt.Errorf("read memory totals: %w", err)
 	}
-	memoryTotal, memoryAvailable, err := parseMeminfo(string(memoryData))
+	memoryTotal, memoryAvailable, err := parseMeminfo(memoryData)
 	if err != nil {
 		return hostSample{}, err
 	}
@@ -303,7 +345,23 @@ func collectHost(procRoot string, at time.Time) (hostSample, error) {
 	}, nil
 }
 
-func cpuCapacity(root, mount string) (float64, error) {
+func readGatewayLimits(root, mount string) (gatewayLimits, error) {
+	hierarchy, err := cgroupHierarchy(root, mount)
+	if err != nil {
+		return gatewayLimits{}, err
+	}
+	capacity, err := cpuCapacity(root, hierarchy)
+	if err != nil {
+		return gatewayLimits{}, fmt.Errorf("read cpu capacity: %w", err)
+	}
+	limit, err := memoryLimit(hierarchy)
+	if err != nil {
+		return gatewayLimits{}, fmt.Errorf("read memory limit: %w", err)
+	}
+	return gatewayLimits{capacityCores: capacity, memoryLimit: limit}, nil
+}
+
+func cpuCapacity(root string, hierarchy []string) (float64, error) {
 	cpus := runtime.NumCPU()
 	if data, err := os.ReadFile(filepath.Join(root, "cpuset.cpus.effective")); err == nil {
 		if count, parseErr := parseCPUSet(strings.TrimSpace(string(data))); parseErr == nil && count > 0 {
@@ -311,10 +369,6 @@ func cpuCapacity(root, mount string) (float64, error) {
 		}
 	}
 	capacity := float64(cpus)
-	hierarchy, err := cgroupHierarchy(root, mount)
-	if err != nil {
-		return 0, err
-	}
 	for _, cgroup := range hierarchy {
 		data, readErr := os.ReadFile(filepath.Join(cgroup, "cpu.max"))
 		if errors.Is(readErr, os.ErrNotExist) {
@@ -323,13 +377,13 @@ func cpuCapacity(root, mount string) (float64, error) {
 		if readErr != nil {
 			return 0, readErr
 		}
-		fields := strings.Fields(string(data))
+		fields := bytes.Fields(data)
 		if len(fields) != 2 {
 			return 0, fmt.Errorf("invalid cpu.max")
 		}
-		if fields[0] != "max" {
-			quota, quotaErr := strconv.ParseFloat(fields[0], 64)
-			period, periodErr := strconv.ParseFloat(fields[1], 64)
+		if !bytes.Equal(fields[0], []byte("max")) {
+			quota, quotaErr := strconv.ParseFloat(string(fields[0]), 64)
+			period, periodErr := strconv.ParseFloat(string(fields[1]), 64)
 			if quotaErr != nil || periodErr != nil || quota <= 0 || period <= 0 {
 				return 0, fmt.Errorf("invalid cpu.max")
 			}
@@ -344,11 +398,7 @@ func cpuCapacity(root, mount string) (float64, error) {
 	return capacity, nil
 }
 
-func memoryLimit(root, mount string) (*uint64, error) {
-	hierarchy, err := cgroupHierarchy(root, mount)
-	if err != nil {
-		return nil, err
-	}
+func memoryLimit(hierarchy []string) (*uint64, error) {
 	var effective *uint64
 	for _, cgroup := range hierarchy {
 		limit, readErr := readLimit(filepath.Join(cgroup, "memory.max"))
@@ -434,34 +484,31 @@ func parseCPUSet(value string) (int, error) {
 	return count, nil
 }
 
-func parseProcStat(value string) (uint64, uint64, int, error) {
-	scanner := bufio.NewScanner(strings.NewReader(value))
+func parseProcStat(value []byte) (uint64, uint64, int, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(value))
 	var total, idle uint64
 	cores := 0
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
+		fields := bytes.Fields(scanner.Bytes())
 		if len(fields) == 0 {
 			continue
 		}
-		if fields[0] == "cpu" {
+		if bytes.Equal(fields[0], []byte("cpu")) {
 			if len(fields) < 6 {
 				return 0, 0, 0, fmt.Errorf("invalid /proc/stat CPU line")
 			}
-			values := make([]uint64, min(len(fields)-1, 8))
-			for index := range values {
-				parsed, err := strconv.ParseUint(fields[index+1], 10, 64)
+			for index := 0; index < min(len(fields)-1, 8); index++ {
+				parsed, err := parseUintBytes(fields[index+1])
 				if err != nil {
 					return 0, 0, 0, fmt.Errorf("invalid /proc/stat CPU value")
 				}
-				values[index] = parsed
 				total += parsed
+				if index == 3 || index == 4 {
+					idle += parsed
+				}
 			}
-			idle = values[3]
-			if len(values) > 4 {
-				idle += values[4]
-			}
-		} else if len(fields[0]) > 3 && strings.HasPrefix(fields[0], "cpu") {
-			if _, err := strconv.Atoi(fields[0][3:]); err == nil {
+		} else if len(fields[0]) > 3 && bytes.Equal(fields[0][:3], []byte("cpu")) {
+			if _, err := parseUintBytes(fields[0][3:]); err == nil {
 				cores++
 			}
 		}
@@ -475,33 +522,56 @@ func parseProcStat(value string) (uint64, uint64, int, error) {
 	return total, idle, cores, nil
 }
 
-func parseMeminfo(value string) (uint64, uint64, error) {
-	fields := map[string]uint64{}
-	scanner := bufio.NewScanner(strings.NewReader(value))
+func parseMeminfo(value []byte) (uint64, uint64, error) {
+	var total, available uint64
+	var totalOK, availableOK bool
+	scanner := bufio.NewScanner(bytes.NewReader(value))
 	for scanner.Scan() {
-		parts := strings.Fields(scanner.Text())
+		parts := bytes.Fields(scanner.Bytes())
 		if len(parts) < 2 {
 			continue
 		}
-		name := strings.TrimSuffix(parts[0], ":")
-		if name != "MemTotal" && name != "MemAvailable" {
+		isTotal := bytes.Equal(parts[0], []byte("MemTotal:"))
+		isAvailable := bytes.Equal(parts[0], []byte("MemAvailable:"))
+		if !isTotal && !isAvailable {
 			continue
 		}
-		amount, err := strconv.ParseUint(parts[1], 10, 64)
+		amount, err := parseUintBytes(parts[1])
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid /proc/meminfo value")
 		}
-		fields[name] = amount * 1024
+		if isTotal {
+			total, totalOK = amount*1024, true
+		} else {
+			available, availableOK = amount*1024, true
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return 0, 0, err
 	}
-	total, totalOK := fields["MemTotal"]
-	available, availableOK := fields["MemAvailable"]
 	if !totalOK || !availableOK || available > total {
 		return 0, 0, fmt.Errorf("missing /proc/meminfo values")
 	}
 	return total, available, nil
+}
+
+func parseUintBytes(value []byte) (uint64, error) {
+	if len(value) == 0 {
+		return 0, strconv.ErrSyntax
+	}
+	const maxUint64 = ^uint64(0)
+	var parsed uint64
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return 0, strconv.ErrSyntax
+		}
+		next := uint64(digit - '0')
+		if parsed > (maxUint64-next)/10 {
+			return 0, strconv.ErrRange
+		}
+		parsed = parsed*10 + next
+	}
+	return parsed, nil
 }
 
 func readUintField(path, name string) (uint64, error) {

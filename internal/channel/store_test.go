@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -162,5 +163,43 @@ func TestSQLiteStoreRejectsStaleRevisionAndOldApplyResult(t *testing.T) {
 	loaded, err := store.Get(context.Background(), item.ID)
 	if err != nil || loaded.Name != "Current generation" || loaded.Revision != 2 || loaded.ApplyState != ApplyPending {
 		t.Fatalf("channel after stale writes = %#v, %v", loaded, err)
+	}
+}
+
+func TestSQLiteStoreListsNonAppliedReconciliationRows(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	unknown := ApplyState("unknown")
+	for index, state := range []ApplyState{ApplyApplied, ApplyPending, ApplyError, ApplyDeleting, unknown} {
+		item, err := New(Draft{
+			Name: "Reconcile state " + string(state), Enabled: true,
+			Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000 + index}},
+		}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		item.Number = index + 1
+		item.ApplyState = state
+		if err := store.Create(context.Background(), item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE channels SET input_json = 'invalid' WHERE apply_state = ?`, ApplyApplied); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE channels SET input_json = '{"mode":"rtp-unicast"}' WHERE apply_state = ?`, ApplyPending); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := store.ListPending(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "validate persisted channel") {
+		t.Fatalf("ListPending() error = %v, want invalid persisted input", err)
+	}
+	if len(items) != 3 || items[0].ApplyState != ApplyError || items[1].ApplyState != ApplyDeleting || items[2].ApplyState != unknown {
+		t.Fatalf("ListPending() = %#v", items)
 	}
 }

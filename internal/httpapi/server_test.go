@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -31,8 +34,34 @@ type fakeMediaMTX struct {
 	err    error
 }
 
-func (f fakeMediaMTX) Status(context.Context) (mediamtx.Status, error) {
-	return f.status, f.err
+type fakeStatusSnapshot struct {
+	status       mediamtx.Status
+	byPath       map[string]mediamtx.Channel
+	channelCalls *atomic.Int32
+}
+
+func (f fakeStatusSnapshot) Status() mediamtx.Status {
+	return f.status
+}
+
+func (f fakeStatusSnapshot) Channel(name string) (mediamtx.Channel, bool) {
+	if f.channelCalls != nil {
+		f.channelCalls.Add(1)
+	}
+	if f.byPath != nil {
+		value, ok := f.byPath[name]
+		return value, ok
+	}
+	for _, value := range f.status.Channels {
+		if value.Name == name {
+			return value, true
+		}
+	}
+	return mediamtx.Channel{}, false
+}
+
+func (f fakeMediaMTX) Snapshot(context.Context) (mediamtx.StatusSnapshot, error) {
+	return fakeStatusSnapshot{status: f.status}, f.err
 }
 
 func (f fakeMediaMTX) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) {
@@ -40,6 +69,41 @@ func (f fakeMediaMTX) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) 
 }
 
 func (f fakeMediaMTX) Reachable(context.Context) error { return f.err }
+
+type indexedFakeMediaMTX struct {
+	status        mediamtx.Status
+	global        mediamtx.GlobalConfig
+	byPath        map[string]mediamtx.Channel
+	snapshotCalls atomic.Int32
+	channelCalls  atomic.Int32
+}
+
+func (f *indexedFakeMediaMTX) Snapshot(context.Context) (mediamtx.StatusSnapshot, error) {
+	f.snapshotCalls.Add(1)
+	return fakeStatusSnapshot{status: f.status, byPath: f.byPath, channelCalls: &f.channelCalls}, nil
+}
+
+func (f *indexedFakeMediaMTX) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) {
+	return f.global, nil
+}
+
+type generationFakeMediaMTX struct {
+	snapshotCalls atomic.Int32
+}
+
+func (f *generationFakeMediaMTX) Snapshot(context.Context) (mediamtx.StatusSnapshot, error) {
+	generation := f.snapshotCalls.Add(1)
+	raw := mediamtx.Channel{Name: "demo", Available: true, Online: true, InboundBytes: uint64(generation*100 + 1)}
+	output := mediamtx.Channel{Name: "compat-channel-1", Available: true, Online: true, InboundBytes: uint64(generation*100 + 2)}
+	return fakeStatusSnapshot{
+		status: mediamtx.Status{Info: mediamtx.Info{Version: "generation-test"}, Channels: []mediamtx.Channel{raw, output}},
+		byPath: map[string]mediamtx.Channel{raw.Name: raw, output.Name: output},
+	}, nil
+}
+
+func (*generationFakeMediaMTX) GetGlobal(context.Context) (mediamtx.GlobalConfig, error) {
+	return mediamtx.GlobalConfig{}, nil
+}
 
 type fakeChannels struct {
 	items     []channel.Channel
@@ -245,6 +309,71 @@ func TestStatusResolvesInterfaceFollowingBindings(t *testing.T) {
 	}
 }
 
+func TestInterfaceEnumerationIsCachedUntilExpiry(t *testing.T) {
+	calls := 0
+	s := &server{interfaces: func() ([]networkbind.InterfaceAddress, error) {
+		calls++
+		return []networkbind.InterfaceAddress{{Name: "eth0", Address: fmt.Sprintf("192.0.2.%d", calls), Family: networkbind.IPv4}}, nil
+	}}
+	first, err := s.cachedInterfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first[0].Address = "changed-by-caller"
+	second, err := s.cachedInterfaces()
+	if err != nil || calls != 1 || second[0].Address != "192.0.2.1" {
+		t.Fatalf("cached interfaces = %#v, %v, calls %d", second, err, calls)
+	}
+
+	s.interfaceCacheMu.Lock()
+	s.interfaceCacheExpiresAt = time.Now().Add(-time.Millisecond)
+	s.interfaceCacheMu.Unlock()
+	third, err := s.cachedInterfaces()
+	if err != nil || calls != 2 || third[0].Address != "192.0.2.2" {
+		t.Fatalf("refreshed interfaces = %#v, %v, calls %d", third, err, calls)
+	}
+}
+
+func TestSettingsMutationUsesFreshInterfaceEnumeration(t *testing.T) {
+	interfaceName := "eth0"
+	interfaceAddress := "192.0.2.10"
+	calls := 0
+	value := settings.Defaults(time.Now())
+	s := &server{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), channels: fakeChannels{}, settings: fakeSettings{value: value},
+		management: ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
+		interfaces: func() ([]networkbind.InterfaceAddress, error) {
+			calls++
+			return []networkbind.InterfaceAddress{{Name: interfaceName, Address: interfaceAddress, Family: networkbind.IPv4}}, nil
+		},
+	}
+	_, err := s.cachedInterfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.interfaceCacheMu.Lock()
+	s.interfaceCacheExpiresAt = time.Now().Add(time.Hour)
+	s.interfaceCacheMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("cached interface calls = %d, want 1", calls)
+	}
+
+	interfaceName = "eth1"
+	interfaceAddress = "192.0.2.20"
+	value.ManagementBindAddress = "interface:ipv4:eth1"
+	body, err := json.Marshal(settingsRequestFrom(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/settings", bytes.NewReader(body))
+	request.Header.Set("If-Match", `"1"`)
+	response := httptest.NewRecorder()
+	s.updateSettings(response, request)
+	if response.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("settings response = %d %s, interface calls %d", response.Code, response.Body.String(), calls)
+	}
+}
+
 func TestStatusKeepsAppliedMediaAddressUntilReconciliation(t *testing.T) {
 	value := settings.Defaults(time.Now())
 	value.MediaBindAddress = "interface:ipv4:eth0"
@@ -391,6 +520,139 @@ func TestListChannelsMergesRuntimeStatus(t *testing.T) {
 	}
 }
 
+func TestRuntimeChannelsAreCompactAndComplete(t *testing.T) {
+	available := "2026-08-25T11:00:00Z"
+	handler := newTestHandler(t, fakeMediaMTX{status: mediamtx.Status{Channels: []mediamtx.Channel{{
+		Name: "demo", Available: true, AvailableTime: &available, Online: true, OnlineTime: &available,
+		InboundBytes: 1200, OutboundBytes: 600, InboundFramesInError: 2,
+		Source:  &mediamtx.PathSource{Type: "srtConn", ID: "source-1"},
+		Readers: []mediamtx.PathReader{{Type: "webRTCSession", ID: "reader-secret"}},
+		Tracks:  []mediamtx.Track{{Codec: "H264"}},
+	}}}}, fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Revision: 3, Number: 7, Name: "Configured name", Path: "demo", Enabled: true,
+		Input: channel.Input{Mode: channel.InputRTPUnicast, RTP: &channel.RTPInput{
+			Address: "0.0.0.0", Port: 22000, SDP: "secret session description",
+		}},
+		ApplyState: channel.ApplyApplied, ApplyError: "retained apply error",
+	}}}, "http://127.0.0.1:1")
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/channels/runtime", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("runtime response = %d %s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Channels []map[string]any `json:"channels"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil || len(body.Channels) != 1 {
+		t.Fatalf("decode runtime response = %#v, %v", body, err)
+	}
+	item := body.Channels[0]
+	for _, field := range []string{
+		"id", "revision", "applyState", "applyError", "available", "availableTime", "online", "onlineTime",
+		"inputGeneration", "inboundBytes", "outputInboundBytes", "outputAvailableTime", "outputGeneration",
+		"outboundBytes", "inboundFramesInError", "readerCount", "tracks", "outputReady", "outputTracks",
+		"compatibility",
+	} {
+		if _, ok := item[field]; !ok {
+			t.Errorf("runtime channel omitted %q: %s", field, res.Body.String())
+		}
+	}
+	for _, field := range []string{
+		"number", "name", "path", "enabled", "automaticPreview", "input", "maxReaders", "useAbsoluteTimestamp",
+		"createdAt", "updatedAt", "whepPath", "viewerPath", "embedPath", "source", "readers",
+	} {
+		if _, ok := item[field]; ok {
+			t.Errorf("runtime channel exposed %q: %s", field, res.Body.String())
+		}
+	}
+	if item["readerCount"] != float64(1) || item["inputGeneration"] != available+":source-1" ||
+		item["outputGeneration"] != available+":"+compatibility.ModeDirect || strings.Contains(res.Body.String(), "reader-secret") ||
+		strings.Contains(res.Body.String(), "secret session description") {
+		t.Fatalf("runtime projection = %s", res.Body.String())
+	}
+}
+
+func TestRuntimeStatusRetainsOperationalScopesAndRevisionGuards(t *testing.T) {
+	value := settings.Defaults(time.Now())
+	value.Revision = 4
+	value.ApplyState = settings.ApplyError
+	value.ApplyError = "apply failed"
+	resources := telemetry.Snapshot{SampledAt: time.Now(), Media: telemetry.ResourceAvailability{Status: telemetry.StatusUnavailable}}
+	handler, err := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MediaMTX: fakeMediaMTX{}, Channels: fakeChannels{},
+		Settings: fakeSettings{value: value}, Resources: fakeResources{snapshot: resources},
+		MediaMTXWHEPURL: "http://127.0.0.1:1", Management: ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status/runtime", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("runtime status = %d %s", res.Code, res.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"gateway", "media", "settings", "network", "resources", "channels"} {
+		if _, ok := body[field]; !ok {
+			t.Errorf("runtime status omitted %q", field)
+		}
+	}
+	compactSettings := body["settings"].(map[string]any)
+	if len(compactSettings) != 3 || compactSettings["revision"] != float64(4) ||
+		compactSettings["applyState"] != string(settings.ApplyError) || compactSettings["applyError"] != "apply failed" {
+		t.Fatalf("runtime settings = %#v", compactSettings)
+	}
+}
+
+func TestFocusedRuntimeChannelUsesIndexedLookup(t *testing.T) {
+	media := &indexedFakeMediaMTX{byPath: map[string]mediamtx.Channel{
+		"demo": {Name: "demo", Available: true, Online: true},
+	}}
+	handler := newTestHandler(t, media, fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Revision: 2, Number: 7, Path: "demo", Enabled: true, ApplyState: channel.ApplyApplied,
+	}}}, "http://127.0.0.1:1")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/channels/7/runtime", nil))
+	if res.Code != http.StatusOK || media.snapshotCalls.Load() != 1 || media.channelCalls.Load() != 1 ||
+		!strings.Contains(res.Body.String(), `"id":"channel-1"`) || strings.Contains(res.Body.String(), `"path":"demo"`) {
+		t.Fatalf("response = %d %s, Snapshot calls %d, snapshot Channel calls %d", res.Code, res.Body.String(), media.snapshotCalls.Load(), media.channelCalls.Load())
+	}
+}
+
+func TestStatusResponsesUseOneMediaSnapshotForPairedPaths(t *testing.T) {
+	paths := []string{
+		"/api/v1/status",
+		"/api/v1/status/runtime",
+		"/api/v1/channels",
+		"/api/v1/channels/runtime",
+		"/api/v1/channels/channel-1",
+		"/api/v1/channels/channel-1/runtime",
+	}
+	for _, requestPath := range paths {
+		t.Run(requestPath, func(t *testing.T) {
+			media := &generationFakeMediaMTX{}
+			router := &fakeCompatibility{state: compatibility.State{
+				State: compatibility.StateReady, Mode: compatibility.ModeTranscoded,
+				OutputPath: "compat-channel-1", Reasons: []string{},
+			}}
+			handler := newTestHandlerWithCompatibility(t, media, fakeChannels{items: []channel.Channel{{
+				ID: "channel-1", Path: "demo", Enabled: true, ApplyState: channel.ApplyApplied,
+			}}}, "http://127.0.0.1:1", router)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestPath, nil))
+			body := response.Body.String()
+			if response.Code != http.StatusOK || media.snapshotCalls.Load() != 1 ||
+				!strings.Contains(body, `"inboundBytes":101`) || !strings.Contains(body, `"outputInboundBytes":102`) {
+				t.Fatalf("response = %d %s, snapshot calls %d", response.Code, body, media.snapshotCalls.Load())
+			}
+		})
+	}
+}
+
 func TestListChannelsReportsUnavailableMediaStatus(t *testing.T) {
 	handler := newTestHandler(t, fakeMediaMTX{err: errors.New("offline")}, fakeChannels{items: []channel.Channel{{
 		ID: "channel-1", Name: "Demo", Path: "demo",
@@ -444,6 +706,50 @@ func TestHealthReportsDegradedMediaMTX(t *testing.T) {
 	}
 }
 
+func TestRequestLogSuppressesSuccessfulPollsButRetainsErrors(t *testing.T) {
+	var output bytes.Buffer
+	s := &server{logger: slog.New(slog.NewTextHandler(&output, nil))}
+	handler := s.requestLog(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("fail") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if r.URL.Query().Has("degraded") {
+			markResponseDegraded(w)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	for _, requestPath := range []string{
+		"/api/v1/status", "/api/v1/status/runtime", "/api/v1/channels", "/api/v1/channels/runtime",
+		"/api/v1/channels/channel-1/runtime",
+	} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, requestPath, nil))
+	}
+	if output.Len() != 0 {
+		t.Fatalf("successful poll logs = %q", output.String())
+	}
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/status?degraded=1", nil))
+	if logOutput := output.String(); !strings.Contains(logOutput, "method=GET") || !strings.Contains(logOutput, "path=/api/v1/status") {
+		t.Fatalf("degraded poll log = %q", logOutput)
+	}
+	output.Reset()
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/channels?fail=1", nil))
+	if logOutput := output.String(); !strings.Contains(logOutput, "method=GET") || !strings.Contains(logOutput, "path=/api/v1/channels") {
+		t.Fatalf("failed poll log = %q", logOutput)
+	}
+	output.Reset()
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/channels", nil))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/channels/channel-1/whep", nil))
+	if logOutput := output.String(); strings.Count(logOutput, "HTTP request") != 2 ||
+		!strings.Contains(logOutput, "path=/api/v1/channels ") || !strings.Contains(logOutput, "path=/api/v1/channels/channel-1/whep") {
+		t.Fatalf("mutation/WHEP logs = %q", logOutput)
+	}
+}
+
 func TestWHEPProxyRewritesSessionLocation(t *testing.T) {
 	var receivedPath string
 	var receivedContentType string
@@ -475,6 +781,66 @@ func TestWHEPProxyRewritesSessionLocation(t *testing.T) {
 	}
 	if receivedContentType != "application/sdp" || res.Body.String() != "answer-sdp" {
 		t.Fatalf("proxy content = %q, %q", receivedContentType, res.Body.String())
+	}
+}
+
+func TestWHEPUsesIndexedOperationalLookup(t *testing.T) {
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer mediaServer.Close()
+	media := &indexedFakeMediaMTX{byPath: map[string]mediamtx.Channel{
+		"demo": {Name: "demo", Available: true, Online: true},
+	}}
+	handler := newTestHandler(t, media, fakeChannels{items: []channel.Channel{{
+		ID: "channel-1", Path: "demo", Enabled: true, ApplyState: channel.ApplyApplied,
+	}}}, mediaServer.URL)
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/channels/channel-1/whep", strings.NewReader("offer")))
+	if res.Code != http.StatusCreated || media.snapshotCalls.Load() != 1 || media.channelCalls.Load() != 1 {
+		t.Fatalf("response = %d %s, Snapshot calls %d, snapshot Channel calls %d", res.Code, res.Body.String(), media.snapshotCalls.Load(), media.channelCalls.Load())
+	}
+}
+
+func TestWHEPReusableProxyKeepsConcurrentRoutingIsolated(t *testing.T) {
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", r.URL.Path+"/session")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer mediaServer.Close()
+	channels := fakeChannels{items: []channel.Channel{
+		{ID: "channel-a", Path: "alpha", Enabled: true, ApplyState: channel.ApplyApplied},
+		{ID: "channel-b", Path: "beta", Enabled: true, ApplyState: channel.ApplyApplied},
+	}}
+	media := fakeMediaMTX{status: mediamtx.Status{Channels: []mediamtx.Channel{
+		{Name: "alpha", Available: true, Online: true},
+		{Name: "beta", Available: true, Online: true},
+	}}}
+	handler := newTestHandler(t, media, channels, mediaServer.URL)
+
+	const requests = 20
+	errorsSeen := make(chan string, requests)
+	var wait sync.WaitGroup
+	for i := range requests {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			id := "channel-a"
+			if i%2 != 0 {
+				id = "channel-b"
+			}
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/channels/"+id+"/whep", strings.NewReader("offer")))
+			wantLocation := "/api/v1/channels/" + id + "/whep/session"
+			if res.Code != http.StatusCreated || res.Header().Get("Location") != wantLocation {
+				errorsSeen <- fmt.Sprintf("%s: %d, Location %q", id, res.Code, res.Header().Get("Location"))
+			}
+		}()
+	}
+	wait.Wait()
+	close(errorsSeen)
+	for message := range errorsSeen {
+		t.Error(message)
 	}
 }
 

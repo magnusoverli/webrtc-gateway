@@ -230,7 +230,7 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stal
       <div className="overview-card-stats">
         <div><span>Input</span><strong>{item.available && item.online ? formatBitrate(rate?.inputBitrateBps) : "—"}</strong></div>
         <div><span>Output</span><strong>{item.outputReady ? formatBitrate(rate?.outputBitrateBps) : "—"}</strong></div>
-        <div><span>Viewers</span><strong>{item.outputReady ? item.readers.length : "—"}</strong></div>
+        <div><span>Viewers</span><strong>{item.outputReady ? item.readerCount : "—"}</strong></div>
       </div>
       <div className="overview-card-foot">
         <span
@@ -281,7 +281,7 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
     previousItem.online === nextItem.online &&
     previousItem.whepPath === nextItem.whepPath &&
     previousItem.outputReady === nextItem.outputReady &&
-    previousItem.readers.length === nextItem.readers.length &&
+    previousItem.readerCount === nextItem.readerCount &&
     previousItem.relay?.state === nextItem.relay?.state &&
     previousItem.compatibility.state === nextItem.compatibility.state &&
     previousItem.compatibility.mode === nextItem.compatibility.mode &&

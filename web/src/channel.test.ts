@@ -11,7 +11,11 @@ import {
   interfaceBindingSelector,
   managementOrigin,
   mediaHost,
+  mergeChannelRuntime,
+  mergeChannelRuntimes,
   parseInterfaceBinding,
+  readChannelRuntime,
+  readChannelSnapshot,
   resolveBinding,
   resolveInterfaceBinding,
   sampleChannelRates,
@@ -19,6 +23,7 @@ import {
   srtPublishURL,
   trackKind,
   type Channel,
+  type ChannelRuntime,
 } from "./channel";
 
 const baseChannel: Channel = {
@@ -40,11 +45,14 @@ const baseChannel: Channel = {
   embedPath: "/embed/1",
   available: false,
   online: false,
+  inputGeneration: ":",
   inboundBytes: 0,
   outputInboundBytes: 0,
+  outputGeneration: ":direct",
   outboundBytes: 0,
   inboundFramesInError: 0,
   readers: [],
+  readerCount: 0,
   tracks: [],
   outputReady: false,
   outputTracks: [],
@@ -122,9 +130,26 @@ describe("stream telemetry", () => {
   });
 
   it("resets rates when a stream generation changes", () => {
-    const online = { ...baseChannel, available: true, online: true, outputReady: true, availableTime: "one", outputAvailableTime: "out-one" };
+    const online = {
+      ...baseChannel,
+      available: true,
+      online: true,
+      outputReady: true,
+      availableTime: "one",
+      outputAvailableTime: "out-one",
+      inputGeneration: "one:",
+      outputGeneration: "out-one:direct",
+    };
     const first = sampleChannelRates([{ ...online, inboundBytes: 1000, outputInboundBytes: 1000 }], new Map(), 1000);
-    const second = sampleChannelRates([{ ...online, availableTime: "two", outputAvailableTime: "out-two", inboundBytes: 2000, outputInboundBytes: 2000 }], first.samples, 2000);
+    const second = sampleChannelRates([{
+      ...online,
+      availableTime: "two",
+      outputAvailableTime: "out-two",
+      inputGeneration: "two:",
+      outputGeneration: "out-two:direct",
+      inboundBytes: 2000,
+      outputInboundBytes: 2000,
+    }], first.samples, 2000);
     expect(second.rates[online.id]?.inputBitrateBps).toBeNull();
     expect(second.rates[online.id]?.outputBitrateBps).toBeNull();
   });
@@ -144,6 +169,50 @@ describe("stream telemetry", () => {
     expect(trackKind({ codec: "G726" })).toBe("audio");
     expect(trackKind({ codec: "custom", codecProps: { width: 1920 } })).toBe("video");
     expect(trackKind({ codec: "custom" })).toBe("unknown");
+  });
+});
+
+describe("compact runtime snapshots", () => {
+  it("derives reader and generation markers from a full channel snapshot", () => {
+    const { readerCount: _readerCount, inputGeneration: _inputGeneration, outputGeneration: _outputGeneration, ...wire } = {
+      ...baseChannel,
+      availableTime: "input-one",
+      outputAvailableTime: "output-one",
+      source: { type: "srtConn", id: "source-one" },
+      readers: [{ type: "webRTCSession", id: "reader-one" }],
+    };
+    const snapshot = readChannelSnapshot(wire);
+    expect(snapshot).toMatchObject({
+      readerCount: 1,
+      inputGeneration: "input-one:source-one",
+      outputGeneration: "output-one:direct",
+    });
+  });
+
+  it("merges runtime fields while preserving full configuration and reader identities", () => {
+    const runtime = runtimeFor(baseChannel, {
+      inputGeneration: "input-two:source-two",
+      outputGeneration: "output-two:transcoded",
+      inboundBytes: 1200,
+      readerCount: 3,
+      compatibility: { ...baseChannel.compatibility, mode: "transcoded" },
+    });
+    expect(readChannelRuntime(runtime)).toEqual(runtime);
+    const merged = mergeChannelRuntime(baseChannel, runtime);
+    expect(merged).toMatchObject({
+      input: baseChannel.input,
+      readerCount: 3,
+      readers: baseChannel.readers,
+      inboundBytes: 1200,
+      inputGeneration: "input-two:source-two",
+    });
+  });
+
+  it("rejects every channel ID or revision mismatch", () => {
+    expect(mergeChannelRuntime(baseChannel, runtimeFor(baseChannel, { revision: 2 }))).toBeNull();
+    expect(mergeChannelRuntime(baseChannel, runtimeFor(baseChannel, { id: "other" }))).toBeNull();
+    expect(mergeChannelRuntimes([baseChannel], [])).toBeNull();
+    expect(mergeChannelRuntimes([baseChannel], [runtimeFor(baseChannel), runtimeFor(baseChannel)])).toBeNull();
   });
 });
 
@@ -245,3 +314,30 @@ describe("iframeEmbedCode", () => {
     expect(absolutePath("http://192.168.15.5:8080", "/embed/7")).toBe("http://192.168.15.5:8080/embed/7");
   });
 });
+
+function runtimeFor(channel: Channel, overrides: Partial<ChannelRuntime> = {}): ChannelRuntime {
+  return {
+    id: channel.id,
+    revision: channel.revision,
+    applyState: channel.applyState,
+    applyError: channel.applyError,
+    available: channel.available,
+    availableTime: channel.availableTime,
+    online: channel.online,
+    onlineTime: channel.onlineTime,
+    inputGeneration: channel.inputGeneration,
+    inboundBytes: channel.inboundBytes,
+    outputInboundBytes: channel.outputInboundBytes,
+    outputAvailableTime: channel.outputAvailableTime,
+    outputGeneration: channel.outputGeneration,
+    outboundBytes: channel.outboundBytes,
+    inboundFramesInError: channel.inboundFramesInError,
+    readerCount: channel.readerCount,
+    tracks: channel.tracks,
+    outputReady: channel.outputReady,
+    outputTracks: channel.outputTracks,
+    compatibility: channel.compatibility,
+    relay: channel.relay,
+    ...overrides,
+  };
+}
