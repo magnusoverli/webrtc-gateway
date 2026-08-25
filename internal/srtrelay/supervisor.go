@@ -88,6 +88,46 @@ type inputSession struct {
 	wait    <-chan error
 }
 
+type packetConn interface {
+	ReadFromUDP([]byte) (int, *net.UDPAddr, error)
+	SetReadDeadline(time.Time) error
+}
+
+type packetReader struct {
+	ctx         context.Context
+	packets     packetConn
+	interrupted chan struct{}
+	stop        func() bool
+}
+
+func newPacketReader(ctx context.Context, packets packetConn) *packetReader {
+	reader := &packetReader{ctx: ctx, packets: packets, interrupted: make(chan struct{})}
+	reader.stop = context.AfterFunc(ctx, func() {
+		close(reader.interrupted)
+		_ = packets.SetReadDeadline(time.Now())
+	})
+	return reader
+}
+
+func (r *packetReader) close() {
+	r.stop()
+}
+
+func (r *packetReader) read(buffer []byte) ([]byte, error) {
+	n, _, err := r.packets.ReadFromUDP(buffer)
+	if err == nil {
+		return buffer[:n], nil
+	}
+	select {
+	case <-r.interrupted:
+		if contextErr := r.ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+	default:
+	}
+	return nil, err
+}
+
 type payloadMode int
 
 const (
@@ -108,24 +148,69 @@ type Supervisor struct {
 	logger     *slog.Logger
 	executable string
 
-	mu        sync.Mutex
-	listeners map[string]*listenerProcess
-	prepared  map[string]channel.SRTIngestPlan
-	snapshots sync.Map
-	closed    bool
-	startFn   func(context.Context, string) (inputSession, error)
-	relayFn   func(context.Context, channel.SRTIngestPlan, inputSession) (string, error)
+	mu               sync.Mutex
+	listeners        map[string]*listenerProcess
+	prepared         map[string]channel.SRTIngestPlan
+	operations       map[string]*channelOperation
+	activeOperations int
+	operationsDone   *sync.Cond
+	snapshots        sync.Map
+	closed           bool
+	closeDone        chan struct{}
+	startFn          func(context.Context, string) (inputSession, error)
+	relayFn          func(context.Context, channel.SRTIngestPlan, inputSession) (string, error)
+}
+
+type channelOperation struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func New(logger *slog.Logger, executable string) *Supervisor {
 	supervisor := &Supervisor{
 		logger: logger, executable: executable,
-		listeners: make(map[string]*listenerProcess),
-		prepared:  make(map[string]channel.SRTIngestPlan),
+		listeners:  make(map[string]*listenerProcess),
+		prepared:   make(map[string]channel.SRTIngestPlan),
+		operations: make(map[string]*channelOperation),
+		closeDone:  make(chan struct{}),
 	}
+	supervisor.operationsDone = sync.NewCond(&supervisor.mu)
 	supervisor.startFn = supervisor.startInput
 	supervisor.relayFn = supervisor.relayConnection
 	return supervisor
+}
+
+func (s *Supervisor) reserve(channelID string) (*channelOperation, bool) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, false
+	}
+	operation := s.operations[channelID]
+	if operation == nil {
+		operation = &channelOperation{}
+		s.operations[channelID] = operation
+	}
+	operation.refs++
+	s.activeOperations++
+	s.mu.Unlock()
+
+	operation.mu.Lock()
+	return operation, true
+}
+
+func (s *Supervisor) release(channelID string, operation *channelOperation) {
+	operation.mu.Unlock()
+	s.mu.Lock()
+	operation.refs--
+	if operation.refs == 0 && s.operations[channelID] == operation {
+		delete(s.operations, channelID)
+	}
+	s.activeOperations--
+	if s.activeOperations == 0 {
+		s.operationsDone.Broadcast()
+	}
+	s.mu.Unlock()
 }
 
 func (s *Supervisor) Snapshot(channelID string) Status {
@@ -149,17 +234,25 @@ func (s *Supervisor) Prepare(ctx context.Context, config channel.SRTListener) (c
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	operation, ok := s.reserve(config.ChannelID)
+	if !ok {
 		return channel.SRTIngestPlan{}, errors.New("SRT relay supervisor is closed")
 	}
+	defer s.release(config.ChannelID, operation)
+	if err := ctx.Err(); err != nil {
+		return channel.SRTIngestPlan{}, err
+	}
+
+	s.mu.Lock()
 	if current := s.listeners[config.ChannelID]; current != nil && current.plan.Listener == config {
+		s.mu.Unlock()
 		return current.plan, nil
 	}
 	if prepared, ok := s.prepared[config.ChannelID]; ok && prepared.Listener == config {
+		s.mu.Unlock()
 		return prepared, nil
 	}
+	s.mu.Unlock()
 
 	plan := channel.SRTIngestPlan{Listener: config, RTPSDP: config.SDP}
 	if config.SDP != "" {
@@ -190,7 +283,9 @@ func (s *Supervisor) Prepare(ctx context.Context, config channel.SRTListener) (c
 		plan.PublishPassphrase = publishPassphrase
 		plan.OutputAddress = output
 	}
+	s.mu.Lock()
 	s.prepared[config.ChannelID] = plan
+	s.mu.Unlock()
 	return plan, nil
 }
 
@@ -208,18 +303,26 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	channelID := plan.Listener.ChannelID
+	operation, ok := s.reserve(channelID)
+	if !ok {
 		return errors.New("SRT relay supervisor is closed")
 	}
-	if current := s.listeners[plan.Listener.ChannelID]; current != nil && current.plan == plan {
+	defer s.release(channelID, operation)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	current := s.listeners[channelID]
+	s.mu.Unlock()
+	if current != nil && current.plan == plan {
 		if current.snapshot().State != StateStopping {
 			return nil
 		}
 	}
-	if current := s.listeners[plan.Listener.ChannelID]; current != nil {
-		if err := s.stopLocked(ctx, plan.Listener.ChannelID, current); err != nil {
+	if current != nil {
+		if err := s.stopProcess(ctx, channelID, current); err != nil {
 			return err
 		}
 	}
@@ -250,52 +353,94 @@ func (s *Supervisor) Ensure(ctx context.Context, plan channel.SRTIngestPlan) err
 		plan: plan, cancel: cancel, done: make(chan struct{}),
 	}
 	process.status = process.statusFor(StateRunning, 0, "", nil)
-	s.listeners[plan.Listener.ChannelID] = process
-	s.snapshots.Store(plan.Listener.ChannelID, process)
-	delete(s.prepared, plan.Listener.ChannelID)
+	s.mu.Lock()
+	s.listeners[channelID] = process
+	s.snapshots.Store(channelID, process)
+	delete(s.prepared, channelID)
+	listenerCount := len(s.listeners)
+	s.mu.Unlock()
 	go s.monitor(processCtx, process, inputEndpoint, session)
-	s.logger.Info("SRT channel ingest started", "channel", plan.Listener.ChannelID, "mode", plan.Listener.Mode, "port", plan.Listener.Port, "elementaryRTP", plan.RTPSDP != "")
-	if len(s.listeners) == listenerCapacityWarning {
-		s.logger.Warn("SRT channel ingest count has reached the subprocess scaling threshold", "listeners", len(s.listeners), "recommendation", "use direct stream-ID publishing for raw MPEG-TS when supported")
+	s.logger.Info("SRT channel ingest started", "channel", channelID, "mode", plan.Listener.Mode, "port", plan.Listener.Port, "elementaryRTP", plan.RTPSDP != "")
+	if listenerCount == listenerCapacityWarning {
+		s.logger.Warn("SRT channel ingest count has reached the subprocess scaling threshold", "listeners", listenerCount, "recommendation", "use direct stream-ID publishing for raw MPEG-TS when supported")
 	}
 	return nil
 }
 
 func (s *Supervisor) Stop(ctx context.Context, channelID string) error {
+	operation, ok := s.reserve(channelID)
+	if !ok {
+		select {
+		case <-s.closeDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer s.release(channelID, operation)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.prepared, channelID)
-	if process := s.listeners[channelID]; process != nil {
-		return s.stopLocked(ctx, channelID, process)
+	process := s.listeners[channelID]
+	s.mu.Unlock()
+	if process != nil {
+		return s.stopProcess(ctx, channelID, process)
 	}
 	return nil
 }
 
 func (s *Supervisor) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.closed {
+		done := s.closeDone
+		s.mu.Unlock()
+		<-done
+		return nil
+	}
 	s.closed = true
 	clear(s.prepared)
+	for s.activeOperations != 0 {
+		s.operationsDone.Wait()
+	}
+	clear(s.prepared)
+	processes := make(map[string]*listenerProcess, len(s.listeners))
 	for channelID, process := range s.listeners {
+		processes[channelID] = process
 		process.setStatus(StateStopping, process.snapshot().Restarts, "", nil)
 		process.cancel()
+	}
+	s.mu.Unlock()
+
+	for _, process := range processes {
 		<-process.done
-		delete(s.listeners, channelID)
+	}
+	s.mu.Lock()
+	for channelID, process := range processes {
+		if s.listeners[channelID] == process {
+			delete(s.listeners, channelID)
+		}
 		s.snapshots.CompareAndDelete(channelID, process)
 	}
+	close(s.closeDone)
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *Supervisor) stopLocked(ctx context.Context, channelID string, process *listenerProcess) error {
+func (s *Supervisor) stopProcess(ctx context.Context, channelID string, process *listenerProcess) error {
 	status := process.snapshot()
 	process.setStatus(StateStopping, status.Restarts, status.LastError, nil)
 	process.cancel()
 	select {
 	case <-process.done:
+		s.mu.Lock()
 		if s.listeners[channelID] == process {
 			delete(s.listeners, channelID)
 		}
 		s.snapshots.CompareAndDelete(channelID, process)
+		s.mu.Unlock()
 		s.logger.Info("SRT channel ingest stopped", "channel", channelID, "port", process.plan.Listener.Port)
 		return nil
 	case <-ctx.Done():
@@ -412,6 +557,9 @@ func (s *Supervisor) startInput(ctx context.Context, inputEndpoint string) (inpu
 }
 
 func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngestPlan, input inputSession) (string, error) {
+	reader := newPacketReader(ctx, input.packets)
+	defer reader.close()
+
 	if plan.RTPSDP != "" {
 		allowed, err := elementaryPayloadTypes(plan.RTPSDP)
 		if err != nil {
@@ -435,7 +583,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		}
 		buffer := make([]byte, maximumUDPPacketSize)
 		for {
-			packet, err := readPacket(ctx, input.packets, buffer)
+			packet, err := reader.read(buffer)
 			if err != nil {
 				return "elementary-rtp", errors.Join(err, <-input.wait)
 			}
@@ -458,7 +606,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		}
 	}
 
-	mode, initial, err := classifyPayload(ctx, input.packets)
+	mode, initial, err := classifyPayload(reader)
 	if err != nil {
 		terminateInput(input)
 		return "unknown", err
@@ -478,7 +626,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 	copyDone := make(chan error, 1)
 	go func() {
 		_, firstErr := sink.Write(initial)
-		streamErr := streamNormalized(ctx, input.packets, sink, mode)
+		streamErr := streamNormalized(reader, sink, mode)
 		closeErr := sink.Close()
 		copyDone <- errors.Join(firstErr, streamErr, closeErr)
 	}()
@@ -508,12 +656,12 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 	}
 }
 
-func classifyPayload(ctx context.Context, packets *net.UDPConn) (payloadMode, []byte, error) {
+func classifyPayload(reader *packetReader) (payloadMode, []byte, error) {
 	var messages [][]byte
 	total := 0
 	buffer := make([]byte, maximumUDPPacketSize)
 	for total < classificationLimit {
-		packet, err := readPacket(ctx, packets, buffer)
+		packet, err := reader.read(buffer)
 		if err != nil {
 			return payloadUnknown, nil, err
 		}
@@ -565,10 +713,10 @@ func classifyPayload(ctx context.Context, packets *net.UDPConn) (payloadMode, []
 	return payloadUnknown, nil, fmt.Errorf("SRT payload is neither MPEG-TS nor RTP/MP2T payload type 33 after %d bytes", classificationLimit)
 }
 
-func streamNormalized(ctx context.Context, packets *net.UDPConn, sink io.Writer, mode payloadMode) error {
+func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) error {
 	buffer := make([]byte, maximumUDPPacketSize)
 	for {
-		message, err := readPacket(ctx, packets, buffer)
+		message, err := reader.read(buffer)
 		if err != nil {
 			return err
 		}
@@ -586,25 +734,6 @@ func streamNormalized(ctx context.Context, packets *net.UDPConn, sink io.Writer,
 		if _, err := sink.Write(payload); err != nil {
 			return err
 		}
-	}
-}
-
-func readPacket(ctx context.Context, packets *net.UDPConn, buffer []byte) ([]byte, error) {
-	for {
-		if err := packets.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-			return nil, err
-		}
-		n, _, err := packets.ReadFromUDP(buffer)
-		if err == nil {
-			return buffer[:n], nil
-		}
-		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		return nil, err
 	}
 }
 
