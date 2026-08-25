@@ -6,7 +6,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Channel, ChannelStreamRates } from "./channel";
 import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
 
-const overviewPlayerHarness = vi.hoisted(() => ({ calls: vi.fn() }));
+const overviewPlayerHarness = vi.hoisted(() => ({ calls: vi.fn(), cardRenders: vi.fn() }));
+
+vi.mock("./presentation", async () => {
+  const presentation = await vi.importActual<typeof import("./presentation")>("./presentation");
+  return {
+    ...presentation,
+    inputModeLabel: (mode: Parameters<typeof presentation.inputModeLabel>[0]) => {
+      overviewPlayerHarness.cardRenders(mode);
+      return presentation.inputModeLabel(mode);
+    },
+  };
+});
 
 vi.mock("./useWHEPPlayer", () => ({
   useWHEPPlayer: (options: unknown) => {
@@ -18,6 +29,7 @@ vi.mock("./useWHEPPlayer", () => ({
 afterEach(() => {
   cleanup();
   overviewPlayerHarness.calls.mockClear();
+  overviewPlayerHarness.cardRenders.mockClear();
 });
 
 describe("ChannelOverview", () => {
@@ -189,6 +201,70 @@ describe("ChannelOverview", () => {
     expect(screen.getByRole("button", { name: "Configure Studio" }).hasAttribute("disabled")).toBe(true);
     expect(screen.getByRole("button", { name: "Disable preview for Studio" }).hasAttribute("disabled")).toBe(true);
     expect(document.querySelectorAll(".overview-card [aria-live]")).toHaveLength(0);
+  });
+
+  it("does not rerender unchanged cards or players when polling returns equivalent objects", () => {
+    const first = { ...channel("one", "Studio", "live"), automaticPreview: true };
+    const second = { ...channel("two", "Control", "live"), automaticPreview: true };
+    const rates = {
+      one: { inputBitrateBps: 1_000_000, outputBitrateBps: 900_000, deliveryBitrateBps: 900_000 },
+      two: { inputBitrateBps: 2_000_000, outputBitrateBps: 1_800_000, deliveryBitrateBps: 1_800_000 },
+    };
+    const view = renderOverview({ channels: [first, second], rates });
+    expect(overviewPlayerHarness.calls).toHaveBeenCalledTimes(2);
+
+    overviewPlayerHarness.calls.mockClear();
+    overviewPlayerHarness.cardRenders.mockClear();
+    view.rerender(overview({
+      channels: [{ ...first, readers: [...first.readers] }, { ...second, readers: [...second.readers] }],
+      rates: { one: { ...rates.one }, two: { ...rates.two } },
+    }));
+
+    expect(overviewPlayerHarness.cardRenders).not.toHaveBeenCalled();
+    expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
+  });
+
+  it("updates changed card metrics without rerendering or reconfiguring its player", () => {
+    const first = { ...channel("one", "Studio", "live"), automaticPreview: true };
+    const second = { ...channel("two", "Control", "live"), automaticPreview: true };
+    const rates = {
+      one: { inputBitrateBps: 1_000_000, outputBitrateBps: 900_000, deliveryBitrateBps: 900_000 },
+      two: { inputBitrateBps: 2_000_000, outputBitrateBps: 1_800_000, deliveryBitrateBps: 1_800_000 },
+    };
+    const view = renderOverview({ channels: [first, second], rates });
+    overviewPlayerHarness.calls.mockClear();
+    overviewPlayerHarness.cardRenders.mockClear();
+
+    view.rerender(overview({
+      channels: [{ ...first }, { ...second }],
+      rates: { ...rates, one: { ...rates.one, inputBitrateBps: 1_500_000 } },
+    }));
+
+    const studio = screen.getByRole("button", { name: "Open details for Studio" }).closest("article")!;
+    const control = screen.getByRole("button", { name: "Open details for Control" }).closest("article")!;
+    expect(within(studio).getByText("1.50 Mbps")).toBeDefined();
+    expect(within(control).getByText("2.00 Mbps")).toBeDefined();
+    expect(overviewPlayerHarness.cardRenders).toHaveBeenCalledTimes(1);
+    expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
+  });
+
+  it("uses the latest channel and callback across a skipped card render", async () => {
+    const user = userEvent.setup();
+    const original = channel("one", "Studio", "live");
+    const latest = { ...original, revision: 2, updatedAt: "2026-08-25T09:00:00Z" };
+    const originalEdit = vi.fn();
+    const latestEdit = vi.fn();
+    const view = renderOverview({ channels: [original], onEdit: originalEdit });
+    overviewPlayerHarness.calls.mockClear();
+    overviewPlayerHarness.cardRenders.mockClear();
+
+    view.rerender(overview({ channels: [latest], onEdit: latestEdit }));
+    expect(overviewPlayerHarness.cardRenders).not.toHaveBeenCalled();
+    expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Configure Studio" }));
+
+    expect(originalEdit).not.toHaveBeenCalled();
+    expect(latestEdit).toHaveBeenCalledWith(latest);
   });
 });
 
