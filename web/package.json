@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "npm run lint && vite build",
+    "build": "npm run lint && vite build && node scripts/compress-dist.mjs",
     "dev": "vite",
     "lint": "tsc --noEmit -p tsconfig.app.json --pretty false && tsc --noEmit -p tsconfig.node.json --pretty false",
     "test": "vitest run"

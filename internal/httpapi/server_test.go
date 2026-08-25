@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"webrtc-gateway/internal/channel"
@@ -996,6 +997,112 @@ func TestHealthUsesLightweightReachabilityRead(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if res.Code != http.StatusOK || infoReads != 1 {
 		t.Fatalf("health response = %d %s, info reads %d", res.Code, res.Body.String(), infoReads)
+	}
+}
+
+func TestSPAHandlerNegotiatesCompressionAndCaching(t *testing.T) {
+	files := fstest.MapFS{
+		"index.html":                {Data: []byte("index identity")},
+		"index.html.br":             {Data: []byte("index br")},
+		"index.html.gz":             {Data: []byte("index gzip")},
+		"assets/app-AbCd1234.js":    {Data: []byte("asset identity")},
+		"assets/app-AbCd1234.js.br": {Data: []byte("asset br")},
+		"assets/app-AbCd1234.js.gz": {Data: []byte("asset gzip")},
+		"placeholder.txt":           {Data: []byte("placeholder identity")},
+	}
+	handler := (&server{staticFiles: files}).spaHandler()
+
+	tests := []struct {
+		name            string
+		method          string
+		path            string
+		acceptEncoding  string
+		wantStatus      int
+		wantEncoding    string
+		wantBody        string
+		wantCache       string
+		wantContentType string
+		wantLength      string
+	}{
+		{
+			name: "brotli wins equal quality", method: http.MethodGet, path: "/assets/app-AbCd1234.js",
+			acceptEncoding: "gzip, br", wantStatus: http.StatusOK, wantEncoding: "br", wantBody: "asset br",
+			wantCache: "public,max-age=31536000,immutable", wantContentType: "text/javascript",
+		},
+		{
+			name: "higher gzip quality wins", method: http.MethodGet, path: "/assets/app-AbCd1234.js",
+			acceptEncoding: "br;q=0.4, gzip;q=0.8, identity;q=0.2", wantStatus: http.StatusOK,
+			wantEncoding: "gzip", wantBody: "asset gzip", wantCache: "public,max-age=31536000,immutable",
+			wantContentType: "text/javascript",
+		},
+		{
+			name: "zero quality coding uses identity", method: http.MethodGet, path: "/assets/app-AbCd1234.js",
+			acceptEncoding: "br;q=0, gzip;q=0", wantStatus: http.StatusOK, wantBody: "asset identity",
+			wantCache: "public,max-age=31536000,immutable", wantContentType: "text/javascript",
+		},
+		{
+			name: "spa fallback is compressed but revalidated", method: http.MethodGet, path: "/channels/1",
+			acceptEncoding: "br", wantStatus: http.StatusOK, wantEncoding: "br", wantBody: "index br",
+			wantCache: "no-cache", wantContentType: "text/html",
+		},
+		{
+			name: "root is not cached", method: http.MethodGet, path: "/",
+			wantStatus: http.StatusOK, wantBody: "index identity", wantCache: "no-cache", wantContentType: "text/html",
+		},
+		{
+			name: "index keeps canonical redirect", method: http.MethodGet, path: "/index.html",
+			acceptEncoding: "br", wantStatus: http.StatusMovedPermanently,
+		},
+		{
+			name: "missing sidecars use identity", method: http.MethodGet, path: "/placeholder.txt",
+			acceptEncoding: "gzip, br", wantStatus: http.StatusOK, wantBody: "placeholder identity",
+			wantContentType: "text/plain",
+		},
+		{
+			name: "head has representation headers and no body", method: http.MethodHead, path: "/assets/app-AbCd1234.js",
+			acceptEncoding: "gzip", wantStatus: http.StatusOK, wantEncoding: "gzip",
+			wantCache: "public,max-age=31536000,immutable", wantContentType: "text/javascript", wantLength: "10",
+		},
+		{
+			name: "all representations refused", method: http.MethodGet, path: "/assets/app-AbCd1234.js",
+			acceptEncoding: "br;q=0, gzip;q=0, identity;q=0", wantStatus: http.StatusNotAcceptable,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, nil)
+			req.Header.Set("Accept-Encoding", test.acceptEncoding)
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+
+			if res.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", res.Code, test.wantStatus, res.Body.String())
+			}
+			if got := res.Header().Get("Vary"); got != "Accept-Encoding" {
+				if test.wantStatus != http.StatusMovedPermanently {
+					t.Errorf("Vary = %q, want Accept-Encoding", got)
+				}
+			}
+			if got := res.Header().Get("Content-Encoding"); got != test.wantEncoding {
+				t.Errorf("Content-Encoding = %q, want %q", got, test.wantEncoding)
+			}
+			if got := res.Body.String(); got != test.wantBody && test.wantStatus == http.StatusOK {
+				t.Errorf("body = %q, want %q", got, test.wantBody)
+			}
+			if got := res.Header().Get("Cache-Control"); got != test.wantCache && test.wantStatus == http.StatusOK {
+				t.Errorf("Cache-Control = %q, want %q", got, test.wantCache)
+			}
+			if got := res.Header().Get("Content-Type"); test.wantContentType != "" && !strings.HasPrefix(got, test.wantContentType) {
+				t.Errorf("Content-Type = %q, want prefix %q", got, test.wantContentType)
+			}
+			if got := res.Header().Get("Content-Length"); test.wantLength != "" && got != test.wantLength {
+				t.Errorf("Content-Length = %q, want %q", got, test.wantLength)
+			}
+			if test.wantStatus == http.StatusMovedPermanently && res.Header().Get("Location") != "./" {
+				t.Errorf("Location = %q, want ./", res.Header().Get("Location"))
+			}
+		})
 	}
 }
 

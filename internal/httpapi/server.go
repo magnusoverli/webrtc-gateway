@@ -8,10 +8,12 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -1079,15 +1081,122 @@ func (s *server) spaHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(s.staticFiles))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requested := strings.TrimPrefix(r.URL.Path, "/")
-		if requested != "" {
-			if info, err := fs.Stat(s.staticFiles, requested); err == nil && !info.IsDir() {
-				fileServer.ServeHTTP(w, r)
-				return
+		// Preserve FileServer's canonical redirect for the real index path.
+		if requested == "index.html" && staticFileExists(s.staticFiles, requested) {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		fallback := true
+		if requested != "" && staticFileExists(s.staticFiles, requested) {
+			fallback = false
+		} else {
+			requested = "index.html"
+		}
+
+		w.Header().Set("Vary", "Accept-Encoding")
+		encoding, ok := selectContentEncoding(strings.Join(r.Header.Values("Accept-Encoding"), ","), func(encoding string) bool {
+			return encoding == "identity" || staticFileExists(s.staticFiles, requested+"."+encodingExtension(encoding))
+		})
+		if !ok {
+			http.Error(w, "no acceptable content encoding", http.StatusNotAcceptable)
+			return
+		}
+
+		served := requested
+		if encoding != "identity" {
+			served += "." + encodingExtension(encoding)
+			w.Header().Set("Content-Encoding", encoding)
+			if info, err := fs.Stat(s.staticFiles, served); err == nil {
+				w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 			}
 		}
-		r.URL.Path = "/"
-		fileServer.ServeHTTP(w, r)
+		if contentType := mime.TypeByExtension(path.Ext(requested)); contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		if strings.HasPrefix(requested, "assets/") && !fallback {
+			w.Header().Set("Cache-Control", "public,max-age=31536000,immutable")
+		} else if requested == "index.html" {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+
+		request := r.Clone(r.Context())
+		request.URL.Path = "/" + served
+		if encoding == "identity" && requested == "index.html" && (fallback || r.URL.Path == "/") {
+			request.URL.Path = "/"
+		}
+		fileServer.ServeHTTP(w, request)
 	})
+}
+
+func staticFileExists(files fs.FS, name string) bool {
+	info, err := fs.Stat(files, name)
+	return err == nil && !info.IsDir()
+}
+
+func encodingExtension(encoding string) string {
+	if encoding == "gzip" {
+		return "gz"
+	}
+	return encoding
+}
+
+func selectContentEncoding(header string, available func(string) bool) (string, bool) {
+	if strings.TrimSpace(header) == "" {
+		return "identity", true
+	}
+
+	qualities := make(map[string]float64)
+	for _, value := range strings.Split(header, ",") {
+		parts := strings.Split(value, ";")
+		name := strings.ToLower(strings.TrimSpace(parts[0]))
+		if name == "" {
+			continue
+		}
+		quality := 1.0
+		for _, parameter := range parts[1:] {
+			key, raw, found := strings.Cut(parameter, "=")
+			if !found || !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+			if err != nil || parsed < 0 || parsed > 1 {
+				quality = 0
+			} else {
+				quality = parsed
+			}
+		}
+		if current, found := qualities[name]; !found || quality > current {
+			qualities[name] = quality
+		}
+	}
+
+	quality := func(encoding string) float64 {
+		if value, found := qualities[encoding]; found {
+			return value
+		}
+		wildcard, hasWildcard := qualities["*"]
+		if encoding == "identity" {
+			if hasWildcard && wildcard == 0 {
+				return 0
+			}
+			return 1
+		}
+		if hasWildcard {
+			return wildcard
+		}
+		return 0
+	}
+
+	selected := ""
+	selectedQuality := 0.0
+	for _, encoding := range []string{"br", "gzip", "identity"} {
+		candidateQuality := quality(encoding)
+		if available(encoding) && candidateQuality > selectedQuality {
+			selected = encoding
+			selectedQuality = candidateQuality
+		}
+	}
+	return selected, selected != ""
 }
 
 func (s *server) requestLog(next http.Handler) http.Handler {
