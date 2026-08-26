@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -238,7 +240,7 @@ func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
 	const passphrase = "plus+percent%secret"
 	args := remuxArgs("srt://127.0.0.1:8890?streamid=publish:test", passphrase)
 	for _, pair := range [][2]string{
-		{"-f", "mpegts"}, {"-i", "pipe:0"}, {"-map", "0:v?"}, {"-map", "0:a?"},
+		{"-f", "mpegts"}, {"-probesize", "131072"}, {"-analyzeduration", "1000000"}, {"-i", "pipe:0"}, {"-map", "0:v?"}, {"-map", "0:a?"},
 		{"-c", "copy"}, {"-mpegts_flags", "+resend_headers"}, {"-pes_payload_size", "0"}, {"-muxdelay", "0"},
 		{"-mpegts_copyts", "1"},
 	} {
@@ -254,6 +256,123 @@ func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
 	}
 	if !containsArgumentPair(args, "-passphrase", passphrase) || strings.Contains(args[len(args)-1], passphrase) {
 		t.Fatalf("remux passphrase is not a separate output option: %#v", args)
+	}
+}
+
+func TestElementaryRelayNotifiesAfterFirstValidPacket(t *testing.T) {
+	inputPackets, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	input := runningInputSession(t, inputPackets)
+	supervisor := newTestSupervisor(t, "unused")
+	observer := &recordingInputObserver{started: make(chan string, 2)}
+	supervisor.SetInputObserver(observer)
+	plan := channel.SRTIngestPlan{
+		Listener:      channel.SRTListener{ChannelID: "channel-1"},
+		OutputAddress: destination.LocalAddr().String(),
+		RTPSDP:        "v=0\nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, relayErr := supervisor.relayConnection(ctx, plan, input)
+		result <- relayErr
+	}()
+
+	sender, err := net.DialUDP("udp4", nil, inputPackets.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	packet := testRTPPacket(96, []byte{1, 2, 3})
+	if _, err := sender.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case channelID := <-observer.started:
+		if channelID != "channel-1" {
+			t.Fatalf("notified channel = %q", channelID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid elementary RTP did not notify the observer")
+	}
+	if _, err := sender.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 64)
+	if err := destination.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, _, err := destination.ReadFromUDP(buffer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertNoInputNotification(t, observer.started)
+	cancel()
+	_ = input.cmd.Process.Kill()
+	select {
+	case <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("elementary relay did not stop")
+	}
+}
+
+func TestAutomaticRelayNotifiesAfterRemuxAcceptsInput(t *testing.T) {
+	ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\ndd bs=1 count=1 of=/dev/null 2>/dev/null\nsleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inputPackets, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := runningInputSession(t, inputPackets)
+	supervisor := newTestSupervisor(t, "unused")
+	supervisor.ffmpeg = ffmpeg
+	observer := &recordingInputObserver{started: make(chan string, 1)}
+	supervisor.SetInputObserver(observer)
+	plan := channel.SRTIngestPlan{
+		Listener:      channel.SRTListener{ChannelID: "channel-2"},
+		OutputAddress: "srt://127.0.0.1:8890",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, relayErr := supervisor.relayConnection(ctx, plan, input)
+		result <- relayErr
+	}()
+	sender, err := net.DialUDP("udp4", nil, inputPackets.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	transportStream := make([]byte, 188*3)
+	for offset := 0; offset < len(transportStream); offset += 188 {
+		transportStream[offset] = 0x47
+	}
+	if _, err := sender.Write(transportStream); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case channelID := <-observer.started:
+		if channelID != "channel-2" {
+			t.Fatalf("notified channel = %q", channelID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("automatic MPEG-TS relay did not notify the observer")
+	}
+	cancel()
+	select {
+	case <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("automatic relay did not stop")
 	}
 }
 
@@ -852,6 +971,39 @@ func containsArgumentPair(arguments []string, name, value string) bool {
 type shortWriter struct {
 	limit int
 	value strings.Builder
+}
+
+type recordingInputObserver struct {
+	started chan string
+}
+
+func (o *recordingInputObserver) SRTInputStarted(channelID string) {
+	o.started <- channelID
+}
+
+func runningInputSession(t *testing.T, packets *net.UDPConn) inputSession {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	wait := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		_ = packets.Close()
+		wait <- err
+	}()
+	return inputSession{cmd: cmd, packets: packets, wait: wait}
+}
+
+func assertNoInputNotification(t *testing.T, notifications <-chan string) {
+	t.Helper()
+	select {
+	case channelID := <-notifications:
+		t.Fatalf("unexpected duplicate input notification for %q", channelID)
+	default:
+	}
 }
 
 func (w *shortWriter) Write(value []byte) (int, error) {

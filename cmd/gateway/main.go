@@ -78,6 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer compatibilityManager.Close()
+	relaySupervisor.SetInputObserver(compatibilityManager)
 	logger.Info("compatibility capacity configured", "encoderThreads", cfg.EncoderThreads, "capacityUnits", cfg.WorkerCapacity)
 	restartRequests := make(chan struct{}, 1)
 	resourceSampler := telemetry.New(logger)

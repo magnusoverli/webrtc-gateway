@@ -246,6 +246,94 @@ describe("dashboard navigation", () => {
     expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status", "/api/v1/status/runtime"]);
   });
 
+  it("polls compact runtime status every 500ms while an automatic detail preview waits for playback", async () => {
+    vi.useFakeTimers();
+    const item = { ...channelWithMode("srt-push"), automaticPreview: true, outputReady: false };
+    const full = statusWith([item]);
+    const compact = runtimeStatus(full, [runtimeChannel(item)]);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(compact));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/status",
+      "/api/v1/status/runtime",
+    ]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(499); });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/status",
+      "/api/v1/status/runtime",
+      "/api/v1/status/runtime",
+    ]);
+  });
+
+  it("returns to the configured interval after leaving automatic preview startup", async () => {
+    vi.useFakeTimers();
+    const item = { ...channelWithMode("srt-push"), automaticPreview: true, outputReady: false };
+    const full = statusWith([item]);
+    const compact = runtimeStatus(full, [runtimeChannel(item)]);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(compact));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      fireEvent.click(document.querySelector<HTMLButtonElement>(".crumb-back")!);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/status",
+      "/api/v1/status/runtime",
+      "/api/v1/status/runtime",
+    ]);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ["automatic preview is disabled", { automaticPreview: false, outputReady: false }],
+    ["playback is already ready", { automaticPreview: true, outputReady: true }],
+    ["the channel is disabled", { automaticPreview: true, enabled: false, outputReady: false }],
+    ["the channel failed to apply", { automaticPreview: true, applyState: "error" as const, outputReady: false }],
+  ])("keeps the configured interval when %s", async (_condition, overrides) => {
+    vi.useFakeTimers();
+    const item = { ...channelWithMode("srt-push"), ...overrides };
+    const full = statusWith([item]);
+    const compact = runtimeStatus(full, [runtimeChannel(item)]);
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(compact));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    render(<App />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status"]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status", "/api/v1/status/runtime"]);
+  });
+
   it("does not let a compact poll started before a mutation overwrite its result", async () => {
     vi.useFakeTimers();
     const item = { ...channelWithMode("srt-push"), revision: 7, automaticPreview: false };

@@ -50,6 +50,10 @@ type Status struct {
 	ListenerActive  bool       `json:"listenerActive"`
 }
 
+type InputObserver interface {
+	SRTInputStarted(channelID string)
+}
+
 type listenerProcess struct {
 	plan     channel.SRTIngestPlan
 	cancel   context.CancelFunc
@@ -158,6 +162,7 @@ type Supervisor struct {
 	activeOperations int
 	operationsDone   *sync.Cond
 	snapshots        sync.Map
+	inputObserver    InputObserver
 	closed           bool
 	closeDone        chan struct{}
 	startFn          func(context.Context, string) (inputSession, error)
@@ -184,6 +189,24 @@ func New(logger *slog.Logger, executable, ffmpeg string) *Supervisor {
 	supervisor.startFn = supervisor.startInput
 	supervisor.relayFn = supervisor.relayConnection
 	return supervisor
+}
+
+func (s *Supervisor) SetInputObserver(observer InputObserver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.inputObserver = observer
+	}
+}
+
+func (s *Supervisor) notifyInputStarted(channelID string) {
+	s.mu.Lock()
+	observer := s.inputObserver
+	closed := s.closed
+	s.mu.Unlock()
+	if !closed && observer != nil {
+		observer.SRTInputStarted(channelID)
+	}
 }
 
 func (s *Supervisor) reserve(channelID string) (*channelOperation, bool) {
@@ -588,6 +611,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 			return "elementary-rtp", fmt.Errorf("configure MediaMTX RTP bridge send buffer: %w", err)
 		}
 		buffer := make([]byte, maximumUDPPacketSize)
+		notified := false
 		for {
 			packet, err := reader.read(buffer)
 			if err != nil {
@@ -611,6 +635,10 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 			if _, err := output.WriteToUDP(packet, destination); err != nil {
 				terminateInput(input)
 				return "elementary-rtp", fmt.Errorf("forward elementary RTP: %w", err)
+			}
+			if !notified {
+				notified = true
+				s.notifyInputStarted(plan.Listener.ChannelID)
 			}
 		}
 	}
@@ -647,6 +675,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		firstErr := writeFull(sink, initial)
 		var streamErr error
 		if firstErr == nil {
+			s.notifyInputStarted(plan.Listener.ChannelID)
 			streamErr = streamNormalized(reader, sink, mode)
 		}
 		closeErr := sink.Close()
@@ -769,7 +798,7 @@ func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) er
 func remuxArgs(outputAddress, passphrase string) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin",
-		"-copyts", "-f", "mpegts", "-i", "pipe:0",
+		"-copyts", "-f", "mpegts", "-probesize", "131072", "-analyzeduration", "1000000", "-i", "pipe:0",
 		"-map", "0:v?", "-map", "0:a?", "-c", "copy",
 		"-mpegts_flags", "+resend_headers", "-pes_payload_size", "0", "-muxdelay", "0",
 		"-mpegts_copyts", "1", "-f", "mpegts",

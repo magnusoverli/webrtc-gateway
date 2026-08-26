@@ -27,7 +27,9 @@ var codecNormalizer = strings.NewReplacer(" ", "", "-", "", "_", "", "/", "")
 
 const (
 	metadataGrace        = 8 * time.Second
+	inputDiscoveryWindow = 3 * time.Second
 	probeRetryDelay      = 3 * time.Second
+	videoInspectionLimit = 4 * time.Second
 	workerStartupTimeout = 8 * time.Second
 )
 
@@ -66,6 +68,7 @@ type ChannelReader interface {
 
 type MediaManager interface {
 	Status(context.Context) (mediamtx.Status, error)
+	StatusFresh(context.Context) (mediamtx.Status, error)
 	ReplacePath(context.Context, string, mediamtx.PathConfig) error
 	DeletePath(context.Context, string) error
 }
@@ -103,10 +106,17 @@ type Manager struct {
 	entries        map[string]*entry
 	nextGeneration uint64
 	nextProbeTask  uint64
+	freshStatus    bool
+	discovering    map[string]inputDiscovery
 	closed         bool
 	runCancel      context.CancelFunc
 	wake           chan struct{}
 	workers        sync.WaitGroup
+}
+
+type inputDiscovery struct {
+	deadline            time.Time
+	previousFingerprint string
 }
 
 type entry struct {
@@ -209,7 +219,7 @@ func New(options Options) (*Manager, error) {
 		rtspURL: parsed, ffmpeg: options.FFmpeg, ffprobe: options.FFprobe,
 		interval: options.Interval, activeInterval: options.ActiveInterval,
 		encoderThreads: options.EncoderThreads, workerCapacity: options.WorkerCapacity,
-		entries: make(map[string]*entry), wake: make(chan struct{}, 1),
+		entries: make(map[string]*entry), discovering: make(map[string]inputDiscovery), wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -313,6 +323,13 @@ func (m *Manager) nextInterval() time.Duration {
 			shorten(m.activeInterval)
 		}
 	}
+	for _, discovery := range m.discovering {
+		if !now.Before(discovery.deadline) {
+			continue
+		}
+		shorten(m.activeInterval)
+		shortenDeadline(discovery.deadline)
+	}
 	return next
 }
 
@@ -321,6 +338,30 @@ func (m *Manager) notify() {
 	case m.wake <- struct{}{}:
 	default:
 	}
+}
+
+func (m *Manager) SRTInputStarted(channelID string) {
+	if strings.TrimSpace(channelID) == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	if m.discovering == nil {
+		m.discovering = make(map[string]inputDiscovery)
+	}
+	previousFingerprint := ""
+	if current := m.entries[channelID]; current != nil {
+		previousFingerprint = current.fingerprint
+	}
+	m.discovering[channelID] = inputDiscovery{
+		deadline: m.nowTime().Add(inputDiscoveryWindow), previousFingerprint: previousFingerprint,
+	}
+	m.freshStatus = true
+	m.mu.Unlock()
+	m.notify()
 }
 
 func (m *Manager) Close() {
@@ -354,7 +395,16 @@ func (m *Manager) reconcile(ctx context.Context) {
 		m.logger.Warn("compatibility channel list unavailable", "error", err)
 		return
 	}
-	status, err := m.media.Status(ctx)
+	m.mu.Lock()
+	freshStatus := m.freshStatus
+	m.freshStatus = false
+	m.mu.Unlock()
+	var status mediamtx.Status
+	if freshStatus {
+		status, err = m.media.StatusFresh(ctx)
+	} else {
+		status, err = m.media.Status(ctx)
+	}
 	if err != nil {
 		m.logger.Warn("compatibility MediaMTX status unavailable", "error", err)
 		return
@@ -365,15 +415,27 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 
 	seen := make(map[string]struct{}, len(configured))
+	configuredPaths := make(map[string]string, len(configured))
 	knownPaths := make(map[string]struct{}, len(configured))
 	for _, item := range configured {
 		seen[item.ID] = struct{}{}
+		configuredPaths[item.ID] = item.Path
 		knownPaths[item.Path] = struct{}{}
 		knownPaths[CompatibilityPath(item.ID)] = struct{}{}
 		m.reconcileChannel(ctx, item, byPath)
 	}
 
 	m.mu.Lock()
+	now := m.nowTime()
+	for channelID, discovery := range m.discovering {
+		path, configured := configuredPaths[channelID]
+		raw := byPath[path]
+		newSourceOnline := raw.Available && raw.Online &&
+			(discovery.previousFingerprint == "" || fingerprint(raw) != discovery.previousFingerprint)
+		if !configured || !now.Before(discovery.deadline) || newSourceOnline {
+			delete(m.discovering, channelID)
+		}
+	}
 	for id, item := range m.entries {
 		if _, ok := seen[id]; ok {
 			continue
@@ -493,11 +555,15 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	defer task.cancel()
 	defer close(task.done)
 	probeURL := m.pathURL(path)
+	expectedVideoCodec, expectedVideoWidth, expectedVideoHeight, expectedVideoProfile := firstVideoTrack(tracks)
+	if normalizeCodec(expectedVideoCodec) == "h264" && !h264ProfileExcludesBFrames(expectedVideoProfile) {
+		expectedVideoCodec = ""
+	}
 	result, err := classifyTracks(task.ctx, tracks, func(ctx context.Context) (videoCharacteristics, error) {
 		if m.probeVideo != nil {
 			return m.probeVideo(ctx, probeURL)
 		}
-		return m.probeVideoCharacteristics(ctx, probeURL)
+		return m.probeVideoCharacteristics(ctx, probeURL, expectedVideoCodec, expectedVideoWidth, expectedVideoHeight)
 	})
 
 	m.mu.Lock()
@@ -950,28 +1016,74 @@ func classifyTracks(ctx context.Context, tracks []mediamtx.Track, probeVideo fun
 	return result, nil
 }
 
-func (m *Manager) probeVideoCharacteristics(ctx context.Context, sourceURL string) (videoCharacteristics, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+func (m *Manager) probeVideoCharacteristics(ctx context.Context, sourceURL, expectedCodec string, expectedDimensions ...int) (videoCharacteristics, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, videoInspectionLimit)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, m.ffprobe,
+	if normalizeCodec(expectedCodec) == "h264" {
+		characteristics, err := m.probeH264StreamMetadata(probeCtx, sourceURL)
+		if err == nil && len(expectedDimensions) >= 2 && expectedDimensions[0] > 0 && expectedDimensions[1] > 0 &&
+			(characteristics.width != expectedDimensions[0] || characteristics.height != expectedDimensions[1]) {
+			err = fmt.Errorf("ffprobe H264 dimensions %dx%d differ from MediaMTX dimensions %dx%d",
+				characteristics.width, characteristics.height, expectedDimensions[0], expectedDimensions[1])
+		}
+		if err == nil {
+			if err := probeCtx.Err(); err != nil {
+				return videoCharacteristics{}, err
+			}
+			return characteristics, nil
+		}
+		if err := probeCtx.Err(); err != nil {
+			return videoCharacteristics{}, err
+		}
+	}
+	if err := probeCtx.Err(); err != nil {
+		return videoCharacteristics{}, err
+	}
+	return m.probeVideoFrames(probeCtx, sourceURL)
+}
+
+func (m *Manager) probeH264StreamMetadata(ctx context.Context, sourceURL string) (videoCharacteristics, error) {
+	cmd := exec.CommandContext(ctx, m.ffprobe,
+		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+		"-show_streams",
+		"-show_entries", "stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order",
+		"-of", "json", sourceURL,
+	)
+	output, err := ffprobeOutput(ctx, cmd)
+	if err != nil {
+		return videoCharacteristics{}, err
+	}
+	return parseH264StreamMetadata(output)
+}
+
+func (m *Manager) probeVideoFrames(ctx context.Context, sourceURL string) (videoCharacteristics, error) {
+	cmd := exec.CommandContext(ctx, m.ffprobe,
 		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
 		"-read_intervals", "%+2", "-show_streams", "-show_frames",
 		"-show_entries", "stream=codec_name,pix_fmt,width,height,field_order:frame=pict_type,pix_fmt,width,height,interlaced_frame,top_field_first",
 		"-of", "json", sourceURL,
 	)
+	output, err := ffprobeOutput(ctx, cmd)
+	if err != nil {
+		return videoCharacteristics{}, err
+	}
+	return parseVideoCharacteristics(output)
+}
+
+func ffprobeOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if err != nil {
-		if probeCtx.Err() != nil {
-			return videoCharacteristics{}, probeCtx.Err()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		if detail := strings.TrimSpace(stderr.String()); detail != "" {
-			return videoCharacteristics{}, errors.New(detail)
+			return nil, errors.New(detail)
 		}
-		return videoCharacteristics{}, err
+		return nil, err
 	}
-	return parseVideoCharacteristics(output)
+	return output, nil
 }
 
 type ffprobeFlag struct {
@@ -994,6 +1106,75 @@ func (f *ffprobeFlag) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("invalid ffprobe boolean %q", value)
 	}
 	return nil
+}
+
+type ffprobeInteger struct {
+	set   bool
+	value int
+}
+
+func (i *ffprobeInteger) UnmarshalJSON(data []byte) error {
+	value := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	switch strings.ToLower(value) {
+	case "", "null", "n/a", "unknown":
+		return nil
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("invalid ffprobe integer %q", value)
+	}
+	if number < 0 {
+		return nil
+	}
+	i.set = true
+	i.value = number
+	return nil
+}
+
+func parseH264StreamMetadata(data []byte) (videoCharacteristics, error) {
+	var output struct {
+		Streams []struct {
+			CodecName   string         `json:"codec_name"`
+			Profile     string         `json:"profile"`
+			HasBFrames  ffprobeInteger `json:"has_b_frames"`
+			PixelFormat string         `json:"pix_fmt"`
+			Width       int            `json:"width"`
+			Height      int            `json:"height"`
+			FieldOrder  string         `json:"field_order"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &output); err != nil {
+		return videoCharacteristics{}, fmt.Errorf("decode ffprobe stream metadata JSON: %w", err)
+	}
+	if len(output.Streams) != 1 {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned %d video streams", len(output.Streams))
+	}
+	stream := output.Streams[0]
+	if normalizeCodec(stream.CodecName) != "h264" {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned video codec %q, expected H264", stream.CodecName)
+	}
+	if !h264ProfileExcludesBFrames(stream.Profile) {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned H264 profile %q, expected Baseline", stream.Profile)
+	}
+	if !stream.HasBFrames.set {
+		return videoCharacteristics{}, errors.New("ffprobe did not return known H264 B-frame metadata")
+	}
+	if stream.HasBFrames.value != 0 {
+		return videoCharacteristics{}, errors.New("ffprobe reported H264 B-frames")
+	}
+	if !browserCompatibleH264PixelFormat(stream.PixelFormat) {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned non-browser H264 pixel format %q", stream.PixelFormat)
+	}
+	if stream.Width <= 0 || stream.Height <= 0 {
+		return videoCharacteristics{}, errors.New("ffprobe did not return valid video dimensions")
+	}
+	if !strings.EqualFold(strings.TrimSpace(stream.FieldOrder), "progressive") {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned non-progressive H264 field order %q", stream.FieldOrder)
+	}
+	return videoCharacteristics{
+		codec: stream.CodecName, pixelFormat: stream.PixelFormat,
+		width: stream.Width, height: stream.Height,
+	}, nil
 }
 
 func parseVideoCharacteristics(data []byte) (videoCharacteristics, error) {
@@ -1102,6 +1283,27 @@ func fieldOrderDescription(characteristics videoCharacteristics) string {
 		return "field order auto-detected"
 	}
 
+}
+
+func firstVideoTrack(tracks []mediamtx.Track) (string, int, int, string) {
+	for _, track := range tracks {
+		width := positiveIntProperty(track.CodecProps, "width")
+		height := positiveIntProperty(track.CodecProps, "height")
+		codec := normalizeCodec(track.Codec)
+		if isVideoCodec(codec, width, height) {
+			return codec, width, height, stringProperty(track.CodecProps, "profile")
+		}
+	}
+	return "", 0, 0, ""
+}
+
+func h264ProfileExcludesBFrames(profile string) bool {
+	switch normalizeCodec(profile) {
+	case "baseline", "constrainedbaseline":
+		return true
+	default:
+		return false
+	}
 }
 
 func isVideoCodec(codec string, width, height int) bool {
@@ -1272,6 +1474,14 @@ func positiveIntProperty(properties map[string]any, name string) int {
 		return 0
 	}
 	return int(number)
+}
+
+func stringProperty(properties map[string]any, name string) string {
+	value, ok := properties[name]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func retryDelay(restarts int) time.Duration {

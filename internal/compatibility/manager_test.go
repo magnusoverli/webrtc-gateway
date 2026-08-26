@@ -140,6 +140,47 @@ func TestParseVideoCharacteristicsRejectsIncompleteOutput(t *testing.T) {
 	}
 }
 
+func TestParseH264StreamMetadataAcceptsCompleteSafeStream(t *testing.T) {
+	for _, pixelFormat := range []string{"yuv420p", "yuvj420p"} {
+		t.Run(pixelFormat, func(t *testing.T) {
+			input := `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"` + pixelFormat + `","width":1920,"height":1080,"field_order":"progressive"}]}`
+			got, err := parseH264StreamMetadata([]byte(input))
+			want := progressiveVideo("h264", pixelFormat, 1920, 1080)
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("parseH264StreamMetadata() = %#v, %v; want %#v", got, err, want)
+			}
+		})
+	}
+}
+
+func TestParseH264StreamMetadataRejectsUnsafeOrIncompleteStream(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+	}{
+		{name: "malformed JSON", json: `not json`},
+		{name: "missing stream", json: `{"streams":[]}`},
+		{name: "multiple streams", json: `{"streams":[{},{}]}`},
+		{name: "missing B-frame metadata", json: `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "non-Baseline profile", json: `{"streams":[{"codec_name":"h264","profile":"High","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "unknown B-frame metadata", json: `{"streams":[{"codec_name":"h264","has_b_frames":"N/A","pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "malformed B-frame metadata", json: `{"streams":[{"codec_name":"h264","has_b_frames":false,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "contradictory codec", json: `{"streams":[{"codec_name":"hevc","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "positive B-frame metadata", json: `{"streams":[{"codec_name":"h264","has_b_frames":2,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "incompatible pixel format", json: `{"streams":[{"codec_name":"h264","has_b_frames":0,"pix_fmt":"yuv422p","width":1920,"height":1080,"field_order":"progressive"}]}`},
+		{name: "missing dimensions", json: `{"streams":[{"codec_name":"h264","has_b_frames":0,"pix_fmt":"yuv420p","field_order":"progressive"}]}`},
+		{name: "unknown field order", json: `{"streams":[{"codec_name":"h264","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"unknown"}]}`},
+		{name: "interlaced field order", json: `{"streams":[{"codec_name":"h264","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"tt"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := parseH264StreamMetadata([]byte(test.json)); err == nil {
+				t.Fatalf("parseH264StreamMetadata() = %#v, nil", got)
+			}
+		})
+	}
+}
+
 func TestClassifyTracksSelectsVideoTransformsAndReasons(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -800,6 +841,15 @@ func TestNextIntervalUsesEventsDeadlinesAndFallback(t *testing.T) {
 	if got := manager.nextInterval(); got != 2*time.Second {
 		t.Fatalf("stable interval = %v", got)
 	}
+	manager.discovering = map[string]inputDiscovery{"channel": {deadline: now.Add(time.Second)}}
+	if got := manager.nextInterval(); got != 250*time.Millisecond {
+		t.Fatalf("input discovery interval = %v", got)
+	}
+	manager.discovering["channel"] = inputDiscovery{deadline: now.Add(-time.Millisecond)}
+	if got := manager.nextInterval(); got != 2*time.Second {
+		t.Fatalf("expired input discovery interval = %v", got)
+	}
+	clear(manager.discovering)
 	manager.entries["channel"].state.State = StateStarting
 	if got := manager.nextInterval(); got != 250*time.Millisecond {
 		t.Fatalf("active interval = %v", got)
@@ -854,6 +904,94 @@ func TestNextIntervalUsesEventsDeadlinesAndFallback(t *testing.T) {
 	}
 	if got := manager.nextInterval(); got != 250*time.Millisecond {
 		t.Fatalf("elapsed metadata deadline interval = %v, want active interval", got)
+	}
+}
+
+func TestSRTInputStartedWakesWithFreshStatus(t *testing.T) {
+	configured := srtChannel("channel", "raw")
+	media := &wakeMediaManager{
+		status:      mediamtx.Status{Channels: []mediamtx.Channel{{Name: "raw"}}},
+		freshStatus: mediamtx.Status{Channels: []mediamtx.Channel{srtRuntime("generation-a", []mediamtx.Track{{Codec: "Opus"}})}},
+		statusCalls: make(chan struct{}, 4),
+		freshCalls:  make(chan struct{}, 4),
+	}
+	manager, err := New(Options{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Channels: reconcileChannelReader{items: []channel.Channel{configured}}, MediaMTX: media,
+		MediaRTSPURL: "rtsp://127.0.0.1:8554", Interval: time.Hour, ActiveInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(runDone)
+	}()
+	waitClosed(t, media.statusCalls, "initial cached status")
+
+	manager.SRTInputStarted(configured.ID)
+	waitClosed(t, media.freshCalls, "fresh status after SRT input")
+	waitForState(t, manager, configured.ID, func(state State) bool {
+		return state.State == StateReady && state.Mode == ModeDirect
+	})
+	manager.mu.RLock()
+	_, discovering := manager.discovering[configured.ID]
+	manager.mu.RUnlock()
+	if discovering {
+		t.Fatal("input discovery remained active after MediaMTX reported the path online")
+	}
+
+	cancel()
+	waitClosed(t, runDone, "manager run")
+	manager.SRTInputStarted(configured.ID)
+	assertNoSignal(t, media.freshCalls, "fresh status requested after manager close")
+}
+
+func TestInputDiscoveryWaitsForNewSourceFingerprint(t *testing.T) {
+	configured := srtChannel("channel", "raw")
+	oldRuntime := srtRuntime("old-generation", []mediamtx.Track{{Codec: "Opus"}})
+	newRuntime := srtRuntime("new-generation", []mediamtx.Track{{Codec: "Opus"}})
+	media := &reconcileMediaManager{status: mediamtx.Status{Channels: []mediamtx.Channel{oldRuntime}}}
+	rtspURL, err := url.Parse("rtsp://127.0.0.1:8554")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		channels: reconcileChannelReader{items: []channel.Channel{configured}}, media: media, rtspURL: rtspURL,
+		entries: map[string]*entry{configured.ID: {
+			fingerprint: fingerprint(oldRuntime), srt: true, classified: true,
+			state: State{State: StateReady, Mode: ModeDirect},
+		}},
+		discovering: map[string]inputDiscovery{configured.ID: {
+			deadline: time.Now().Add(time.Second), previousFingerprint: fingerprint(oldRuntime),
+		}},
+	}
+
+	manager.reconcile(context.Background())
+	if _, ok := manager.discovering[configured.ID]; !ok {
+		t.Fatal("discovery ended while MediaMTX still exposed the previous source")
+	}
+	media.status = mediamtx.Status{Channels: []mediamtx.Channel{newRuntime}}
+	manager.reconcile(context.Background())
+	manager.workers.Wait()
+	if _, ok := manager.discovering[configured.ID]; ok {
+		t.Fatal("discovery remained active after MediaMTX exposed the new source")
+	}
+}
+
+func TestH264ProfileExcludesBFrames(t *testing.T) {
+	for _, profile := range []string{"Baseline", "Constrained Baseline", "constrained-baseline"} {
+		if !h264ProfileExcludesBFrames(profile) {
+			t.Errorf("h264ProfileExcludesBFrames(%q) = false", profile)
+		}
+	}
+	for _, profile := range []string{"", "Main", "High", "High 4:2:2"} {
+		if h264ProfileExcludesBFrames(profile) {
+			t.Errorf("h264ProfileExcludesBFrames(%q) = true", profile)
+		}
 	}
 }
 
@@ -1132,17 +1270,208 @@ func TestRingWriterKeepsExactTailAcrossWraps(t *testing.T) {
 	}
 }
 
-func TestProbeVideoCharacteristicsReadsFirstVideoJSON(t *testing.T) {
-	probe := filepath.Join(t.TempDir(), "ffprobe")
-	output := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080}],"frames":[{"pict_type":"I","interlaced_frame":1,"top_field_first":1},{"pict_type":"B","interlaced_frame":1,"top_field_first":1}]}`
-	script := "#!/bin/sh\ncase \" $* \" in *\" -select_streams v:0 \"*) ;; *) exit 2;; esac\ncase \" $* \" in *\" -of json \"*) ;; *) exit 3;; esac\nprintf '%s' '" + output + "'\n"
-	if err := os.WriteFile(probe, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+func TestProbeVideoCharacteristicsUsesH264StreamMetadataWithoutFrameScan(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	calls := filepath.Join(directory, "calls")
+	output := `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+		"case \" $* \" in *\" -select_streams v:0 \"*) ;; *) exit 2;; esac\n" +
+		"case \" $* \" in *\" -show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order \"*) ;; *) exit 3;; esac\n" +
+		"case \" $* \" in *\" -read_intervals \"*|*\" -show_frames \"*) exit 4;; esac\n" +
+		"printf '%s' '" + output + "'\n"
+	writeExecutable(t, probe, script)
+
 	manager := &Manager{ffprobe: probe}
-	characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw")
-	if err != nil || !characteristics.hasBFrames || !characteristics.interlaced || !characteristics.topFieldFirst || characteristics.bottomFieldFirst {
+	characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "H264")
+	if err != nil || !reflect.DeepEqual(characteristics, progressiveVideo("h264", "yuv420p", 1920, 1080)) {
 		t.Fatalf("probeVideoCharacteristics() = %#v, %v", characteristics, err)
+	}
+	if got := readLines(t, calls); len(got) != 1 || !strings.Contains(got[0], "-show_streams") || strings.Contains(got[0], "-show_frames") {
+		t.Fatalf("ffprobe calls = %#v", got)
+	}
+}
+
+func TestProbeVideoCharacteristicsFallsBackForUntrustedH264Metadata(t *testing.T) {
+	metadata := []struct {
+		name   string
+		output string
+	}{
+		{name: "missing", output: `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}]}`},
+		{name: "unknown", output: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":"N/A","pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"unknown"}]}`},
+		{name: "contradictory", output: `{"streams":[{"codec_name":"hevc","has_b_frames":0,"pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}]}`},
+		{name: "positive B-frame", output: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":1,"pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}]}`},
+		{name: "incompatible pixel format", output: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv444p","width":1280,"height":720,"field_order":"progressive"}]}`},
+		{name: "interlaced", output: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"tt"}]}`},
+		{name: "malformed", output: `not json`},
+	}
+	frames := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`
+	for _, test := range metadata {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			probe := filepath.Join(directory, "ffprobe")
+			calls := filepath.Join(directory, "calls")
+			script := "#!/bin/sh\n" +
+				"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+				"case \" $* \" in\n" +
+				"  *\"has_b_frames\"*) printf '%s' '" + test.output + "' ;;\n" +
+				"  *) printf '%s' '" + frames + "' ;;\n" +
+				"esac\n"
+			writeExecutable(t, probe, script)
+
+			manager := &Manager{ffprobe: probe}
+			characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "h264")
+			if err != nil || !reflect.DeepEqual(characteristics, progressiveVideo("h264", "yuv420p", 1280, 720)) {
+				t.Fatalf("probeVideoCharacteristics() = %#v, %v", characteristics, err)
+			}
+			assertMetadataThenFrameScan(t, readLines(t, calls))
+		})
+	}
+}
+
+func TestProbeVideoCharacteristicsFallsBackAfterMetadataCommandFailure(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	calls := filepath.Join(directory, "calls")
+	frames := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":640,"height":480}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+		"case \" $* \" in\n" +
+		"  *\"has_b_frames\"*) printf '%s\\n' 'metadata unavailable' >&2; exit 12 ;;\n" +
+		"  *) printf '%s' '" + frames + "' ;;\n" +
+		"esac\n"
+	writeExecutable(t, probe, script)
+
+	manager := &Manager{ffprobe: probe}
+	characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "h264")
+	if err != nil || !reflect.DeepEqual(characteristics, progressiveVideo("h264", "yuv420p", 640, 480)) {
+		t.Fatalf("probeVideoCharacteristics() = %#v, %v", characteristics, err)
+	}
+	assertMetadataThenFrameScan(t, readLines(t, calls))
+}
+
+func TestProbeVideoCharacteristicsFallsBackWhenMediaMTXDimensionsDiffer(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	calls := filepath.Join(directory, "calls")
+	metadata := `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}]}`
+	frames := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+		"case \" $* \" in\n" +
+		"  *\"has_b_frames\"*) printf '%s' '" + metadata + "' ;;\n" +
+		"  *) printf '%s' '" + frames + "' ;;\n" +
+		"esac\n"
+	writeExecutable(t, probe, script)
+
+	manager := &Manager{ffprobe: probe}
+	characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "h264", 1920, 1080)
+	if err != nil || characteristics.width != 1280 || characteristics.height != 720 {
+		t.Fatalf("probeVideoCharacteristics() = %#v, %v", characteristics, err)
+	}
+	assertMetadataThenFrameScan(t, readLines(t, calls))
+}
+
+func TestProbeVideoCharacteristicsSkipsMetadataForNonH264ExpectedVideo(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	calls := filepath.Join(directory, "calls")
+	frames := `{"streams":[{"codec_name":"hevc","pix_fmt":"yuv420p10le","width":1920,"height":1080}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+		"case \" $* \" in *\"has_b_frames\"*) exit 9;; esac\n" +
+		"printf '%s' '" + frames + "'\n"
+	writeExecutable(t, probe, script)
+
+	manager := &Manager{ffprobe: probe}
+	characteristics, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "H265")
+	if err != nil || characteristics.codec != "hevc" {
+		t.Fatalf("probeVideoCharacteristics() = %#v, %v", characteristics, err)
+	}
+	if got := readLines(t, calls); len(got) != 1 || strings.Contains(got[0], "has_b_frames") || !strings.Contains(got[0], "-read_intervals %+2") {
+		t.Fatalf("ffprobe calls = %#v", got)
+	}
+}
+
+func TestProbeVideoCharacteristicsCancellationDoesNotStartFallback(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	calls := filepath.Join(directory, "calls")
+	metadataStarted := filepath.Join(directory, "metadata-started")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
+		"case \" $* \" in\n" +
+		"  *\"has_b_frames\"*) : > '" + metadataStarted + "'; exec sleep 10 ;;\n" +
+		"  *) exit 17 ;;\n" +
+		"esac\n"
+	writeExecutable(t, probe, script)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	manager := &Manager{ffprobe: probe}
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.probeVideoCharacteristics(ctx, "rtsp://input/raw", "h264")
+		done <- err
+	}()
+	waitForFile(t, metadataStarted)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("probe error = %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled metadata probe did not exit")
+	}
+	if got := readLines(t, calls); len(got) != 1 || !strings.Contains(got[0], "has_b_frames") {
+		t.Fatalf("ffprobe calls after cancellation = %#v", got)
+	}
+}
+
+func TestH264MetadataFallbackPreservesClassificationReasons(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata string
+		frames   string
+		reason   string
+	}{
+		{
+			name:     "B-frames",
+			metadata: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":1,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"progressive"}]}`,
+			frames:   `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0},{"pict_type":"B","interlaced_frame":0,"top_field_first":0}]}`,
+			reason:   "H264 contains B-frames and requires low-latency H264 conversion.",
+		},
+		{
+			name:     "pixel format",
+			metadata: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv422p","width":1920,"height":1080,"field_order":"progressive"}]}`,
+			frames:   `{"streams":[{"codec_name":"h264","pix_fmt":"yuv422p","width":1920,"height":1080}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`,
+			reason:   "H264 uses yuv422p; browser-compatible H264 requires 8-bit yuv420p.",
+		},
+		{
+			name:     "interlace",
+			metadata: `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv420p","width":1920,"height":1080,"field_order":"tt"}]}`,
+			frames:   `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080}],"frames":[{"pict_type":"I","interlaced_frame":1,"top_field_first":1}]}`,
+			reason:   "H264 is interlaced (top-field-first) and requires send-field deinterlacing.",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			probe := filepath.Join(t.TempDir(), "ffprobe")
+			script := "#!/bin/sh\ncase \" $* \" in\n" +
+				"  *\"has_b_frames\"*) printf '%s' '" + test.metadata + "' ;;\n" +
+				"  *) printf '%s' '" + test.frames + "' ;;\n" +
+				"esac\n"
+			writeExecutable(t, probe, script)
+			manager := &Manager{ffprobe: probe}
+
+			result, err := classifyTracks(context.Background(), []mediamtx.Track{{Codec: "H264"}}, func(ctx context.Context) (videoCharacteristics, error) {
+				return manager.probeVideoCharacteristics(ctx, "rtsp://input/raw", "h264")
+			})
+			if err != nil || !result.required || !result.transcodeVideo || !reflect.DeepEqual(result.reasons, []string{test.reason}) {
+				t.Fatalf("classification = %#v, %v", result, err)
+			}
+		})
 	}
 }
 
@@ -1211,14 +1540,30 @@ type reconcileMediaManager struct {
 type wakeMediaManager struct {
 	mu          sync.Mutex
 	status      mediamtx.Status
+	freshStatus mediamtx.Status
 	statusCalls chan struct{}
+	freshCalls  chan struct{}
 	deleteCalls chan string
 }
 
 func (m *wakeMediaManager) Status(context.Context) (mediamtx.Status, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.statusCalls <- struct{}{}
+	if m.statusCalls != nil {
+		m.statusCalls <- struct{}{}
+	}
+	return m.status, nil
+}
+
+func (m *wakeMediaManager) StatusFresh(context.Context) (mediamtx.Status, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.freshStatus.Channels != nil {
+		m.status = m.freshStatus
+	}
+	if m.freshCalls != nil {
+		m.freshCalls <- struct{}{}
+	}
 	return m.status, nil
 }
 
@@ -1272,6 +1617,10 @@ type pathRetryMedia struct {
 
 func (m *pathRetryMedia) Status(context.Context) (mediamtx.Status, error) {
 	return mediamtx.Status{}, nil
+}
+
+func (m *pathRetryMedia) StatusFresh(ctx context.Context) (mediamtx.Status, error) {
+	return m.Status(ctx)
 }
 
 func (m *pathRetryMedia) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
@@ -1380,6 +1729,10 @@ func (m *reconcileMediaManager) Status(context.Context) (mediamtx.Status, error)
 	return m.status, nil
 }
 
+func (m *reconcileMediaManager) StatusFresh(ctx context.Context) (mediamtx.Status, error) {
+	return m.Status(ctx)
+}
+
 func (m *reconcileMediaManager) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
 	return nil
 }
@@ -1411,6 +1764,49 @@ func countPair(values []string, first, second string) int {
 		}
 	}
 	return count
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSpace(string(contents))
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func assertMetadataThenFrameScan(t *testing.T, calls []string) {
+	t.Helper()
+	if len(calls) != 2 ||
+		!strings.Contains(calls[0], "-show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order") ||
+		strings.Contains(calls[0], "-read_intervals") ||
+		!strings.Contains(calls[1], "-read_intervals %+2") ||
+		!strings.Contains(calls[1], "-show_frames") {
+		t.Fatalf("ffprobe calls = %#v", calls)
+	}
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
 }
 
 func progressiveVideo(codec, pixelFormat string, width, height int) videoCharacteristics {

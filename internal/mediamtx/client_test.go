@@ -660,6 +660,99 @@ func TestClientRuntimeCacheExpiresAndMutationInvalidatesCaches(t *testing.T) {
 	}
 }
 
+func TestStatusFreshBypassesCachedRuntime(t *testing.T) {
+	var runtimeOnline atomic.Bool
+	var runtimeReads atomic.Int32
+	var infoReads atomic.Int32
+	var configReads atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		infoReads.Add(1)
+		fmt.Fprint(w, `{"started":"start-1","version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		configReads.Add(1)
+		fmt.Fprint(w, `{"items":[{"name":"demo","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		runtimeReads.Add(1)
+		fmt.Fprintf(w, `{"items":[{"name":"demo","available":%t,"online":%t}]}`, runtimeOnline.Load(), runtimeOnline.Load())
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := client.Status(context.Background())
+	if err != nil || status.Channels[0].Online {
+		t.Fatalf("initial Status() = %#v, %v", status, err)
+	}
+	runtimeOnline.Store(true)
+	status, err = client.Status(context.Background())
+	if err != nil || status.Channels[0].Online || runtimeReads.Load() != 1 {
+		t.Fatalf("cached Status() = %#v, %v, runtime reads %d", status, err, runtimeReads.Load())
+	}
+	status, err = client.StatusFresh(context.Background())
+	if err != nil || !status.Channels[0].Online || runtimeReads.Load() != 2 || infoReads.Load() != 1 || configReads.Load() != 1 {
+		t.Fatalf("StatusFresh() = %#v, %v, reads runtime=%d info=%d config=%d",
+			status, err, runtimeReads.Load(), infoReads.Load(), configReads.Load())
+	}
+}
+
+func TestStatusFreshKeepsUnrelatedInflightGeneration(t *testing.T) {
+	var globalReads atomic.Int32
+	globalStarted := make(chan struct{})
+	releaseGlobal := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v3/info", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"started":"start-1","version":"1.20.1"}`)
+	})
+	mux.HandleFunc("GET /v3/config/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"demo","source":"publisher"}]}`)
+	})
+	mux.HandleFunc("GET /v3/paths/list", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"demo","available":true,"online":true}]}`)
+	})
+	mux.HandleFunc("GET /v3/config/global/get", func(w http.ResponseWriter, _ *http.Request) {
+		if globalReads.Add(1) == 1 {
+			close(globalStarted)
+		}
+		<-releaseGlobal
+		fmt.Fprint(w, `{"logLevel":"info"}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client, err := NewClient(server.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globalResult := make(chan GlobalConfig, 1)
+	globalError := make(chan error, 1)
+	go func() {
+		config, callErr := client.GetGlobal(context.Background())
+		globalResult <- config
+		globalError <- callErr
+	}()
+	<-globalStarted
+	if _, err := client.StatusFresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseGlobal)
+	if config := <-globalResult; config.LogLevel != "info" {
+		t.Fatalf("in-flight GetGlobal() = %#v", config)
+	}
+	if err := <-globalError; err != nil {
+		t.Fatal(err)
+	}
+	config, err := client.GetGlobal(context.Background())
+	if err != nil || config.LogLevel != "info" || globalReads.Load() != 1 {
+		t.Fatalf("cached GetGlobal() = %#v, %v, reads %d", config, err, globalReads.Load())
+	}
+}
+
 func TestClientMutationInvalidatesEarlierInflightRead(t *testing.T) {
 	var reads atomic.Int32
 	firstStarted := make(chan struct{})

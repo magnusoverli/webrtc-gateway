@@ -26,10 +26,11 @@ type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
 
-	cacheMu  sync.Mutex
-	cache    map[string]cacheEntry
-	inflight map[string]*cacheCall
-	epoch    uint64
+	cacheMu      sync.Mutex
+	cache        map[string]cacheEntry
+	inflight     map[string]*cacheCall
+	epoch        uint64
+	runtimeEpoch uint64
 }
 
 type cacheEntry struct {
@@ -39,11 +40,12 @@ type cacheEntry struct {
 }
 
 type cacheCall struct {
-	done      chan struct{}
-	value     any
-	err       error
-	expiresAt time.Time
-	epoch     uint64
+	done         chan struct{}
+	value        any
+	err          error
+	expiresAt    time.Time
+	epoch        uint64
+	runtimeEpoch uint64
 }
 
 type cachedResult[T any] struct {
@@ -193,6 +195,11 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 	return snapshot.Status(), nil
 }
 
+func (c *Client) StatusFresh(ctx context.Context) (Status, error) {
+	c.invalidateRuntime()
+	return c.Status(ctx)
+}
+
 func (c *Client) Snapshot(ctx context.Context) (StatusSnapshot, error) {
 	return c.getStatusSnapshot(ctx)
 }
@@ -216,7 +223,7 @@ func (c *Client) getStatusSnapshot(ctx context.Context) (*statusSnapshot, error)
 		c.cacheMu.Unlock()
 		return snapshot, nil
 	}
-	if call := c.inflight[statusCacheKey]; call != nil && call.epoch == c.epoch {
+	if call := c.inflight[statusCacheKey]; call != nil && call.epoch == c.epoch && call.runtimeEpoch == c.runtimeEpoch {
 		c.cacheMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -229,7 +236,8 @@ func (c *Client) getStatusSnapshot(ctx context.Context) (*statusSnapshot, error)
 		}
 	}
 	epoch := c.epoch
-	call := &cacheCall{done: make(chan struct{}), epoch: epoch}
+	runtimeEpoch := c.runtimeEpoch
+	call := &cacheCall{done: make(chan struct{}), epoch: epoch, runtimeEpoch: runtimeEpoch}
 	c.inflight[statusCacheKey] = call
 	c.cacheMu.Unlock()
 
@@ -241,7 +249,7 @@ func (c *Client) getStatusSnapshot(ctx context.Context) (*statusSnapshot, error)
 	if c.inflight[statusCacheKey] == call {
 		delete(c.inflight, statusCacheKey)
 	}
-	if err == nil && c.epoch == epoch {
+	if err == nil && c.epoch == epoch && c.runtimeEpoch == runtimeEpoch {
 		c.cache[statusCacheKey] = cacheEntry{value: snapshot, expiresAt: expiresAt}
 	}
 	close(call.done)
@@ -387,7 +395,11 @@ func getURLCachedResult[T any](ctx context.Context, c *Client, endpoint string, 
 		c.cacheMu.Unlock()
 		return cachedResult[T]{value: clone(value), expiresAt: cached.expiresAt}, nil
 	}
-	if call := c.inflight[key]; call != nil && call.epoch == c.epoch {
+	runtimeEpoch := uint64(0)
+	if endpoint == "/v3/paths/list" {
+		runtimeEpoch = c.runtimeEpoch
+	}
+	if call := c.inflight[key]; call != nil && call.epoch == c.epoch && call.runtimeEpoch == runtimeEpoch {
 		c.cacheMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -400,7 +412,7 @@ func getURLCachedResult[T any](ctx context.Context, c *Client, endpoint string, 
 		}
 	}
 	epoch := c.epoch
-	call := &cacheCall{done: make(chan struct{}), epoch: epoch}
+	call := &cacheCall{done: make(chan struct{}), epoch: epoch, runtimeEpoch: runtimeEpoch}
 	c.inflight[key] = call
 	c.cacheMu.Unlock()
 
@@ -421,7 +433,7 @@ func getURLCachedResult[T any](ctx context.Context, c *Client, endpoint string, 
 	if c.inflight[key] == call {
 		delete(c.inflight, key)
 	}
-	if fetched && c.epoch == epoch {
+	if fetched && c.epoch == epoch && (endpoint != "/v3/paths/list" || c.runtimeEpoch == runtimeEpoch) {
 		c.cache[key] = cacheEntry{value: value, err: err, expiresAt: expiresAt}
 	}
 	close(call.done)
@@ -638,5 +650,19 @@ func (c *Client) invalidate() {
 	c.cacheMu.Lock()
 	c.epoch++
 	clear(c.cache)
+	c.cacheMu.Unlock()
+}
+
+func (c *Client) invalidateRuntime() {
+	runtimePath := c.endpointURL("/v3/paths/list").Path
+	c.cacheMu.Lock()
+	c.runtimeEpoch++
+	delete(c.cache, statusCacheKey)
+	for key := range c.cache {
+		requestURL, err := url.Parse(key)
+		if err == nil && requestURL.Path == runtimePath {
+			delete(c.cache, key)
+		}
+	}
 	c.cacheMu.Unlock()
 }

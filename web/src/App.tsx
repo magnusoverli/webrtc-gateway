@@ -250,6 +250,7 @@ function Dashboard() {
   const statusPollingRef = useRef<ReturnType<typeof startSerialPolling> | null>(null);
   const statusRef = useRef<Status | null>(null);
   const pollIntervalRef = useRef(2_000);
+  const compactRuntimePollingRef = useRef(false);
   const statusMutationGenerationRef = useRef(0);
   const forceFullStatusRef = useRef(false);
   const selectedRevisionRef = useRef<{ id: string; revision: number } | null>(null);
@@ -342,7 +343,11 @@ function Dashboard() {
       }
     };
 
-    const stopPolling = startSerialPolling(load, { intervalMs: () => pollIntervalRef.current });
+    const stopPolling = startSerialPolling(load, {
+      intervalMs: () => document.visibilityState === "visible" && compactRuntimePollingRef.current
+        ? 500
+        : pollIntervalRef.current,
+    });
     statusPollingRef.current = stopPolling;
     return () => {
       disposed = true;
@@ -355,6 +360,10 @@ function Dashboard() {
 
   const selected = status?.channels.find((item) => item.id === selectedID) ?? null;
   selectedRevisionRef.current = selected ? { id: selected.id, revision: selected.revision } : null;
+  const compactRuntimePolling = Boolean(
+    view === "detail" && selected?.automaticPreview && selected.enabled &&
+    selected.applyState === "applied" && !selected.outputReady,
+  );
   const statusStale = Boolean(status && statusError);
   const selectedRates = selected ? streamRates[selected.id] : undefined;
   const selectedFault = Boolean(selected && channelHasFault(selected));
@@ -417,6 +426,12 @@ function Dashboard() {
   const pendingEmbedURL = selected && pendingOutputOrigin ? absolutePath(pendingOutputOrigin, selected.embedPath) : "";
   const whepURL = selected ? absolutePath(outputOrigin, selected.whepPath) : "";
   const iframeCode = selected ? iframeEmbedCode(embedURL, selected.name) : "";
+
+  useEffect(() => {
+    if (compactRuntimePollingRef.current === compactRuntimePolling) return;
+    compactRuntimePollingRef.current = compactRuntimePolling;
+    statusPollingRef.current?.runNow();
+  }, [compactRuntimePolling]);
 
   useEffect(() => {
     passphraseRequestRef.current?.abort();
