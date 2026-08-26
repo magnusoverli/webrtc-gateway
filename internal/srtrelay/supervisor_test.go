@@ -19,7 +19,7 @@ import (
 	"webrtc-gateway/internal/channel"
 )
 
-func TestBuildInputEndpointUsesWiredLANDefaults(t *testing.T) {
+func TestBuildInputEndpointUsesCabledLANDefaults(t *testing.T) {
 	config := channel.SRTListener{
 		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
 		BindAddress: "192.0.2.20", Port: 10000, DestinationAddress: ":8890", Passphrase: "0123456789",
@@ -32,7 +32,7 @@ func TestBuildInputEndpointUsesWiredLANDefaults(t *testing.T) {
 	if input.Hostname() != "192.0.2.20" || input.Port() != "10000" || input.Query().Get("mode") != "listener" || input.Query().Has("streamid") {
 		t.Fatalf("input URL = %q", input.String())
 	}
-	if input.Query().Get("passphrase") != "0123456789" || input.Query().Get("latency") != "60" ||
+	if input.Query().Get("passphrase") != "0123456789" || input.Query().Get("latency") != "20" ||
 		input.Query().Get("rcvbuf") != "4194304" || input.Query().Get("conntimeo") != "1000" || input.Query().Get("peeridletimeo") != "3000" {
 		t.Fatalf("input URL options = %q", input.RawQuery)
 	}

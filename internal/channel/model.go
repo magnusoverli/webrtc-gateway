@@ -19,7 +19,7 @@ const (
 	InputSRTPush      InputMode = "srt-push"
 	InputSRTPull      InputMode = "srt-pull"
 
-	DefaultSRTLatencyMS = 60
+	DefaultSRTLatencyMS = 20
 	MinimumSRTLatencyMS = 20
 	MaximumSRTLatencyMS = 8000
 )

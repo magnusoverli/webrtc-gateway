@@ -30,6 +30,7 @@ const (
 	maximumUDPPacketSize       = 64 * 1024
 	bridgeReadBufferSize       = 4 * 1024 * 1024
 	bridgeWriteBufferSize      = 1 * 1024 * 1024
+	internalPublisherLatency   = 60 * time.Millisecond
 	rtpMP2TPayloadType         = 33
 )
 
@@ -1051,7 +1052,7 @@ func buildPublishEndpoint(config channel.SRTListener) (string, error) {
 	query.Set("connect_timeout", "1000")
 	query.Set("timeout", "3000000")
 	query.Set("sndbuf", strconv.Itoa(bridgeReadBufferSize))
-	query.Set("latency", strconv.Itoa(channel.DefaultSRTLatencyMS*1000))
+	query.Set("latency", strconv.FormatInt(internalPublisherLatency.Microseconds(), 10))
 	query.Set("pkt_size", "1316")
 	endpoint.RawQuery = query.Encode()
 	return endpoint.String(), nil

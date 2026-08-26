@@ -40,6 +40,15 @@ const RETRY_CAP_MS = 8_000;
 const RETRY_JITTER_RATIO = 0.2;
 const RESUME_BASE_MS = 500;
 
+export function preferLowDelay(receiver: RTCRtpReceiver) {
+  if (!("jitterBufferTarget" in receiver)) return;
+  try {
+    receiver.jitterBufferTarget = 0;
+  } catch {
+    // Receiver hints are optional and must not prevent playback.
+  }
+}
+
 export function useWHEPPlayer({
   whepPath,
   enabled,
@@ -220,8 +229,8 @@ export function useWHEPPlayer({
       const stream = new MediaStream();
       session = current;
 
-      peer.addTransceiver("video", { direction: "recvonly" });
-      peer.addTransceiver("audio", { direction: "recvonly" });
+      preferLowDelay(peer.addTransceiver("video", { direction: "recvonly" }).receiver);
+      preferLowDelay(peer.addTransceiver("audio", { direction: "recvonly" }).receiver);
       peer.ontrack = (event) => {
         if (disposed || session !== current) return;
         stream.addTrack(event.track);

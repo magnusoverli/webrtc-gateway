@@ -136,20 +136,22 @@ When an unlocked management-interface change is pending, the UI shows **Restart 
 
 Create an enabled **SRT push** channel in the UI and assign it an unused sender destination port, such as `10000`. The channel detail view shows the sender destination. Senders need only the Gateway IP and this port; no SRT stream ID is required.
 
-With FFmpeg installed on the host, publish a browser-compatible H264 test pattern to the per-channel listener:
+With FFmpeg installed on the host, publish a browser-compatible H264/Opus test pattern to the per-channel listener:
 
 ```sh
 ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=1000:sample_rate=48000 \
   -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline \
-  -bf 0 -g 30 -f mpegts \
-  "srt://HOST_IP:10000?latency=60"
+  -pix_fmt yuv420p -bf 0 -g 30 \
+  -c:a libopus -application lowdelay -frame_duration 10 -b:a 96k -ac 2 \
+  -f mpegts "srt://HOST_IP:10000?latency=20000"
 ```
 
-Gateway starts a supervised `srt-live-transmit` listener with a 60 ms wired-LAN latency default, a 4 MiB receive buffer, three-second peer-idle detection, and one-second connection timeout. It classifies each SRT message before routing it into MediaMTX. Raw MPEG-TS and RTP/MP2T are stream-copy remuxed by FFmpeg to normalize transport headers, codec metadata, and PES framing; the remux input uses a bounded 128 KiB/one-second analysis budget instead of FFmpeg's multi-second default. Elementary RTP is forwarded directly over loopback UDP. Neither route decodes or encodes media. Internal publishers exist only while a sender is active, and the listener recovers automatically after disconnects and Gateway restarts.
+Gateway starts a supervised `srt-live-transmit` listener with a 20 ms cabled-LAN latency default, a 4 MiB receive buffer, three-second peer-idle detection, and one-second connection timeout. Increase the per-channel latency for lossy or long-distance links. FFmpeg's SRT `latency` URL value is expressed in microseconds, so `20000` matches the Gateway's 20 ms setting. Gateway classifies each SRT message before routing it into MediaMTX. Raw MPEG-TS and RTP/MP2T are stream-copy remuxed by FFmpeg to normalize transport headers, codec metadata, and PES framing; the remux input uses a bounded 128 KiB/one-second analysis budget instead of FFmpeg's multi-second default. Elementary RTP is forwarded directly over loopback UDP. Neither route decodes or encodes media. Internal publishers exist only while a sender is active, and the listener recovers automatically after disconnects and Gateway restarts.
 
 Senders that support stream IDs can alternatively use the direct MediaMTX SRT URL shown in the channel view. Direct publishing uses the global SRT listener, `8890/udp` by default, and a stream ID in the form `publish:CHANNEL_PATH`. This shortcut terminates in MediaMTX's native MPEG-TS SRT reader and is therefore MPEG-TS-only.
 
-The UI reports the channel online and displays the detected H264 profile and dimensions. Automatic preview creates a muted WHEP reader for an eligible overview card or open channel detail and displays receive bitrate, codec, resolution, frame rate, packet loss, jitter, ICE path, and decoded or dropped frames. While a visible channel detail is waiting for automatic-preview output, compact runtime status is checked every 500 ms; steady-state polling returns to the configured statistics interval. Disabling automatic preview or leaving the surface closes the peer connection and deletes its WHEP session; a session also closes after the page remains hidden for 30 seconds.
+The UI reports the channel online and displays the detected H264 profile and dimensions. Automatic preview creates a muted WHEP reader for an eligible overview card or open channel detail and displays receive bitrate, codec, resolution, frame rate, packet loss, jitter, ICE path, and decoded or dropped frames. The player requests the browser's minimum supported jitter-buffer target; browsers can clamp this upward for current network conditions, and browsers without the standardized receiver hint retain their adaptive default. While a visible channel detail is waiting for automatic-preview output, compact runtime status is checked every 500 ms; steady-state polling returns to the configured statistics interval. Disabling automatic preview or leaving the surface closes the peer connection and deletes its WHEP session; a session also closes after the page remains hidden for 30 seconds.
 
 WebRTC media prefers UDP and also exposes a TCP fallback on the same port by default. Configure or disable the **WebRTC TCP fallback port** in **Global settings**, and allow the selected media interface and configured UDP/TCP ports through the host firewall. TCP and UDP can use the same port number.
 
@@ -280,7 +282,7 @@ Open **Global settings** in the UI to configure management/media interfaces, tra
 
 Full settings and channel replacements use their current revision with `If-Match`, so a stale editor is rejected instead of overwriting newer state. The automatic-preview toggle uses a narrow `PATCH` request rather than sending a full channel configuration.
 
-Fresh deployments use a wired-LAN profile: five-second media I/O timeouts, a 512-packet writer queue, a 4 MiB UDP receive buffer, 1452-byte UDP payloads, 60 ms per-channel SRT latency, and a default maximum of 16 readers for new channels. A value of zero still explicitly selects unlimited readers. Persisted settings and existing per-channel viewer limits are not silently overwritten during upgrades.
+Fresh deployments use a cabled-LAN profile: five-second media I/O timeouts, a 512-packet writer queue, a 4 MiB UDP receive buffer, 1452-byte UDP payloads, 20 ms per-channel SRT latency, and a default maximum of 16 readers for new channels. A value of zero still explicitly selects unlimited readers. Persisted channel latency settings and existing per-channel viewer limits are not silently overwritten during upgrades.
 
 To remove containers while preserving configuration:
 

@@ -2,7 +2,7 @@
 
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useWHEPPlayer } from "./useWHEPPlayer";
+import { preferLowDelay, useWHEPPlayer } from "./useWHEPPlayer";
 
 const fetchMock = vi.fn<typeof fetch>();
 
@@ -38,6 +38,20 @@ describe("useWHEPPlayer", () => {
     expect(MockPeer.instances[0].getStats).not.toHaveBeenCalled();
     await act(async () => vi.advanceTimersByTimeAsync(5000));
     expect(MockPeer.instances[0].getStats).not.toHaveBeenCalled();
+  });
+
+  it("requests minimum browser jitter buffering for both receivers", async () => {
+    renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true }));
+    await settle();
+
+    expect(MockPeer.instances[0].receivers.map((receiver) => receiver.jitterBufferTarget)).toEqual([0, 0]);
+  });
+
+  it("treats unsupported or rejected receiver hints as nonfatal", () => {
+    expect(() => preferLowDelay({} as RTCRtpReceiver)).not.toThrow();
+    const receiver = {} as RTCRtpReceiver;
+    Object.defineProperty(receiver, "jitterBufferTarget", { set: () => { throw new Error("unsupported"); } });
+    expect(() => preferLowDelay(receiver)).not.toThrow();
   });
 
   it("runs opted-in stats serially and treats failures as nonfatal", async () => {
@@ -252,7 +266,8 @@ class MockPeer extends EventTarget {
   localDescription: RTCSessionDescription | null = null;
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onconnectionstatechange: ((event: Event) => void) | null = null;
-  addTransceiver = vi.fn();
+  receivers = [{ jitterBufferTarget: null }, { jitterBufferTarget: null }];
+  addTransceiver = vi.fn(() => ({ receiver: this.receivers[this.addTransceiver.mock.calls.length - 1] }));
   createOffer = vi.fn(async () => ({ type: "offer" as const, sdp: "offer" }));
   setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => {
     this.localDescription = description as RTCSessionDescription;

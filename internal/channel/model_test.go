@@ -28,8 +28,8 @@ func TestNewChannelBuildsStablePath(t *testing.T) {
 	if item.ApplyState != ApplyPending || !item.CreatedAt.Equal(now) {
 		t.Fatalf("unexpected initial state: %#v", item)
 	}
-	if item.Input.SRT.LatencyMS != DefaultSRTLatencyMS {
-		t.Fatalf("SRT latency = %d, want %d", item.Input.SRT.LatencyMS, DefaultSRTLatencyMS)
+	if item.Input.SRT.LatencyMS != 20 {
+		t.Fatalf("SRT latency = %d, want low-latency LAN default 20", item.Input.SRT.LatencyMS)
 	}
 
 	updated, err := item.WithDraft(Draft{

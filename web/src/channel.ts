@@ -1,5 +1,7 @@
 export type InputMode = "srt-push" | "srt-pull" | "rtp-unicast" | "rtp-multicast";
 
+export const DEFAULT_SRT_LATENCY_MS = 20;
+
 export type Track = {
   codec: string;
   codecProps?: Record<string, string | number | boolean | null>;
@@ -419,7 +421,7 @@ export function activeListenerHost(listenerAddress: string | undefined, fallback
   return isWildcardHost(listener.host) ? fallbackHostname : listener.host;
 }
 
-export function srtListenerURL(listenerAddress: string | undefined, fallbackHostname: string, latencyMs = 60) {
+export function srtListenerURL(listenerAddress: string | undefined, fallbackHostname: string, latencyMs = DEFAULT_SRT_LATENCY_MS) {
   const listener = parseListenerSocket(listenerAddress);
   if (!listener) return "";
   const host = isWildcardHost(listener.host) ? fallbackHostname : listener.host;

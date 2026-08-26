@@ -5,6 +5,7 @@ import {
   channelHasFault,
   channelPlaybackReady,
   channelStateLabel,
+  DEFAULT_SRT_LATENCY_MS,
   hasInputStream,
   hasOutputStream,
   iframeEmbedCode,
@@ -184,7 +185,7 @@ const emptyForm = (settings?: GlobalSettings, srtPort = 10000): ChannelForm => (
   passphrase: "",
   hasPassphrase: false,
   clearPassphrase: false,
-  latencyMs: "60",
+  latencyMs: String(DEFAULT_SRT_LATENCY_MS),
   maxReaders: String(settings?.defaultMaxReaders ?? 16),
   useAbsoluteTimestamp: true,
 });
@@ -597,7 +598,7 @@ function Dashboard() {
       next.port = String(item.input.srt.port || 8890);
       next.streamId = item.input.srt.streamId ?? "";
       next.hasPassphrase = item.input.srt.hasPassphrase;
-      next.latencyMs = String(item.input.srt.latencyMs || 60);
+      next.latencyMs = String(item.input.srt.latencyMs || DEFAULT_SRT_LATENCY_MS);
       next.srtSdp = item.input.srt.sdp ?? "";
     }
     setEditingID(item.id);
@@ -1194,6 +1195,7 @@ function Dashboard() {
                   {selected.compatibility.state === "error" && <p>{selected.compatibility.lastError ?? "Compatibility output is unavailable."}</p>}
                   {selected.compatibility.state === "ready" && selected.compatibility.mode === "direct" && <p>Incoming tracks are routed directly without an FFmpeg worker.</p>}
                   {selected.compatibility.state === "ready" && selected.compatibility.mode === "transcoded" && <p>WebRTC output: {selected.outputTracks.map((track) => track.codec).join(" + ") || "H264 + Opus"}.</p>}
+                  {selected.compatibility.state === "ready" && selected.compatibility.mode === "transcoded" && <p>For the lowest latency and CPU use, send progressive H264 Baseline, YUV420p, no B-frames, and Opus.</p>}
                 </div>}
               </article>
             </section>
@@ -1404,8 +1406,15 @@ function ChannelEditor({ form, editing, error, conflict, saving, mutationBlocked
               <label className="field">
                 <FieldTitle help="SRT retransmission buffer duration. Higher values tolerate more delay and packet loss but add end-to-end latency.">SRT latency</FieldTitle>
                 <div className="suffix-input"><input type="number" min="20" max="8000" value={form.latencyMs} onChange={(event) => update("latencyMs", event.target.value)} /><span>ms</span></div>
-                <small>60 ms is tuned for reliable cabled LANs. Increase it for lossy or long-distance links.</small>
+                <small>20 ms is the lowest validated cabled-LAN setting. Increase it for lossy or long-distance links.</small>
               </label>
+            )}
+
+            {!isRTP && (
+              <div className="field full">
+                <FieldTitle help="Gateway routes compatible input without a conversion worker, reducing latency and CPU use.">Lowest-latency sender profile</FieldTitle>
+                <small>Use progressive H264 Baseline, YUV420p, no B-frames, and Opus. Other supported codecs are normalized automatically.</small>
+              </div>
             )}
 
             {!isRTP && (

@@ -70,7 +70,7 @@ describe("connection URLs", () => {
 
   it("uses concrete bindings and brackets IPv6 hosts", () => {
     expect(mediaHost("2001:db8::20", location.hostname)).toBe("2001:db8::20");
-    expect(srtListenerURL("[2001:db8::20]:10000", location.hostname)).toBe("srt://[2001:db8::20]:10000?latency=60");
+    expect(srtListenerURL("[2001:db8::20]:10000", location.hostname)).toBe("srt://[2001:db8::20]:10000?latency=20");
     expect(srtListenerURL("192.0.2.20:10000", location.hostname, 80)).toBe("srt://192.0.2.20:10000?latency=80");
     expect(srtPublishURL("studio-main", "[2001:db8::20]:8890", location.hostname)).toBe(
       "srt://[2001:db8::20]:8890?streamid=publish:studio-main&pkt_size=1316",
@@ -81,8 +81,8 @@ describe("connection URLs", () => {
   it("falls back to the browser location for wildcard bindings", () => {
     expect(mediaHost("*", location.hostname)).toBe("desk.local");
     expect(activeListenerHost(":10000", location.hostname)).toBe("desk.local");
-    expect(srtListenerURL("0.0.0.0:10000", location.hostname)).toBe("srt://desk.local:10000?latency=60");
-    expect(srtListenerURL("[::]:10000", location.hostname)).toBe("srt://desk.local:10000?latency=60");
+    expect(srtListenerURL("0.0.0.0:10000", location.hostname)).toBe("srt://desk.local:10000?latency=20");
+    expect(srtListenerURL("[::]:10000", location.hostname)).toBe("srt://desk.local:10000?latency=20");
     expect(srtPublishURL("studio-main", ":8890", location.hostname)).toBe(
       "srt://desk.local:8890?streamid=publish:studio-main&pkt_size=1316",
     );
