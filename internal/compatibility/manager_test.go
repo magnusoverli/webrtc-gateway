@@ -153,6 +153,25 @@ func TestParseH264StreamMetadataAcceptsCompleteSafeStream(t *testing.T) {
 	}
 }
 
+func TestParseVideoStreamMetadataUsesAverageThenNominalFrameRate(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		json string
+		want string
+	}{
+		{name: "average", json: `{"streams":[{"codec_name":"h264","width":1920,"height":1080,"r_frame_rate":"60/1","avg_frame_rate":"60000/1001"}]}`, want: "60000/1001"},
+		{name: "nominal fallback", json: `{"streams":[{"codec_name":"vp9","width":3840,"height":2160,"r_frame_rate":"60000/1001","avg_frame_rate":"0/0"}]}`, want: "60000/1001"},
+		{name: "unavailable", json: `{"streams":[{"codec_name":"h264","width":1280,"height":720,"r_frame_rate":"0/0","avg_frame_rate":"N/A"}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseVideoStreamMetadata([]byte(test.json))
+			if err != nil || got.width <= 0 || got.height <= 0 || got.frameRate != test.want {
+				t.Fatalf("parseVideoStreamMetadata() = %#v, %v; frame rate want %q", got, err, test.want)
+			}
+		})
+	}
+}
+
 func TestParseH264StreamMetadataRejectsUnsafeOrIncompleteStream(t *testing.T) {
 	tests := []struct {
 		name string
@@ -584,7 +603,9 @@ func TestMetadataReadyProbesImmediately(t *testing.T) {
 	probeCalls := make(chan map[string]any, 1)
 	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
 		probeCalls <- nil
-		return progressiveVideo("h264", "yuv420p", 1280, 720), nil
+		result := progressiveVideo("h264", "yuv420p", 1280, 720)
+		result.frameRate = "24000/1001"
+		return result, nil
 	})
 	t.Cleanup(manager.Close)
 	configured := srtChannel("channel", "raw")
@@ -595,6 +616,9 @@ func TestMetadataReadyProbesImmediately(t *testing.T) {
 	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
 	receiveProbeCall(t, probeCalls)
 	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	if got := manager.Snapshot(configured.ID).InputVideo; got == nil || got.Width != 1280 || got.Height != 720 || got.FrameRate != "24000/1001" {
+		t.Fatalf("input video metadata = %#v", got)
+	}
 }
 
 func TestProbeIsAsynchronousNonblockingAndSingleFlight(t *testing.T) {
@@ -634,6 +658,24 @@ func TestProbeIsAsynchronousNonblockingAndSingleFlight(t *testing.T) {
 	assertNoSignal(t, probeStarted, "duplicate probe")
 	close(releaseProbe)
 	waitForState(t, manager, blocked.ID, func(state State) bool { return state.State == StateReady })
+}
+
+func TestVP9MetadataProbeDoesNotDelayDirectReady(t *testing.T) {
+	directory := t.TempDir()
+	probe := filepath.Join(directory, "ffprobe")
+	started := filepath.Join(directory, "started")
+	script := "#!/bin/sh\n: > '" + started + "'\nexec sleep 10\n"
+	writeExecutable(t, probe, script)
+	clock := newTestClock()
+	manager := newProbeTestManager(t, clock, nil)
+	manager.ffprobe = probe
+	configured := srtChannel("channel", "raw")
+	runtime := srtRuntime("generation-a", []mediamtx.Track{{Codec: "VP9", CodecProps: map[string]any{"profile": float64(0)}}})
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	waitForFile(t, started)
+	manager.Close()
 }
 
 func TestProbeRejectsStaleABAResult(t *testing.T) {
@@ -1356,7 +1398,7 @@ func TestProbeVideoCharacteristicsUsesH264StreamMetadataWithoutFrameScan(t *test
 	script := "#!/bin/sh\n" +
 		"printf '%s\\n' \"$*\" >> '" + calls + "'\n" +
 		"case \" $* \" in *\" -select_streams v:0 \"*) ;; *) exit 2;; esac\n" +
-		"case \" $* \" in *\" -show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order \"*) ;; *) exit 3;; esac\n" +
+		"case \" $* \" in *\" -show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order,r_frame_rate,avg_frame_rate \"*) ;; *) exit 3;; esac\n" +
 		"case \" $* \" in *\" -read_intervals \"*|*\" -show_frames \"*) exit 4;; esac\n" +
 		"printf '%s' '" + output + "'\n"
 	writeExecutable(t, probe, script)
@@ -1876,7 +1918,7 @@ func readLines(t *testing.T, path string) []string {
 func assertMetadataThenFrameScan(t *testing.T, calls []string) {
 	t.Helper()
 	if len(calls) != 2 ||
-		!strings.Contains(calls[0], "-show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order") ||
+		!strings.Contains(calls[0], "-show_entries stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order,r_frame_rate,avg_frame_rate") ||
 		strings.Contains(calls[0], "-read_intervals") ||
 		!strings.Contains(calls[1], "-read_intervals %+2") ||
 		!strings.Contains(calls[1], "-show_frames") {

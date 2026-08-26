@@ -1,5 +1,5 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode, type RefObject } from "react";
-import { channelPlaybackReady, channelStateLabel, channelTone, primaryChannelIssue, type Channel, type ChannelStreamRates, type ChannelTone } from "./channel";
+import { channelPlaybackReady, channelStateLabel, channelTone, primaryChannelIssue, trackKind, type Channel, type ChannelStreamRates, type ChannelTone, type Track } from "./channel";
 import { GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { useWHEPPlayer } from "./useWHEPPlayer";
@@ -203,6 +203,7 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stal
   const transcoding = item.compatibility.mode === "transcoded";
   const routeLabel = transcoding ? "Transcoding" : "Passthrough";
   const routeActive = item.compatibility.state === "ready" && item.outputReady && (!transcoding || item.compatibility.worker.running);
+  const format = showPreview ? overviewVideoFormat(item) : null;
 
   return (
     <article className={`overview-card tone-${tone}`}>
@@ -228,6 +229,7 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stal
       </div>
       <OverviewPreview item={item} stale={stale} showPreview={showPreview} />
       <div className="overview-card-stats">
+        {format && <div className="overview-card-format" aria-label={format.label}>{format.display}</div>}
         <div><span>Input</span><strong>{item.available && item.online ? formatBitrate(rate?.inputBitrateBps) : "—"}</strong></div>
         <div><span>Output</span><strong>{item.outputReady ? formatBitrate(rate?.outputBitrateBps) : "—"}</strong></div>
         <div><span>Viewers</span><strong>{item.outputReady ? item.readerCount : "—"}</strong></div>
@@ -283,6 +285,7 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
     previousItem.outputReady === nextItem.outputReady &&
     previousItem.readerCount === nextItem.readerCount &&
     previousItem.relay?.state === nextItem.relay?.state &&
+    sameVideoMetadata(previousItem, nextItem) &&
     sameIssues(previousItem, nextItem) &&
     previousItem.compatibility.state === nextItem.compatibility.state &&
     previousItem.compatibility.mode === nextItem.compatibility.mode &&
@@ -332,6 +335,52 @@ function sameOverviewPreviewProps(previous: OverviewPreviewProps, next: Overview
     previousItem.outputReady === nextItem.outputReady &&
     previousItem.whepPath === nextItem.whepPath &&
     sameIssues(previousItem, nextItem);
+}
+
+function overviewVideoFormat(item: Channel) {
+  const track = overviewInputVideoTrack(item);
+  const width = item.inputVideo?.width || numberTrackProperty(track, "width");
+  const height = item.inputVideo?.height || numberTrackProperty(track, "height");
+  const fps = frameRateValue(item.inputVideo?.frameRate) || numberTrackProperty(track, "frameRate") || numberTrackProperty(track, "fps");
+  const resolution = width && height ? `${width} × ${height}` : "Resolution —";
+  const frameRate = fps ? `${formatFrameRate(fps)} fps` : "FPS —";
+  return {
+    display: `${resolution} · ${frameRate}`,
+    label: `Video format: ${width && height ? `${width} by ${height}` : "resolution unavailable"}, ${fps ? `${frameRate}` : "frame rate unavailable"}`,
+  };
+}
+
+function overviewInputVideoTrack(item: Channel) {
+  return item.tracks.find((track) => trackKind(track) === "video");
+}
+
+function numberTrackProperty(track: Track | undefined, key: string) {
+  const value = track?.codecProps?.[key];
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function sameVideoMetadata(previous: Channel, next: Channel) {
+  const previousTrack = overviewInputVideoTrack(previous);
+  const nextTrack = overviewInputVideoTrack(next);
+  return previous.inputVideo?.width === next.inputVideo?.width &&
+    previous.inputVideo?.height === next.inputVideo?.height &&
+    previous.inputVideo?.frameRate === next.inputVideo?.frameRate &&
+    previousTrack?.codec === nextTrack?.codec &&
+    numberTrackProperty(previousTrack, "width") === numberTrackProperty(nextTrack, "width") &&
+    numberTrackProperty(previousTrack, "height") === numberTrackProperty(nextTrack, "height") &&
+    numberTrackProperty(previousTrack, "frameRate") === numberTrackProperty(nextTrack, "frameRate") &&
+    numberTrackProperty(previousTrack, "fps") === numberTrackProperty(nextTrack, "fps");
+}
+
+function frameRateValue(value?: string) {
+  if (!value) return 0;
+  const [numerator, denominator, extra] = value.split("/").map(Number);
+  if (extra !== undefined || !Number.isFinite(numerator) || !Number.isFinite(denominator) || numerator <= 0 || denominator <= 0) return 0;
+  return numerator / denominator;
+}
+
+function formatFrameRate(value: number) {
+  return Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<typeof useWHEPPlayer>["state"], hasVideo: boolean, hasAudio: boolean) {

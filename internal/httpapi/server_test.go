@@ -457,6 +457,7 @@ func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
 	router := &fakeCompatibility{state: compatibility.State{
 		State: compatibility.StateReady, Mode: compatibility.ModeTranscoded,
 		OutputPath: "compat-channel-1", Reasons: []string{},
+		InputVideo: &compatibility.VideoMetadata{Width: 1920, Height: 1080, FrameRate: "24000/1001"},
 	}}
 	handler := newTestHandlerWithCompatibility(t, fakeMediaMTX{status: mediamtx.Status{
 		Channels: []mediamtx.Channel{
@@ -471,7 +472,8 @@ func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
 	if res.Code != http.StatusOK || !strings.Contains(body, `"inboundBytes":1000`) ||
 		!strings.Contains(body, `"outputInboundBytes":700`) ||
 		!strings.Contains(body, `"outputAvailableTime":"2026-08-23T20:00:01Z"`) ||
-		!strings.Contains(body, `"outboundBytes":1400`) {
+		!strings.Contains(body, `"outboundBytes":1400`) ||
+		!strings.Contains(body, `"inputVideo":{"width":1920,"height":1080,"frameRate":"24000/1001"}`) {
 		t.Fatalf("response = %d %s", res.Code, body)
 	}
 }
@@ -566,7 +568,7 @@ func TestRuntimeChannelsAreCompactAndComplete(t *testing.T) {
 		"id", "revision", "applyState", "applyError", "available", "availableTime", "online", "onlineTime",
 		"inputGeneration", "inboundBytes", "outputInboundBytes", "outputAvailableTime", "outputGeneration",
 		"outboundBytes", "inboundFramesInError", "readerCount", "tracks", "outputReady", "outputTracks",
-		"compatibility",
+		"inputVideo", "compatibility",
 	} {
 		if _, ok := item[field]; !ok {
 			t.Errorf("runtime channel omitted %q: %s", field, res.Body.String())

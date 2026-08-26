@@ -28,6 +28,12 @@ export type ChannelStreamRates = {
   deliveryBitrateBps: number | null;
 };
 
+export type InputVideoMetadata = {
+  width: number;
+  height: number;
+  frameRate?: string;
+};
+
 export type ChannelRateSample = {
   sampledAt: number;
   inputGeneration: string;
@@ -87,6 +93,7 @@ export type Channel = {
   readers: Array<{ type: string; id: string }>;
   readerCount: number;
   tracks: Track[];
+  inputVideo?: InputVideoMetadata | null;
   outputReady: boolean;
   outputTracks: Track[];
   issues: ChannelIssue[];
@@ -127,6 +134,7 @@ export type ChannelRuntime = Pick<
   | "inboundFramesInError"
   | "readerCount"
   | "tracks"
+  | "inputVideo"
   | "outputReady"
   | "outputTracks"
   | "compatibility"
@@ -263,7 +271,7 @@ export function readChannelSnapshot(value: unknown): Channel | null {
     typeof item.whepPath !== "string" || typeof item.viewerPath !== "string" || typeof item.embedPath !== "string" ||
     typeof item.outputReady !== "boolean" || typeof item.applyState !== "string" ||
     !item.input || typeof item.input.mode !== "string" || !isCompatibility(item.compatibility) || !isIssues(item.issues) ||
-    !Array.isArray(item.readers) || !Array.isArray(item.tracks) || !Array.isArray(item.outputTracks)) return null;
+    !Array.isArray(item.readers) || !Array.isArray(item.tracks) || !Array.isArray(item.outputTracks) || !isInputVideo(item.inputVideo)) return null;
   const sourceID = item.source && typeof item.source.id === "string" ? item.source.id : "";
   return {
     ...item,
@@ -294,7 +302,7 @@ export function readChannelRuntime(value: unknown): ChannelRuntime | null {
     typeof item.outboundBytes !== "number" || typeof item.inboundFramesInError !== "number" ||
     typeof item.readerCount !== "number" || !Number.isInteger(item.readerCount) || item.readerCount < 0 ||
     !Array.isArray(item.tracks) || typeof item.outputReady !== "boolean" || !Array.isArray(item.outputTracks) ||
-    !isCompatibility(item.compatibility) || !isIssues(item.issues)) return null;
+    !isCompatibility(item.compatibility) || !isIssues(item.issues) || !isInputVideo(item.inputVideo)) return null;
   if (item.applyError !== undefined && typeof item.applyError !== "string") return null;
   if (item.availableTime !== undefined && typeof item.availableTime !== "string") return null;
   if (item.onlineTime !== undefined && typeof item.onlineTime !== "string") return null;
@@ -332,6 +340,7 @@ export function mergeChannelRuntime(channel: Channel, runtime: ChannelRuntime): 
     inboundFramesInError: runtime.inboundFramesInError,
     readerCount: runtime.readerCount,
     tracks: runtime.tracks,
+    inputVideo: runtime.inputVideo,
     outputReady: runtime.outputReady,
     outputTracks: runtime.outputTracks,
     compatibility: runtime.compatibility,
@@ -397,6 +406,15 @@ function isCompatibility(value: unknown): value is Channel["compatibility"] {
   const item = value as Partial<Channel["compatibility"]>;
   return typeof item.state === "string" && Array.isArray(item.reasons) &&
     Boolean(item.worker && typeof item.worker.running === "boolean" && typeof item.worker.restarts === "number");
+}
+
+function isInputVideo(value: unknown): value is InputVideoMetadata | null | undefined {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "object") return false;
+  const item = value as Partial<InputVideoMetadata>;
+  return typeof item.width === "number" && Number.isInteger(item.width) && item.width > 0 &&
+    typeof item.height === "number" && Number.isInteger(item.height) && item.height > 0 &&
+    (item.frameRate === undefined || typeof item.frameRate === "string");
 }
 
 function isIssues(value: unknown): value is ChannelIssue[] {

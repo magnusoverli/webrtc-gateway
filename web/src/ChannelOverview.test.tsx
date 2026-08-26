@@ -6,7 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Channel, ChannelStreamRates } from "./channel";
 import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
 
-const overviewPlayerHarness = vi.hoisted(() => ({ calls: vi.fn(), cardRenders: vi.fn() }));
+const overviewPlayerHarness = vi.hoisted(() => ({
+  calls: vi.fn(),
+  cardRenders: vi.fn(),
+}));
 
 vi.mock("./presentation", async () => {
   const presentation = await vi.importActual<typeof import("./presentation")>("./presentation");
@@ -188,10 +191,24 @@ describe("ChannelOverview", () => {
     const item = channel("one", "Studio", "idle");
     const view = renderOverview({ channels: [item] });
     expect(screen.getByLabelText("Studio preview: Preview off").textContent).toContain("Preview off");
+    expect(screen.getByLabelText("Video format: resolution unavailable, frame rate unavailable").textContent).toBe("Resolution — · FPS —");
     expect((screen.getByLabelText("Studio muted preview") as HTMLVideoElement).controls).toBe(false);
 
     view.rerender(overview({ channels: [{ ...item, automaticPreview: true }] }));
     expect(screen.getByLabelText("Studio preview: Waiting for input").textContent).toContain("Waiting for input");
+  });
+
+  it("shows nominal input resolution and frame rate in grid cards", () => {
+    const item = { ...channel("one", "Studio", "live"), automaticPreview: true };
+    item.inputVideo = { width: 3840, height: 2160, frameRate: "60000/1001" };
+
+    renderOverview({ channels: [item] });
+
+    const format = screen.getByLabelText("Video format: 3840 by 2160, 59.94 fps");
+    expect(format.textContent).toBe("3840 × 2160 · 59.94 fps");
+    expect(format.className).toBe("overview-card-format");
+    expect(format.closest(".overview-thumb")).toBeNull();
+    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.not.objectContaining({ collectStats: true }));
   });
 
   it("labels control groups and exposes selected controls", () => {

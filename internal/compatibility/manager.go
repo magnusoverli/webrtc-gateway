@@ -52,14 +52,21 @@ type WorkerState struct {
 }
 
 type State struct {
-	State            string      `json:"state"`
-	Mode             string      `json:"mode,omitempty"`
-	Required         bool        `json:"required"`
-	Reasons          []string    `json:"reasons"`
-	LastError        string      `json:"lastError,omitempty"`
-	Worker           WorkerState `json:"worker"`
-	OutputPath       string      `json:"-"`
-	InputFingerprint string      `json:"-"`
+	State            string         `json:"state"`
+	Mode             string         `json:"mode,omitempty"`
+	Required         bool           `json:"required"`
+	Reasons          []string       `json:"reasons"`
+	LastError        string         `json:"lastError,omitempty"`
+	Worker           WorkerState    `json:"worker"`
+	OutputPath       string         `json:"-"`
+	InputFingerprint string         `json:"-"`
+	InputVideo       *VideoMetadata `json:"-"`
+}
+
+type VideoMetadata struct {
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	FrameRate string `json:"frameRate,omitempty"`
 }
 
 type ChannelReader interface {
@@ -128,9 +135,11 @@ type entry struct {
 	srt                bool
 	metadataDeadline   time.Time
 	probe              *probeTask
+	metadataProbe      *probeTask
 	outputResetPending bool
 	classified         bool
 	decision           decision
+	inputVideo         *VideoMetadata
 	state              State
 	worker             *worker
 	retryAt            time.Time
@@ -185,6 +194,7 @@ type videoCharacteristics struct {
 	pixelFormat       string
 	width             int
 	height            int
+	frameRate         string
 	hevcFieldSequence bool
 }
 
@@ -240,6 +250,10 @@ func (m *Manager) Snapshot(channelID string) State {
 	}
 	result := item.state
 	result.Reasons = append([]string(nil), result.Reasons...)
+	if item.inputVideo != nil {
+		metadata := *item.inputVideo
+		result.InputVideo = &metadata
+	}
 	return result
 }
 
@@ -375,6 +389,7 @@ func (m *Manager) Close() {
 		m.closed = true
 		for _, item := range m.entries {
 			cancelProbeLocked(item)
+			cancelMetadataProbeLocked(item)
 			stopWorkerLocked(item)
 		}
 	}
@@ -452,6 +467,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 			continue
 		}
 		cancelProbeLocked(item)
+		cancelMetadataProbeLocked(item)
 		stopWorkerLocked(item)
 		delete(m.entries, id)
 	}
@@ -497,6 +513,7 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 	current := m.entryLocked(item.ID)
 	if current.fingerprint != fingerprint || !current.srt {
 		cancelProbeLocked(current)
+		cancelMetadataProbeLocked(current)
 		stopWorkerLocked(current)
 		m.nextGeneration++
 		current.fingerprint = fingerprint
@@ -505,6 +522,7 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 		current.metadataDeadline = now.Add(metadataGrace)
 		current.classified = false
 		current.decision = decision{}
+		current.inputVideo = nil
 		current.retryAt = time.Time{}
 		current.outputResetPending = byPath[compatPath].Name != ""
 		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
@@ -575,11 +593,17 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	if normalizeCodec(expectedVideoCodec) == "h264" && !h264ProfileExcludesBFrames(expectedVideoProfile) {
 		expectedVideoCodec = ""
 	}
+	var characteristics videoCharacteristics
+	metadataOnly := normalizeCodec(expectedVideoCodec) == "vp9" && expectedVideoProfile == "0"
 	result, err := classifyTracks(task.ctx, tracks, func(ctx context.Context) (videoCharacteristics, error) {
 		if m.probeVideo != nil {
-			return m.probeVideo(ctx, probeURL)
+			var err error
+			characteristics, err = m.probeVideo(ctx, probeURL)
+			return characteristics, err
 		}
-		return m.probeVideoCharacteristics(ctx, probeURL, expectedVideoCodec, expectedVideoWidth, expectedVideoHeight)
+		var err error
+		characteristics, err = m.probeVideoCharacteristics(ctx, probeURL, expectedVideoCodec, expectedVideoWidth, expectedVideoHeight)
+		return characteristics, err
 	})
 
 	m.mu.Lock()
@@ -600,6 +624,11 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	}
 	current.classified = true
 	current.decision = result
+	if metadataOnly {
+		current.metadataProbe = task
+	} else {
+		current.inputVideo = videoMetadata(characteristics)
+	}
 	current.retryAt = time.Time{}
 	if result.required {
 		current.state = State{
@@ -607,11 +636,28 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 			Reasons: append([]string(nil), result.reasons...), OutputPath: CompatibilityPath(channelID),
 			InputFingerprint: fingerprint,
 		}
+	} else {
+		current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
+	}
+	m.mu.Unlock()
+	m.notify()
+	if metadataOnly {
+		m.runInputVideoMetadata(channelID, probeURL, fingerprint, task)
+	}
+}
+
+func (m *Manager) runInputVideoMetadata(channelID, probeURL, fingerprint string, task *probeTask) {
+	characteristics, err := m.probeVideoStreamMetadata(task.ctx, probeURL)
+	m.mu.Lock()
+	current := m.entries[channelID]
+	if current == nil || current.generation != task.generation || current.fingerprint != fingerprint || current.metadataProbe != task || task.ctx.Err() != nil {
 		m.mu.Unlock()
-		m.notify()
 		return
 	}
-	current.state = State{State: StateReady, Mode: ModeDirect, Reasons: []string{}, OutputPath: path, InputFingerprint: fingerprint}
+	current.metadataProbe = nil
+	if err == nil {
+		current.inputVideo = videoMetadata(characteristics)
+	}
 	m.mu.Unlock()
 	m.notify()
 }
@@ -859,11 +905,13 @@ func (m *Manager) setInactive(channelID, path, state string) {
 	defer m.mu.Unlock()
 	current := m.entryLocked(channelID)
 	cancelProbeLocked(current)
+	cancelMetadataProbeLocked(current)
 	stopWorkerLocked(current)
 	current.fingerprint = ""
 	current.srt = false
 	current.outputResetPending = false
 	current.classified = false
+	current.inputVideo = nil
 	current.retryAt = time.Time{}
 	current.state = State{State: state, Mode: ModeDirect, Reasons: []string{}, OutputPath: path}
 }
@@ -872,9 +920,10 @@ func (m *Manager) setDirect(channelID, path, fingerprint string, result decision
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := m.entryLocked(channelID)
-	if current.srt && !srt {
+	if !srt && (current.srt || current.fingerprint != fingerprint) {
 		m.nextGeneration++
 		current.generation = m.nextGeneration
+		current.inputVideo = nil
 	}
 	cancelProbeLocked(current)
 	stopWorkerLocked(current)
@@ -931,6 +980,15 @@ func cancelProbeLocked(current *entry) {
 	}
 	task := current.probe
 	current.probe = nil
+	task.cancel()
+}
+
+func cancelMetadataProbeLocked(current *entry) {
+	if current.metadataProbe == nil {
+		return
+	}
+	task := current.metadataProbe
+	current.metadataProbe = nil
 	task.cancel()
 }
 
@@ -1064,7 +1122,7 @@ func (m *Manager) probeH264StreamMetadata(ctx context.Context, sourceURL string)
 	cmd := exec.CommandContext(ctx, m.ffprobe,
 		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
 		"-show_streams",
-		"-show_entries", "stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order",
+		"-show_entries", "stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order,r_frame_rate,avg_frame_rate",
 		"-of", "json", sourceURL,
 	)
 	output, err := ffprobeOutput(ctx, cmd)
@@ -1078,7 +1136,7 @@ func (m *Manager) probeVideoFrames(ctx context.Context, sourceURL string) (video
 	cmd := exec.CommandContext(ctx, m.ffprobe,
 		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
 		"-read_intervals", "%+2", "-show_streams", "-show_frames",
-		"-show_entries", "stream=codec_name,pix_fmt,width,height,field_order:frame=pict_type,pix_fmt,width,height,interlaced_frame,top_field_first",
+		"-show_entries", "stream=codec_name,pix_fmt,width,height,field_order,r_frame_rate,avg_frame_rate:frame=pict_type,pix_fmt,width,height,interlaced_frame,top_field_first",
 		"-of", "json", sourceURL,
 	)
 	output, err := ffprobeOutput(ctx, cmd)
@@ -1086,6 +1144,21 @@ func (m *Manager) probeVideoFrames(ctx context.Context, sourceURL string) (video
 		return videoCharacteristics{}, err
 	}
 	return parseVideoCharacteristics(output)
+}
+
+func (m *Manager) probeVideoStreamMetadata(ctx context.Context, sourceURL string) (videoCharacteristics, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, videoInspectionLimit)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, m.ffprobe,
+		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+		"-show_entries", "stream=codec_name,width,height,r_frame_rate,avg_frame_rate",
+		"-of", "json", sourceURL,
+	)
+	output, err := ffprobeOutput(probeCtx, cmd)
+	if err != nil {
+		return videoCharacteristics{}, err
+	}
+	return parseVideoStreamMetadata(output)
 }
 
 func ffprobeOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
@@ -1159,6 +1232,8 @@ func parseH264StreamMetadata(data []byte) (videoCharacteristics, error) {
 			Width       int            `json:"width"`
 			Height      int            `json:"height"`
 			FieldOrder  string         `json:"field_order"`
+			FrameRate   string         `json:"r_frame_rate"`
+			AverageRate string         `json:"avg_frame_rate"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(data, &output); err != nil {
@@ -1191,7 +1266,33 @@ func parseH264StreamMetadata(data []byte) (videoCharacteristics, error) {
 	}
 	return videoCharacteristics{
 		codec: stream.CodecName, pixelFormat: stream.PixelFormat,
-		width: stream.Width, height: stream.Height,
+		width: stream.Width, height: stream.Height, frameRate: selectFrameRate(stream.AverageRate, stream.FrameRate),
+	}, nil
+}
+
+func parseVideoStreamMetadata(data []byte) (videoCharacteristics, error) {
+	var output struct {
+		Streams []struct {
+			CodecName   string `json:"codec_name"`
+			Width       int    `json:"width"`
+			Height      int    `json:"height"`
+			FrameRate   string `json:"r_frame_rate"`
+			AverageRate string `json:"avg_frame_rate"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &output); err != nil {
+		return videoCharacteristics{}, fmt.Errorf("decode ffprobe stream metadata JSON: %w", err)
+	}
+	if len(output.Streams) != 1 {
+		return videoCharacteristics{}, fmt.Errorf("ffprobe returned %d video streams", len(output.Streams))
+	}
+	stream := output.Streams[0]
+	if strings.TrimSpace(stream.CodecName) == "" || stream.Width <= 0 || stream.Height <= 0 {
+		return videoCharacteristics{}, errors.New("ffprobe did not return complete video stream metadata")
+	}
+	return videoCharacteristics{
+		codec: stream.CodecName, width: stream.Width, height: stream.Height,
+		frameRate: selectFrameRate(stream.AverageRate, stream.FrameRate),
 	}, nil
 }
 
@@ -1203,6 +1304,8 @@ func parseVideoCharacteristics(data []byte) (videoCharacteristics, error) {
 			Width       int    `json:"width"`
 			Height      int    `json:"height"`
 			FieldOrder  string `json:"field_order"`
+			FrameRate   string `json:"r_frame_rate"`
+			AverageRate string `json:"avg_frame_rate"`
 		} `json:"streams"`
 		Frames []struct {
 			PictureType     string      `json:"pict_type"`
@@ -1226,7 +1329,7 @@ func parseVideoCharacteristics(data []byte) (videoCharacteristics, error) {
 	stream := output.Streams[0]
 	result := videoCharacteristics{
 		codec: stream.CodecName, pixelFormat: stream.PixelFormat,
-		width: stream.Width, height: stream.Height,
+		width: stream.Width, height: stream.Height, frameRate: selectFrameRate(stream.AverageRate, stream.FrameRate),
 	}
 	sawInterlaceFlag := false
 	sawFrameDimensions := false
@@ -1289,6 +1392,33 @@ func parseVideoCharacteristics(data []byte) (videoCharacteristics, error) {
 		return videoCharacteristics{}, errors.New("ffprobe did not return valid video dimensions")
 	}
 	return result, nil
+}
+
+func selectFrameRate(average, nominal string) string {
+	if validFrameRate(average) {
+		return average
+	}
+	if validFrameRate(nominal) {
+		return nominal
+	}
+	return ""
+}
+
+func validFrameRate(value string) bool {
+	numerator, denominator, ok := strings.Cut(strings.TrimSpace(value), "/")
+	if !ok {
+		return false
+	}
+	n, nErr := strconv.ParseInt(numerator, 10, 64)
+	d, dErr := strconv.ParseInt(denominator, 10, 64)
+	return nErr == nil && dErr == nil && n > 0 && d > 0
+}
+
+func videoMetadata(characteristics videoCharacteristics) *VideoMetadata {
+	if characteristics.width <= 0 || characteristics.height <= 0 {
+		return nil
+	}
+	return &VideoMetadata{Width: characteristics.width, Height: characteristics.height, FrameRate: characteristics.frameRate}
 }
 
 func fieldOrderDescription(characteristics videoCharacteristics) string {
