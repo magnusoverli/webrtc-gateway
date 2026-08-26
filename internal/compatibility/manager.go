@@ -120,19 +120,19 @@ type inputDiscovery struct {
 }
 
 type entry struct {
-	fingerprint             string
-	generation              uint64
-	srt                     bool
-	metadataDeadline        time.Time
-	probe                   *probeTask
-	outputResetPending      bool
-	classified              bool
-	decision                decision
-	state                   State
-	worker                  *worker
-	retryAt                 time.Time
-	compatLimit             int
-	compatAbsoluteTimestamp bool
+	fingerprint        string
+	generation         uint64
+	srt                bool
+	metadataDeadline   time.Time
+	probe              *probeTask
+	outputResetPending bool
+	classified         bool
+	decision           decision
+	state              State
+	worker             *worker
+	retryAt            time.Time
+	compatLimit        int
+	compatConfigured   bool
 }
 
 type probeTask struct {
@@ -604,7 +604,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	compatPath := CompatibilityPath(item.ID)
 	m.mu.RLock()
 	current := m.entries[item.ID]
-	refreshPath := current == nil || current.compatLimit != item.MaxReaders || current.compatAbsoluteTimestamp != item.UseAbsoluteTimestamp
+	refreshPath := current == nil || !current.compatConfigured || current.compatLimit != item.MaxReaders
 	retryAt := time.Time{}
 	generation := uint64(0)
 	if current != nil {
@@ -617,7 +617,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 	}
 	if output.Name == "" || refreshPath {
 		if err := m.media.ReplacePath(ctx, compatPath, mediamtx.PathConfig{
-			Source: "publisher", MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
+			Source: "publisher", MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: false,
 		}); err != nil {
 			m.setWorkerError(item.ID, generation, compatPath, result, fmt.Errorf("create compatibility path: %w", err))
 			return
@@ -625,7 +625,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 		m.mu.Lock()
 		if current := m.entries[item.ID]; current != nil && current.generation == generation && !m.closed {
 			current.compatLimit = item.MaxReaders
-			current.compatAbsoluteTimestamp = item.UseAbsoluteTimestamp
+			current.compatConfigured = true
 			current.retryAt = time.Time{}
 		}
 		m.mu.Unlock()

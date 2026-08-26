@@ -360,7 +360,7 @@ func TestEnsureTranscodedQueuesWhenCapacityIsBusy(t *testing.T) {
 		entries: map[string]*entry{
 			"running": {worker: &worker{units: 2}},
 			"queued": {
-				fingerprint: "source", classified: true, decision: result,
+				fingerprint: "source", classified: true, decision: result, compatConfigured: true,
 				state: State{State: StateStarting, Worker: WorkerState{}},
 			},
 		},
@@ -779,13 +779,48 @@ func TestPathRetryHonorsDeadlineAndPreservesWorkerError(t *testing.T) {
 	}
 }
 
+func TestCompatibilityPathReanchorsConvertedTimestamps(t *testing.T) {
+	media := &pathRetryMedia{}
+	result := decision{required: true, transcodeVideo: true, workerUnits: 1}
+	manager := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), media: media, workerCapacity: 1,
+		entries: map[string]*entry{
+			"channel": {
+				fingerprint: "source", classified: true, decision: result,
+				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
+			},
+			"blocker": {worker: &worker{units: 1}},
+		},
+	}
+	configured := channel.Channel{ID: "channel", MaxReaders: 0, UseAbsoluteTimestamp: true}
+	output := mediamtx.Channel{Name: CompatibilityPath(configured.ID)}
+
+	manager.ensureTranscoded(context.Background(), configured, result, output)
+	configs := media.Configs()
+	if len(configs) != 1 || configs[0].UseAbsoluteTimestamp || configs[0].MaxReaders != 0 {
+		t.Fatalf("initial compatibility configs = %#v", configs)
+	}
+	manager.ensureTranscoded(context.Background(), configured, result, output)
+	configured.UseAbsoluteTimestamp = false
+	manager.ensureTranscoded(context.Background(), configured, result, output)
+	if configs = media.Configs(); len(configs) != 1 {
+		t.Fatalf("timestamp toggle refreshed compatibility path: %#v", configs)
+	}
+	configured.MaxReaders = 5
+	manager.ensureTranscoded(context.Background(), configured, result, output)
+	configs = media.Configs()
+	if len(configs) != 2 || configs[1].UseAbsoluteTimestamp || configs[1].MaxReaders != 5 {
+		t.Fatalf("reader-limit compatibility configs = %#v", configs)
+	}
+}
+
 func TestStaleOutputDoesNotBecomeReadyWithoutCurrentWorker(t *testing.T) {
 	result := decision{required: true, transcodeVideo: true, workerUnits: 1, reasons: []string{"conversion required"}}
 	manager := &Manager{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), workerCapacity: 1,
 		entries: map[string]*entry{
 			"channel": {
-				fingerprint: "new-source", srt: true, classified: true, decision: result,
+				fingerprint: "new-source", srt: true, classified: true, decision: result, compatConfigured: true,
 				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
 			},
 			"blocker": {worker: &worker{units: 1}},
@@ -1156,7 +1191,7 @@ func TestCloseWaitsForSpawnOutsideManagerLock(t *testing.T) {
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), rtspURL: rtspURL, ffmpeg: "/bin/true",
 		workerCapacity: 1, entries: map[string]*entry{
 			"channel": {
-				fingerprint: "source", generation: 7, classified: true, decision: result,
+				fingerprint: "source", generation: 7, classified: true, decision: result, compatConfigured: true,
 				state: State{State: StateStarting, Mode: ModeTranscoded, Required: true},
 			},
 		},
@@ -1483,9 +1518,10 @@ func TestWorkerStartupTimeoutStopsWorkerAndSchedulesRetry(t *testing.T) {
 		entries: map[string]*entry{},
 	}
 	manager.entries["channel-id"] = &entry{
-		fingerprint: "source-id",
-		classified:  true,
-		decision:    result,
+		fingerprint:      "source-id",
+		classified:       true,
+		decision:         result,
+		compatConfigured: true,
 		state: State{
 			Worker: WorkerState{Running: true, Restarts: 2},
 		},
@@ -1613,6 +1649,7 @@ type pathRetryMedia struct {
 	mu            sync.Mutex
 	replaceErrors []error
 	replaceCount  int
+	configs       []mediamtx.PathConfig
 }
 
 func (m *pathRetryMedia) Status(context.Context) (mediamtx.Status, error) {
@@ -1623,10 +1660,11 @@ func (m *pathRetryMedia) StatusFresh(ctx context.Context) (mediamtx.Status, erro
 	return m.Status(ctx)
 }
 
-func (m *pathRetryMedia) ReplacePath(context.Context, string, mediamtx.PathConfig) error {
+func (m *pathRetryMedia) ReplacePath(_ context.Context, _ string, config mediamtx.PathConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.replaceCount++
+	m.configs = append(m.configs, config)
 	if len(m.replaceErrors) == 0 {
 		return nil
 	}
@@ -1643,6 +1681,12 @@ func (m *pathRetryMedia) ReplaceCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.replaceCount
+}
+
+func (m *pathRetryMedia) Configs() []mediamtx.PathConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]mediamtx.PathConfig(nil), m.configs...)
 }
 
 func newProbeTestManager(t *testing.T, clock *testClock, probe func(context.Context, string) (videoCharacteristics, error)) *Manager {
