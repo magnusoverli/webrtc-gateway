@@ -32,6 +32,7 @@ const (
 	bridgeWriteBufferSize      = 1 * 1024 * 1024
 	internalPublisherLatency   = 60 * time.Millisecond
 	rtpMP2TPayloadType         = 33
+	matroskaHeader             = "\x1a\x45\xdf\xa3"
 )
 
 const (
@@ -49,10 +50,22 @@ type Status struct {
 	NextRetryAt     *time.Time `json:"nextRetryAt,omitempty"`
 	ListenerAddress string     `json:"listenerAddress,omitempty"`
 	ListenerActive  bool       `json:"listenerActive"`
+	Issue           *Issue     `json:"-"`
+}
+
+type Issue struct {
+	Code        string
+	Source      string
+	Summary     string
+	Message     string
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+	Occurrences int
+	attempt     uint64
 }
 
 type InputObserver interface {
-	SRTInputStarted(channelID string)
+	SRTInputStarted(channelID string, attempt uint64)
 }
 
 type listenerProcess struct {
@@ -66,7 +79,32 @@ type listenerProcess struct {
 func (p *listenerProcess) setStatus(state string, restarts int, lastError string, nextRetryAt *time.Time) {
 	p.statusMu.Lock()
 	defer p.statusMu.Unlock()
+	issue := p.status.Issue
 	p.status = p.statusFor(state, restarts, lastError, nextRetryAt)
+	p.status.Issue = issue
+}
+
+func (p *listenerProcess) setIssue(issue *reportedIssue, attempt uint64) {
+	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
+	if issue == nil {
+		p.status.Issue = nil
+		return
+	}
+	now := time.Now().UTC()
+	if current := p.status.Issue; current != nil && current.Code == issue.code {
+		current.Source = issue.source
+		current.Summary = issue.summary
+		current.Message = issue.message
+		current.LastSeenAt = now
+		current.Occurrences++
+		current.attempt = attempt
+		return
+	}
+	p.status.Issue = &Issue{
+		Code: issue.code, Source: issue.source, Summary: issue.summary, Message: issue.message,
+		FirstSeenAt: now, LastSeenAt: now, Occurrences: 1, attempt: attempt,
+	}
 }
 
 func (p *listenerProcess) statusFor(state string, restarts int, lastError string, nextRetryAt *time.Time) Status {
@@ -85,6 +123,10 @@ func (p *listenerProcess) snapshot() Status {
 	if p.status.NextRetryAt != nil {
 		next := *p.status.NextRetryAt
 		result.NextRetryAt = &next
+	}
+	if p.status.Issue != nil {
+		issue := *p.status.Issue
+		result.Issue = &issue
 	}
 	return result
 }
@@ -141,7 +183,25 @@ const (
 	payloadUnknown payloadMode = iota
 	payloadMPEGTS
 	payloadRTPMP2T
+	payloadMatroska
 )
+
+type reportedIssue struct {
+	code    string
+	source  string
+	summary string
+	message string
+}
+
+func (e *reportedIssue) Error() string { return e.message }
+
+func rejectInput(code, message string) error {
+	return &reportedIssue{code: code, source: "ingest", summary: "Input rejected", message: message}
+}
+
+func bridgeFailed(message string) error {
+	return &reportedIssue{code: "srt.media_bridge_failed", source: "gateway", summary: "Media bridge failed", message: message}
+}
 
 type rtpPacket struct {
 	payloadType uint8
@@ -155,19 +215,21 @@ type Supervisor struct {
 	logger     *slog.Logger
 	executable string
 	ffmpeg     string
+	rtmpURL    *url.URL
 
 	mu               sync.Mutex
 	listeners        map[string]*listenerProcess
 	prepared         map[string]channel.SRTIngestPlan
 	operations       map[string]*channelOperation
 	activeOperations int
+	nextAttempt      uint64
 	operationsDone   *sync.Cond
 	snapshots        sync.Map
 	inputObserver    InputObserver
 	closed           bool
 	closeDone        chan struct{}
 	startFn          func(context.Context, string) (inputSession, error)
-	relayFn          func(context.Context, channel.SRTIngestPlan, inputSession) (string, error)
+	relayFn          func(context.Context, channel.SRTIngestPlan, inputSession, uint64) (string, error)
 }
 
 type channelOperation struct {
@@ -175,12 +237,29 @@ type channelOperation struct {
 	refs int
 }
 
-func New(logger *slog.Logger, executable, ffmpeg string) *Supervisor {
+func New(logger *slog.Logger, executable, ffmpeg, mediaRTMPURL string) (*Supervisor, error) {
 	if ffmpeg == "" {
 		ffmpeg = "ffmpeg"
 	}
+	rtmpURL, err := url.Parse(mediaRTMPURL)
+	if err != nil || (rtmpURL.Scheme != "rtmp" && rtmpURL.Scheme != "rtmps") || rtmpURL.Host == "" {
+		return nil, errors.New("MediaMTX RTMP URL must be an absolute RTMP URL")
+	}
+	if rtmpURL.User != nil || rtmpURL.RawQuery != "" || rtmpURL.Fragment != "" {
+		return nil, errors.New("MediaMTX RTMP URL must not contain credentials, query parameters, or a fragment")
+	}
+	if rtmpURL.EscapedPath() != "" && rtmpURL.EscapedPath() != "/" {
+		return nil, errors.New("MediaMTX RTMP URL must not contain a base path")
+	}
+	host := rtmpURL.Hostname()
+	if host != "localhost" {
+		address := net.ParseIP(host)
+		if address == nil || !address.IsLoopback() {
+			return nil, errors.New("MediaMTX RTMP URL must use a loopback host")
+		}
+	}
 	supervisor := &Supervisor{
-		logger: logger, executable: executable, ffmpeg: ffmpeg,
+		logger: logger, executable: executable, ffmpeg: ffmpeg, rtmpURL: rtmpURL,
 		listeners:  make(map[string]*listenerProcess),
 		prepared:   make(map[string]channel.SRTIngestPlan),
 		operations: make(map[string]*channelOperation),
@@ -189,7 +268,7 @@ func New(logger *slog.Logger, executable, ffmpeg string) *Supervisor {
 	supervisor.operationsDone = sync.NewCond(&supervisor.mu)
 	supervisor.startFn = supervisor.startInput
 	supervisor.relayFn = supervisor.relayConnection
-	return supervisor
+	return supervisor, nil
 }
 
 func (s *Supervisor) SetInputObserver(observer InputObserver) {
@@ -200,14 +279,35 @@ func (s *Supervisor) SetInputObserver(observer InputObserver) {
 	}
 }
 
-func (s *Supervisor) notifyInputStarted(channelID string) {
+func (s *Supervisor) notifyInputStarted(channelID string, attempt uint64) {
 	s.mu.Lock()
 	observer := s.inputObserver
 	closed := s.closed
 	s.mu.Unlock()
 	if !closed && observer != nil {
-		observer.SRTInputStarted(channelID)
+		observer.SRTInputStarted(channelID, attempt)
 	}
+}
+
+func (s *Supervisor) ClearIssue(channelID string, acceptedAttempt uint64) {
+	s.mu.Lock()
+	process := s.listeners[channelID]
+	s.mu.Unlock()
+	if process == nil {
+		return
+	}
+	process.statusMu.Lock()
+	defer process.statusMu.Unlock()
+	if process.status.Issue != nil && process.status.Issue.attempt < acceptedAttempt {
+		process.status.Issue = nil
+	}
+}
+
+func (s *Supervisor) newAttempt() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextAttempt++
+	return s.nextAttempt
 }
 
 func (s *Supervisor) reserve(channelID string) (*channelOperation, bool) {
@@ -499,7 +599,8 @@ func (s *Supervisor) monitor(ctx context.Context, process *listenerProcess, inpu
 	failures := 0
 	sessionStarted := time.Now()
 	for {
-		detected, err := s.relayFn(ctx, process.plan, session)
+		attempt := s.newAttempt()
+		detected, err := s.relayFn(ctx, process.plan, session, attempt)
 		if ctx.Err() != nil {
 			return
 		}
@@ -508,6 +609,10 @@ func (s *Supervisor) monitor(ctx context.Context, process *listenerProcess, inpu
 			attributes = append(attributes, "payload", detected)
 		}
 		if err != nil {
+			var issue *reportedIssue
+			if errors.As(err, &issue) {
+				process.setIssue(issue, attempt)
+			}
 			attributes = append(attributes, "error", err)
 			s.logger.Warn("SRT channel connection ended", attributes...)
 			if time.Since(sessionStarted) >= 5*time.Second {
@@ -586,7 +691,7 @@ func (s *Supervisor) startInput(ctx context.Context, inputEndpoint string) (inpu
 	return inputSession{cmd: cmd, packets: packets, wait: wait}, nil
 }
 
-func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngestPlan, input inputSession) (string, error) {
+func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngestPlan, input inputSession, attempt uint64) (string, error) {
 	reader := newPacketReader(ctx, input.packets)
 	defer reader.close()
 
@@ -627,11 +732,11 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 			parsed, err := parseRTP(packet)
 			if err != nil {
 				terminateInput(input)
-				return "elementary-rtp", fmt.Errorf("invalid elementary RTP packet: %w", err)
+				return "elementary-rtp", rejectInput("srt.invalid_elementary_rtp", fmt.Sprintf("invalid elementary RTP packet: %v", err))
 			}
 			if !allowed[parsed.payloadType] {
 				terminateInput(input)
-				return "elementary-rtp", fmt.Errorf("RTP payload type %d is not declared by the channel SDP", parsed.payloadType)
+				return "elementary-rtp", rejectInput("srt.undeclared_rtp_payload", fmt.Sprintf("RTP payload type %d is not declared by the channel SDP", parsed.payloadType))
 			}
 			if _, err := output.WriteToUDP(packet, destination); err != nil {
 				terminateInput(input)
@@ -639,7 +744,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 			}
 			if !notified {
 				notified = true
-				s.notifyInputStarted(plan.Listener.ChannelID)
+				s.notifyInputStarted(plan.Listener.ChannelID, attempt)
 			}
 		}
 	}
@@ -650,7 +755,15 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		return "unknown", err
 	}
 	stderr := newBoundedWriter(8192)
-	output := exec.CommandContext(ctx, s.ffmpeg, remuxArgs(plan.OutputAddress, plan.PublishPassphrase)...)
+	remuxName := "MPEG-TS"
+	redactionPassphrase := plan.PublishPassphrase
+	args := remuxArgs(plan.OutputAddress, plan.PublishPassphrase)
+	if mode == payloadMatroska {
+		remuxName = "Matroska"
+		redactionPassphrase = plan.Listener.Passphrase
+		args = matroskaRemuxArgs(s.mediaPathURL(plan.Listener.Path))
+	}
+	output := exec.CommandContext(ctx, s.ffmpeg, args...)
 	output.Stdout = io.Discard
 	output.Stderr = stderr
 	output.Cancel = func() error {
@@ -663,11 +776,11 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 	sink, err := output.StdinPipe()
 	if err != nil {
 		terminateInput(input)
-		return mode.String(), fmt.Errorf("open MPEG-TS remux input: %w", err)
+		return mode.String(), fmt.Errorf("open %s remux input: %w", remuxName, err)
 	}
 	if err := output.Start(); err != nil {
 		terminateInput(input)
-		return mode.String(), fmt.Errorf("start MPEG-TS remux: %w", err)
+		return mode.String(), fmt.Errorf("start %s remux: %w", remuxName, err)
 	}
 	outputWait := make(chan error, 1)
 	go func() { outputWait <- output.Wait() }()
@@ -676,7 +789,7 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		firstErr := writeFull(sink, initial)
 		var streamErr error
 		if firstErr == nil {
-			s.notifyInputStarted(plan.Listener.ChannelID)
+			s.notifyInputStarted(plan.Listener.ChannelID, attempt)
 			streamErr = streamNormalized(reader, sink, mode)
 		}
 		closeErr := sink.Close()
@@ -689,15 +802,33 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		copyErr := <-copyDone
 		return mode.String(), errors.Join(inputErr, copyErr)
 	case copyErr := <-copyDone:
-		_ = input.cmd.Process.Kill()
-		inputErr := <-input.wait
+		inputErr, inputEnded := inputEndWithin(input, startupGrace)
+		if !inputEnded {
+			_ = input.cmd.Process.Kill()
+			inputErr = <-input.wait
+		}
 		_ = terminate(output, outputWait)
-		return mode.String(), errors.Join(copyErr, inputErr, remuxDetailError(stderr.String(), plan.PublishPassphrase))
+		detailErr := remuxDetailError(remuxName, stderr.String(), redactionPassphrase)
+		if inputEnded {
+			return mode.String(), errors.Join(inputErr, copyErr, detailErr)
+		}
+		var inputIssue *reportedIssue
+		if errors.As(copyErr, &inputIssue) {
+			return mode.String(), errors.Join(copyErr, inputErr, detailErr)
+		}
+		return mode.String(), errors.Join(bridgeFailed(errorMessage(detailErr, copyErr)), inputErr, detailErr)
 	case outputErr := <-outputWait:
-		_ = input.cmd.Process.Kill()
-		inputErr := <-input.wait
+		inputErr, inputEnded := inputEndWithin(input, startupGrace)
+		if !inputEnded {
+			_ = input.cmd.Process.Kill()
+			inputErr = <-input.wait
+		}
 		copyErr := <-copyDone
-		return mode.String(), errors.Join(remuxError(outputErr, stderr.String(), plan.PublishPassphrase), inputErr, copyErr)
+		remuxErr := remuxError(remuxName, outputErr, stderr.String(), redactionPassphrase)
+		if inputEnded {
+			return mode.String(), errors.Join(remuxErr, inputErr, copyErr)
+		}
+		return mode.String(), errors.Join(bridgeFailed(remuxErr.Error()), remuxErr, inputErr, copyErr)
 	case <-ctx.Done():
 		_ = input.cmd.Process.Kill()
 		_ = output.Process.Kill()
@@ -705,6 +836,17 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		<-outputWait
 		<-copyDone
 		return mode.String(), ctx.Err()
+	}
+}
+
+func inputEndWithin(input inputSession, grace time.Duration) (error, bool) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-input.wait:
+		return err, true
+	case <-timer.C:
+		return nil, false
 	}
 }
 
@@ -752,6 +894,9 @@ func classifyPayload(reader *packetReader) (payloadMode, []byte, error) {
 		}
 		if rawPossible {
 			rawInitial = append(rawInitial, packet...)
+			if len(rawInitial) >= len(matroskaHeader) && string(rawInitial[:len(matroskaHeader)]) == matroskaHeader {
+				return payloadMatroska, rawInitial, nil
+			}
 			eligibleOffsets := min(188, len(rawInitial)-2*188)
 			for nextTSSyncOffset < eligibleOffsets {
 				offset := nextTSSyncOffset
@@ -766,10 +911,10 @@ func classifyPayload(reader *packetReader) (payloadMode, []byte, error) {
 			}
 		}
 		if messageCount >= 3 && allRTP {
-			return payloadUnknown, nil, fmt.Errorf("elementary RTP payload type %d requires an SDP in the channel SRT settings", firstPayloadType)
+			return payloadUnknown, nil, rejectInput("srt.elementary_rtp_requires_sdp", fmt.Sprintf("elementary RTP payload type %d requires an SDP in the channel SRT settings", firstPayloadType))
 		}
 	}
-	return payloadUnknown, nil, fmt.Errorf("SRT payload is neither MPEG-TS nor RTP/MP2T payload type 33 after %d bytes", classificationLimit)
+	return payloadUnknown, nil, rejectInput("srt.unsupported_payload", fmt.Sprintf("SRT payload is neither MPEG-TS, Matroska nor RTP/MP2T payload type 33 after %d bytes", classificationLimit))
 }
 
 func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) error {
@@ -783,10 +928,10 @@ func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) er
 		if mode == payloadRTPMP2T {
 			packet, err := parseRTP(message)
 			if err != nil {
-				return fmt.Errorf("invalid RTP/MP2T packet: %w", err)
+				return rejectInput("srt.invalid_rtp_mp2t", fmt.Sprintf("invalid RTP/MP2T packet: %v", err))
 			}
 			if packet.payloadType != rtpMP2TPayloadType || !validTSPayload(packet.payload) {
-				return fmt.Errorf("RTP/MP2T stream changed to unsupported payload type %d", packet.payloadType)
+				return rejectInput("srt.invalid_rtp_mp2t", fmt.Sprintf("RTP/MP2T stream changed to unsupported payload type %d", packet.payloadType))
 			}
 			payload = packet.payload
 		}
@@ -810,6 +955,26 @@ func remuxArgs(outputAddress, passphrase string) []string {
 	return append(args, outputAddress)
 }
 
+func matroskaRemuxArgs(outputAddress string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "warning", "-nostdin",
+		"-fflags", "nobuffer", "-max_delay", "0", "-copyts",
+		"-f", "matroska", "-probesize", "65536", "-analyzeduration", "100000", "-i", "pipe:0",
+		"-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-strict", "unofficial",
+		"-max_interleave_delta", "100000", "-flush_packets", "1", "-flvflags", "no_duration_filesize",
+		"-f", "flv", outputAddress,
+	}
+}
+
+func (s *Supervisor) mediaPathURL(mediaPath string) string {
+	result := *s.rtmpURL
+	basePath := strings.TrimSuffix(result.Path, "/")
+	escapedBasePath := strings.TrimSuffix(result.EscapedPath(), "/")
+	result.Path = basePath + "/" + mediaPath
+	result.RawPath = escapedBasePath + "/" + url.PathEscape(mediaPath)
+	return result.String()
+}
+
 func writeFull(output io.Writer, value []byte) error {
 	for len(value) > 0 {
 		written, err := output.Write(value)
@@ -826,28 +991,37 @@ func writeFull(output io.Writer, value []byte) error {
 	return nil
 }
 
-func remuxError(processErr error, stderr, passphrase string) error {
-	if detailErr := remuxDetailError(stderr, passphrase); detailErr != nil {
+func remuxError(name string, processErr error, stderr, passphrase string) error {
+	if detailErr := remuxDetailError(name, stderr, passphrase); detailErr != nil {
 		return detailErr
 	}
 	if processErr != nil {
-		return fmt.Errorf("MPEG-TS remux exited: %w", processErr)
+		return fmt.Errorf("%s remux exited: %w", name, processErr)
 	}
-	return errors.New("MPEG-TS remux exited")
+	return fmt.Errorf("%s remux exited", name)
 }
 
-func remuxDetailError(stderr, passphrase string) error {
+func remuxDetailError(name, stderr, passphrase string) error {
 	detail := strings.TrimSpace(stderr)
 	if passphrase != "" {
 		if detail == "" {
 			return nil
 		}
-		return errors.New("MPEG-TS remux exited; FFmpeg detail withheld for encrypted relay")
+		return fmt.Errorf("%s remux exited; FFmpeg detail withheld for encrypted relay", name)
 	}
 	if detail == "" {
 		return nil
 	}
-	return fmt.Errorf("MPEG-TS remux exited: %s", detail)
+	return fmt.Errorf("%s remux exited: %s", name, detail)
+}
+
+func errorMessage(values ...error) string {
+	for _, value := range values {
+		if value != nil {
+			return value.Error()
+		}
+	}
+	return "media input processing stopped"
 }
 
 func parseRTP(value []byte) (rtpPacket, error) {
@@ -1104,6 +1278,8 @@ func (mode payloadMode) String() string {
 		return "mpegts"
 	case payloadRTPMP2T:
 		return "rtp-mp2t"
+	case payloadMatroska:
+		return "matroska"
 	default:
 		return "unknown"
 	}

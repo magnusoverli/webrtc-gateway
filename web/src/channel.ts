@@ -7,6 +7,17 @@ export type Track = {
   codecProps?: Record<string, string | number | boolean | null>;
 };
 
+export type ChannelIssue = {
+  code: string;
+  source: string;
+  severity: "warning" | "error";
+  summary: string;
+  message: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  occurrences: number;
+};
+
 export type TrackKind = "video" | "audio" | "unknown";
 
 export type ChannelTone = "live" | "starting" | "fault" | "idle";
@@ -78,6 +89,7 @@ export type Channel = {
   tracks: Track[];
   outputReady: boolean;
   outputTracks: Track[];
+  issues: ChannelIssue[];
   relay?: {
     state: "running" | "starting" | "retrying" | "stopping" | "stopped";
     restarts: number;
@@ -119,6 +131,7 @@ export type ChannelRuntime = Pick<
   | "outputTracks"
   | "compatibility"
   | "relay"
+  | "issues"
 >;
 
 export type BrowserLocation = {
@@ -188,6 +201,7 @@ export function channelStateLabel(item: Channel) {
   if (!item.enabled) return "Disabled";
   if (item.applyState === "error") return "Configuration error";
   if (item.applyState === "pending") return "Applying configuration";
+  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.summary ?? "Channel error";
   if (item.compatibility.state === "error") return "Output error";
   if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
   if (item.relay?.state === "starting") return "Listener restarting";
@@ -208,8 +222,13 @@ export function channelStateLabel(item: Channel) {
 
 export function channelHasFault(item: Channel) {
   return item.applyState === "error" || item.compatibility.state === "error" ||
+    item.issues.some((issue) => issue.severity === "error") ||
     item.enabled && item.applyState !== "deleting" &&
     (item.relay?.state === "retrying" || item.relay?.state === "stopped");
+}
+
+export function primaryChannelIssue(item: Pick<Channel, "issues">) {
+  return item.issues.find((issue) => issue.severity === "error") ?? item.issues[0];
 }
 
 export function channelTone(item: Channel): ChannelTone {
@@ -243,7 +262,7 @@ export function readChannelSnapshot(value: unknown): Channel | null {
     typeof item.createdAt !== "string" || typeof item.updatedAt !== "string" ||
     typeof item.whepPath !== "string" || typeof item.viewerPath !== "string" || typeof item.embedPath !== "string" ||
     typeof item.outputReady !== "boolean" || typeof item.applyState !== "string" ||
-    !item.input || typeof item.input.mode !== "string" || !isCompatibility(item.compatibility) ||
+    !item.input || typeof item.input.mode !== "string" || !isCompatibility(item.compatibility) || !isIssues(item.issues) ||
     !Array.isArray(item.readers) || !Array.isArray(item.tracks) || !Array.isArray(item.outputTracks)) return null;
   const sourceID = item.source && typeof item.source.id === "string" ? item.source.id : "";
   return {
@@ -275,7 +294,7 @@ export function readChannelRuntime(value: unknown): ChannelRuntime | null {
     typeof item.outboundBytes !== "number" || typeof item.inboundFramesInError !== "number" ||
     typeof item.readerCount !== "number" || !Number.isInteger(item.readerCount) || item.readerCount < 0 ||
     !Array.isArray(item.tracks) || typeof item.outputReady !== "boolean" || !Array.isArray(item.outputTracks) ||
-    !isCompatibility(item.compatibility)) return null;
+    !isCompatibility(item.compatibility) || !isIssues(item.issues)) return null;
   if (item.applyError !== undefined && typeof item.applyError !== "string") return null;
   if (item.availableTime !== undefined && typeof item.availableTime !== "string") return null;
   if (item.onlineTime !== undefined && typeof item.onlineTime !== "string") return null;
@@ -317,6 +336,7 @@ export function mergeChannelRuntime(channel: Channel, runtime: ChannelRuntime): 
     outputTracks: runtime.outputTracks,
     compatibility: runtime.compatibility,
     relay: runtime.relay,
+    issues: runtime.issues,
   };
 }
 
@@ -377,6 +397,19 @@ function isCompatibility(value: unknown): value is Channel["compatibility"] {
   const item = value as Partial<Channel["compatibility"]>;
   return typeof item.state === "string" && Array.isArray(item.reasons) &&
     Boolean(item.worker && typeof item.worker.running === "boolean" && typeof item.worker.restarts === "number");
+}
+
+function isIssues(value: unknown): value is ChannelIssue[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const issue = candidate as Partial<ChannelIssue>;
+    return typeof issue.code === "string" && typeof issue.source === "string" &&
+      (issue.severity === "warning" || issue.severity === "error") &&
+      typeof issue.summary === "string" && typeof issue.message === "string" &&
+      typeof issue.firstSeenAt === "string" && typeof issue.lastSeenAt === "string" &&
+      typeof issue.occurrences === "number" && Number.isInteger(issue.occurrences) && issue.occurrences > 0;
+  });
 }
 
 export function trackKind(track: Track): TrackKind {

@@ -48,6 +48,7 @@ function channelWithMode(mode: InputMode): Channel {
     tracks: [],
     outputReady: false,
     outputTracks: [],
+    issues: [],
     ...(mode === "srt-push" ? { relay: { state: "running" as const, restarts: 0, listenerAddress: "192.0.2.10:10000", listenerActive: true } } : {}),
     compatibility: { state: "offline", required: false, reasons: [], worker: { running: false, restarts: 0 } },
   };
@@ -118,6 +119,7 @@ function runtimeChannel(channel: Channel, overrides: Partial<ChannelRuntime> = {
     outputTracks: channel.outputTracks,
     compatibility: channel.compatibility,
     relay: channel.relay,
+    issues: channel.issues,
     ...overrides,
   };
 }
@@ -183,6 +185,21 @@ describe("dashboard navigation", () => {
     expect(fireEvent.keyDown(window, { key: "ArrowRight" })).toBe(true);
     expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
     expect(window.location.search).toBe(`?channel=${item.id}`);
+  });
+
+  it("shows retained input rejection details in the channel workspace", async () => {
+    const item = channelWithMode("srt-push");
+    item.issues = [{
+      code: "srt.unsupported_payload", source: "ingest", severity: "error", summary: "Input rejected",
+      message: "Matroska header is invalid", firstSeenAt: "2026-08-26T10:46:42Z",
+      lastSeenAt: "2026-08-26T10:46:42Z", occurrences: 1,
+    }];
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(statusWith([item]))));
+    render(<App />);
+
+    expect(await screen.findByText("Matroska header is invalid")).toBeDefined();
+    expect(screen.getByText("Input rejected", { selector: ".state-pill" })).toBeDefined();
   });
 
   it("uses compact runtime polling after the full snapshot", async () => {

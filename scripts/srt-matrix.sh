@@ -126,6 +126,14 @@ start_sender() {
       input=(-re -f lavfi -i testsrc2=size=640x360:rate=30 -re -f lavfi -i sine=frequency=1100:sample_rate=48000)
       output=(-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -tune zerolatency -profile:v high -pix_fmt yuv420p -bf 0 -g 30 -c:a libopus -application lowdelay -b:a 96k)
       ;;
+    matroska-vp9-opus|pull-matroska-vp9-opus)
+      input=(-re -f lavfi -i testsrc2=size=640x360:rate=30 -re -f lavfi -i sine=frequency=1150:sample_rate=48000)
+      output=(-map 0:v:0 -map 1:a:0 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 -g 30 -c:a libopus -application lowdelay -b:a 96k)
+      ffmpeg -hide_banner -loglevel error -nostdin "${input[@]}" "${output[@]}" \
+        -live 1 -f matroska "$target" >"$log_file" 2>&1 &
+      sender_pid=$!
+      return
+      ;;
     h264-main-bframes-opus)
       input=(-re -f lavfi -i testsrc2=size=640x360:rate=30 -re -f lavfi -i sine=frequency=1200:sample_rate=48000)
       output=(-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -profile:v main -pix_fmt yuv420p -bf 3 -g 30 -c:a libopus -application lowdelay -b:a 96k)
@@ -395,6 +403,7 @@ test_wrong_passphrase() {
 printf 'Temporary channel: %s (%s), SRT port %s\n' "$channel_path" "$channel_id" "$SRT_PORT"
 run_case h264-baseline-opus direct 'H264,Opus' 'H264,Opus'
 run_case h264-high-no-b-opus direct 'H264,Opus' 'H264,Opus'
+run_case matroska-vp9-opus direct 'VP9,Opus' 'VP9,Opus'
 run_case h264-main-bframes-opus transcoded 'H264,Opus' 'H264,Opus'
 run_case h264-interlaced-opus transcoded 'H264,Opus' 'H264,Opus' '' 40
 run_case h264-baseline-aac transcoded 'H264,MPEG-4 Audio' 'H264,Opus'
@@ -433,6 +442,8 @@ set_pull_config ""
 sleep 0.5
 run_case pull-h264-baseline-opus direct 'H264,Opus' 'H264,Opus' \
 	"srt://0.0.0.0:$SRT_PULL_PORT?mode=listener&transtype=live&pkt_size=1316"
+run_case pull-matroska-vp9-opus direct 'VP9,Opus' 'VP9,Opus' \
+	"srt://0.0.0.0:$SRT_PULL_PORT?mode=listener&transtype=live&latency=20000"
 run_case pull-rtp-mp2t-h264-aac transcoded 'H264,MPEG-4 Audio' 'H264,Opus' \
 	"srt://0.0.0.0:$SRT_PULL_PORT?mode=listener&transtype=live&messageapi=1&payload_size=1456"
 set_pull_config "$elementary_sdp"

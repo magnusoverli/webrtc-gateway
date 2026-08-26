@@ -11,6 +11,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("GATEWAY_MEDIAMTX_API_URL", "")
 	t.Setenv("GATEWAY_MEDIAMTX_WHEP_URL", "")
 	t.Setenv("GATEWAY_MEDIAMTX_RTSP_URL", "")
+	t.Setenv("GATEWAY_MEDIAMTX_RTMP_URL", "")
 	t.Setenv("GATEWAY_STATE_PATH", "")
 	t.Setenv("GATEWAY_COMPATIBILITY_ENCODER_THREADS", "")
 	t.Setenv("GATEWAY_COMPATIBILITY_CAPACITY", "")
@@ -28,6 +29,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MediaMTXAPIURL != "http://127.0.0.1:9997" {
 		t.Fatalf("MediaMTXAPIURL = %q", cfg.MediaMTXAPIURL)
 	}
+	if cfg.MediaMTXRTMPURL != "rtmp://127.0.0.1:1935" {
+		t.Fatalf("MediaMTXRTMPURL = %q", cfg.MediaMTXRTMPURL)
+	}
 	if cfg.EncoderThreads != min(6, runtime.NumCPU()) || cfg.WorkerCapacity != max(1, runtime.NumCPU()*3/4) {
 		t.Fatalf("compatibility defaults = threads %d, capacity %d", cfg.EncoderThreads, cfg.WorkerCapacity)
 	}
@@ -37,6 +41,13 @@ func TestLoadRejectsRelativeMediaURL(t *testing.T) {
 	t.Setenv("GATEWAY_MEDIAMTX_API_URL", "/mediamtx")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() error = nil, want invalid URL error")
+	}
+}
+
+func TestLoadRejectsRelativeMediaRTMPURL(t *testing.T) {
+	t.Setenv("GATEWAY_MEDIAMTX_RTMP_URL", "/internal")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() error = nil, want invalid RTMP URL error")
 	}
 }
 

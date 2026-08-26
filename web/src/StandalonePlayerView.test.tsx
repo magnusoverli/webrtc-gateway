@@ -273,6 +273,7 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
     tracks: [],
     outputReady,
     outputTracks: [],
+    issues: [],
     compatibility: {
       state: outputReady ? "ready" : "offline",
       mode: "direct",
@@ -306,5 +307,6 @@ function runtimeFor(channel: Channel): ChannelRuntime {
     outputTracks: channel.outputTracks,
     compatibility: channel.compatibility,
     relay: channel.relay,
+    issues: channel.issues,
   };
 }

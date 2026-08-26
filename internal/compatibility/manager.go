@@ -77,6 +77,7 @@ type Options struct {
 	Logger         *slog.Logger
 	Channels       ChannelReader
 	MediaMTX       MediaManager
+	InputAccepted  func(string, uint64)
 	MediaRTSPURL   string
 	FFmpeg         string
 	FFprobe        string
@@ -99,6 +100,7 @@ type Manager struct {
 	workerCapacity int
 	probeVideo     func(context.Context, string) (videoCharacteristics, error)
 	startCommand   func(*exec.Cmd) error
+	inputAccepted  func(string, uint64)
 	now            func() time.Time
 
 	mu             sync.RWMutex
@@ -117,6 +119,7 @@ type Manager struct {
 type inputDiscovery struct {
 	deadline            time.Time
 	previousFingerprint string
+	attempt             uint64
 }
 
 type entry struct {
@@ -219,7 +222,8 @@ func New(options Options) (*Manager, error) {
 		rtspURL: parsed, ffmpeg: options.FFmpeg, ffprobe: options.FFprobe,
 		interval: options.Interval, activeInterval: options.ActiveInterval,
 		encoderThreads: options.EncoderThreads, workerCapacity: options.WorkerCapacity,
-		entries: make(map[string]*entry), discovering: make(map[string]inputDiscovery), wake: make(chan struct{}, 1),
+		inputAccepted: options.InputAccepted,
+		entries:       make(map[string]*entry), discovering: make(map[string]inputDiscovery), wake: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -340,7 +344,7 @@ func (m *Manager) notify() {
 	}
 }
 
-func (m *Manager) SRTInputStarted(channelID string) {
+func (m *Manager) SRTInputStarted(channelID string, attempt uint64) {
 	if strings.TrimSpace(channelID) == "" {
 		return
 	}
@@ -357,7 +361,7 @@ func (m *Manager) SRTInputStarted(channelID string) {
 		previousFingerprint = current.fingerprint
 	}
 	m.discovering[channelID] = inputDiscovery{
-		deadline: m.nowTime().Add(inputDiscoveryWindow), previousFingerprint: previousFingerprint,
+		deadline: m.nowTime().Add(inputDiscoveryWindow), previousFingerprint: previousFingerprint, attempt: attempt,
 	}
 	m.freshStatus = true
 	m.mu.Unlock()
@@ -426,14 +430,21 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 
 	m.mu.Lock()
-	now := m.nowTime()
+	type acceptedInput struct {
+		channelID string
+		attempt   uint64
+	}
+	accepted := make([]acceptedInput, 0, len(m.discovering))
 	for channelID, discovery := range m.discovering {
 		path, configured := configuredPaths[channelID]
 		raw := byPath[path]
 		newSourceOnline := raw.Available && raw.Online &&
 			(discovery.previousFingerprint == "" || fingerprint(raw) != discovery.previousFingerprint)
-		if !configured || !now.Before(discovery.deadline) || newSourceOnline {
+		if !configured || newSourceOnline {
 			delete(m.discovering, channelID)
+		}
+		if newSourceOnline {
+			accepted = append(accepted, acceptedInput{channelID: channelID, attempt: discovery.attempt})
 		}
 	}
 	for id, item := range m.entries {
@@ -445,6 +456,11 @@ func (m *Manager) reconcile(ctx context.Context) {
 		delete(m.entries, id)
 	}
 	m.mu.Unlock()
+	if m.inputAccepted != nil {
+		for _, input := range accepted {
+			m.inputAccepted(input.channelID, input.attempt)
+		}
+	}
 	for path := range byPath {
 		if strings.HasPrefix(path, pathPrefix) {
 			if _, ok := knownPaths[path]; !ok {
@@ -946,6 +962,7 @@ func classifyTracks(ctx context.Context, tracks []mediamtx.Track, probeVideo fun
 	result := decision{}
 	firstVideoCodec := ""
 	firstVideoLabel := "video"
+	firstVideoProfile := ""
 	for _, track := range tracks {
 		width := positiveIntProperty(track.CodecProps, "width")
 		height := positiveIntProperty(track.CodecProps, "height")
@@ -957,6 +974,7 @@ func classifyTracks(ctx context.Context, tracks []mediamtx.Track, probeVideo fun
 		if firstVideoCodec == "" && isVideoCodec(codec, width, height) {
 			firstVideoCodec = codec
 			firstVideoLabel = track.Codec
+			firstVideoProfile = stringProperty(track.CodecProps, "profile")
 		}
 		switch codec {
 		case "h264", "vp8", "vp9", "av1", "opus", "g722", "g711", "pcma", "pcmu":
@@ -973,7 +991,7 @@ func classifyTracks(ctx context.Context, tracks []mediamtx.Track, probeVideo fun
 			result.reasons = append(result.reasons, track.Codec+" is not a direct WebRTC codec and will be normalized.")
 		}
 	}
-	if firstVideoCodec != "" {
+	if firstVideoCodec != "" && !(firstVideoCodec == "vp9" && firstVideoProfile == "0") {
 		characteristics, err := probeVideo(ctx)
 		if err != nil {
 			return decision{}, fmt.Errorf("probe first video characteristics: %w", err)

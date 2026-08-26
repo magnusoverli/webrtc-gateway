@@ -26,13 +26,14 @@ pprof: false
 playback: false
 
 ###############################################
-# Internal protocol used only by compatibility workers
+# Private internal publishing and compatibility protocols
 
 rtsp: true
 rtspTransports: [tcp]
 rtspAddress: 127.0.0.1:8554
 
-rtmp: false
+rtmp: true
+rtmpAddress: 127.0.0.1:1935
 hls: false
 moq: false
 

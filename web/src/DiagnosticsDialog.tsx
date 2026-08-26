@@ -14,6 +14,16 @@ export type DiagnosticsDialogProps = {
 };
 
 type DiagnosticReader = { type: string; id: string };
+type DiagnosticIssue = {
+  code: string;
+  source: string;
+  severity: string;
+  summary: string;
+  message: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  occurrences: number;
+};
 
 type DiagnosticChannel = {
   id: string;
@@ -35,6 +45,7 @@ type DiagnosticChannel = {
     readers: DiagnosticReader[];
   };
   outputReady: boolean;
+  issues: DiagnosticIssue[];
   relay?: {
     state: string;
     restarts: number;
@@ -70,7 +81,7 @@ type DiagnosticsResponse = {
     version?: string;
     started?: string;
     error?: string;
-    activeListeners?: { srt: string; webRTCUDP: string; webRTCTCP: string };
+    activeListeners?: { srt: string; webRTCUDP: string; webRTCTCP: string; rtmp?: string };
   };
   settings: { revision: number; applyState: string; updatedAt: string };
   resources?: {
@@ -235,6 +246,7 @@ function SystemSections({ data }: { data: DiagnosticsResponse }) {
             ["SRT", <code className="diagnostics-id">{valueOrFallback(data.media.activeListeners.srt)}</code>],
             ["WebRTC UDP", <code className="diagnostics-id">{valueOrFallback(data.media.activeListeners.webRTCUDP)}</code>],
             ["WebRTC TCP", <code className="diagnostics-id">{valueOrFallback(data.media.activeListeners.webRTCTCP)}</code>],
+            ["Private RTMP", <code className="diagnostics-id">{valueOrFallback(data.media.activeListeners.rtmp)}</code>],
           ]} />
         </details>
       )}
@@ -368,6 +380,16 @@ function ChannelSections({ channel }: { channel: DiagnosticChannel }) {
             ["Source", source ? <><span>{valueOrFallback(source.type)}</span> <code className="diagnostics-id">{valueOrFallback(source.id)}</code></> : "-"],
           ]} />
         </DiagnosticSection>
+        {channel.issues.length > 0 && (
+          <DiagnosticSection title="Issues" tone="fault">
+            <FactList facts={channel.issues.flatMap((issue) => [
+              [issue.summary, issue.message] as [string, ReactNode],
+              ["Code", <code className="diagnostics-id">{issue.code}</code>] as [string, ReactNode],
+              ["Last seen", timestamp(issue.lastSeenAt)] as [string, ReactNode],
+              ["Occurrences", issue.occurrences] as [string, ReactNode],
+            ])} />
+          </DiagnosticSection>
+        )}
         <DiagnosticSection title="Compatibility" tone={channel.compatibility.state === "error" ? "fault" : undefined}>
           <FactList facts={[
             ["State", valueOrFallback(channel.compatibility.state)],
@@ -445,6 +467,7 @@ function sanitizeDiagnostics(value: unknown): DiagnosticsResponse {
         srt: stringValue(listeners.srt),
         webRTCUDP: stringValue(listeners.webRTCUDP),
         webRTCTCP: stringValue(listeners.webRTCTCP),
+        rtmp: optionalString(listeners.rtmp),
       } } : {}),
     },
     settings: {
@@ -484,6 +507,7 @@ function sanitizeChannel(value: unknown): DiagnosticChannel {
       readers: sanitizeReaders(runtime.readers),
     },
     outputReady: booleanValue(item.outputReady),
+    issues: sanitizeIssues(item.issues),
     ...(relay ? { relay: {
       state: stringValue(relay.state),
       restarts: numberValue(relay.restarts),
@@ -506,6 +530,23 @@ function sanitizeChannel(value: unknown): DiagnosticChannel {
       },
     },
   };
+}
+
+function sanitizeIssues(value: unknown): DiagnosticIssue[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((candidate) => {
+    const issue = record(candidate);
+    return {
+      code: stringValue(issue.code),
+      source: stringValue(issue.source),
+      severity: stringValue(issue.severity),
+      summary: stringValue(issue.summary),
+      message: stringValue(issue.message),
+      firstSeenAt: stringValue(issue.firstSeenAt),
+      lastSeenAt: stringValue(issue.lastSeenAt),
+      occurrences: numberValue(issue.occurrences),
+    };
+  });
 }
 
 function sanitizeReaders(value: unknown): DiagnosticReader[] {

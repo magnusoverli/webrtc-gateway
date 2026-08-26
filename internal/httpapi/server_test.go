@@ -287,7 +287,8 @@ func TestStatusResolvesInterfaceFollowingBindings(t *testing.T) {
 	handler, err := New(Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MediaMTX: fakeMediaMTX{global: mediamtx.GlobalConfig{
-			SRTAddress: "192.0.2.20:8890", WebRTCLocalUDPAddress: "192.0.2.20:8189", WebRTCLocalTCPAddress: "192.0.2.20:8189",
+			SRTAddress: "192.0.2.20:8890", RTMPAddress: "127.0.0.1:1935",
+			WebRTCLocalUDPAddress: "192.0.2.20:8189", WebRTCLocalTCPAddress: "192.0.2.20:8189",
 		}},
 		Channels:        fakeChannels{},
 		Settings:        fakeSettings{value: value},
@@ -304,7 +305,7 @@ func TestStatusResolvesInterfaceFollowingBindings(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
 	body := res.Body.String()
 	if res.Code != http.StatusOK || !strings.Contains(body, `"desiredAddress":"interface:ipv4:eth0","resolvedAddress":"192.0.2.20"`) ||
-		!strings.Contains(body, `"media":{"activeAddress":"192.0.2.20","activeListeners":{"srt":"192.0.2.20:8890","webRTCUDP":"192.0.2.20:8189","webRTCTCP":"192.0.2.20:8189"}`) {
+		!strings.Contains(body, `"media":{"activeAddress":"192.0.2.20","activeListeners":{"srt":"192.0.2.20:8890","webRTCUDP":"192.0.2.20:8189","webRTCTCP":"192.0.2.20:8189","rtmp":"127.0.0.1:1935"}`) {
 		t.Fatalf("response = %d %s", res.Code, body)
 	}
 }
@@ -476,14 +477,21 @@ func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
 }
 
 func TestStatusIncludesRelayRuntimeStateForSRTChannels(t *testing.T) {
+	firstSeen := time.Date(2026, 8, 26, 10, 46, 42, 0, time.UTC)
 	handler, err := New(Options{
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MediaMTX: fakeMediaMTX{},
 		Channels: fakeChannels{items: []channel.Channel{{
 			ID: "channel-1", Name: "SRT", Input: channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000}},
 		}}},
-		Settings:        fakeSettings{value: settings.Defaults(time.Now())},
-		Relays:          fakeRelays{status: srtrelay.Status{State: srtrelay.StateRetrying, Restarts: 3, LastError: "bind failed"}},
+		Settings: fakeSettings{value: settings.Defaults(time.Now())},
+		Relays: fakeRelays{status: srtrelay.Status{
+			State: srtrelay.StateRetrying, Restarts: 3, LastError: "bind failed",
+			Issue: &srtrelay.Issue{
+				Code: "srt.unsupported_payload", Source: "ingest", Summary: "Input rejected", Message: "unsupported payload", FirstSeenAt: firstSeen,
+				LastSeenAt: firstSeen, Occurrences: 1,
+			},
+		}},
 		MediaMTXWHEPURL: "http://127.0.0.1:1",
 	})
 	if err != nil {
@@ -491,8 +499,14 @@ func TestStatusIncludesRelayRuntimeStateForSRTChannels(t *testing.T) {
 	}
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"relay":{"state":"retrying","restarts":3,"lastError":"bind failed","listenerActive":false}`) {
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"relay":{"state":"retrying","restarts":3,"lastError":"bind failed","listenerActive":false}`) ||
+		!strings.Contains(res.Body.String(), `"issues":[{"code":"srt.unsupported_payload","source":"ingest","severity":"error","summary":"Input rejected","message":"unsupported payload"`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+	runtime := httptest.NewRecorder()
+	handler.ServeHTTP(runtime, httptest.NewRequest(http.MethodGet, "/api/v1/channels/runtime", nil))
+	if runtime.Code != http.StatusOK || !strings.Contains(runtime.Body.String(), `"issues":[{"code":"srt.unsupported_payload"`) {
+		t.Fatalf("runtime response = %d %s", runtime.Code, runtime.Body.String())
 	}
 }
 
@@ -1299,7 +1313,7 @@ func TestDiagnosticsIsAllowlistedAndRedactsSensitiveState(t *testing.T) {
 	handler, err := New(Options{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MediaMTX: fakeMediaMTX{
-			global: mediamtx.GlobalConfig{SRTAddress: ":8890", WebRTCLocalUDPAddress: ":8189", WebRTCLocalTCPAddress: ":8190"},
+			global: mediamtx.GlobalConfig{SRTAddress: ":8890", RTMPAddress: "127.0.0.1:1935", WebRTCLocalUDPAddress: ":8189", WebRTCLocalTCPAddress: ":8190"},
 			status: mediamtx.Status{Info: mediamtx.Info{Version: "1.20.1", Started: available}, Channels: []mediamtx.Channel{
 				{
 					Name: "demo", ConfiguredSource: "srt://source?passphrase=raw-secret", Available: true, Online: true,
@@ -1327,7 +1341,7 @@ func TestDiagnosticsIsAllowlistedAndRedactsSensitiveState(t *testing.T) {
 		t.Fatalf("diagnostics response = %d %s", res.Code, body)
 	}
 	for _, expected := range []string{
-		`"version":"test-version"`, `"version":"1.20.1"`, `"activeListeners":{"srt":":8890","webRTCUDP":":8189","webRTCTCP":":8190"}`,
+		`"version":"test-version"`, `"version":"1.20.1"`, `"activeListeners":{"srt":":8890","webRTCUDP":":8189","webRTCTCP":":8190","rtmp":"127.0.0.1:1935"}`,
 		`"revision":4`, `"path":"demo"`, `"availableTime":"2026-08-25T10:00:00Z"`, `"source":{"type":"srtConn","id":"source-1"}`,
 		`"outputAvailableTime":"2026-08-25T10:00:01Z"`,
 		`"readers":[{"type":"webRTCSession","id":"reader-1"}]`, `"lastError":"compatibility process exited"`,

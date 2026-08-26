@@ -5,6 +5,7 @@ import {
   channelStateLabel,
   mergeChannelRuntime,
   mergeChannelRuntimes,
+  primaryChannelIssue,
   readChannelRuntime,
   readChannelRuntimes,
   readChannelSnapshot,
@@ -255,6 +256,7 @@ function offlineDetail(channel: Channel) {
   if (channel.applyState === "deleting") return "This channel is being deleted.";
   if (!channel.enabled) return "This channel is disabled.";
   if (channel.applyState === "error") return channel.applyError ?? "The channel configuration could not be applied.";
+  if (primaryChannelIssue(channel)) return primaryChannelIssue(channel)?.message ?? "The input was rejected.";
   if (channel.compatibility.state === "error") return channel.compatibility.lastError ?? "A browser-compatible output is unavailable.";
   if (channel.relay?.state === "retrying" || channel.relay?.state === "stopped") return channel.relay.lastError ?? "The SRT listener process is unavailable.";
   if (channel.available && channel.online) return "The encoder is connected and the browser-compatible output is being prepared.";

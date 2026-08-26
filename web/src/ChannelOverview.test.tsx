@@ -78,6 +78,19 @@ describe("ChannelOverview", () => {
     expect(screen.queryByLabelText("Passthrough inactive for Inactive")).toBeNull();
   });
 
+  it("surfaces retained input rejection issues", () => {
+    const rejected = channel("rejected", "Rejected", "idle");
+    rejected.issues = [{
+      code: "srt.unsupported_payload", source: "ingest", severity: "error", summary: "Input rejected",
+      message: "Unsupported payload", firstSeenAt: "2026-08-26T10:46:42Z", lastSeenAt: "2026-08-26T10:46:42Z", occurrences: 1,
+    }];
+    renderOverview({ channels: [rejected] });
+
+    const card = screen.getByRole("button", { name: "Open details for Rejected" }).closest("article");
+    expect(card?.className).toContain("tone-fault");
+    expect(screen.getByLabelText("Input rejected").textContent).toBe("Input rejected");
+  });
+
   it("renders loading, initial error retry, no-channel, and filtered-empty copy", async () => {
     const user = userEvent.setup();
     const loading = renderOverview({ loading: true });
@@ -355,6 +368,7 @@ function channel(id: string, name: string, tone: "live" | "starting" | "fault" |
     tracks: [],
     outputReady: live,
     outputTracks: [],
+    issues: [],
     compatibility: {
       state: live ? "ready" : "offline",
       mode: "direct",

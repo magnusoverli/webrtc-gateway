@@ -1,5 +1,5 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode, type RefObject } from "react";
-import { channelPlaybackReady, channelStateLabel, channelTone, type Channel, type ChannelStreamRates, type ChannelTone } from "./channel";
+import { channelPlaybackReady, channelStateLabel, channelTone, primaryChannelIssue, type Channel, type ChannelStreamRates, type ChannelTone } from "./channel";
 import { GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { useWHEPPlayer } from "./useWHEPPlayer";
@@ -283,6 +283,7 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
     previousItem.outputReady === nextItem.outputReady &&
     previousItem.readerCount === nextItem.readerCount &&
     previousItem.relay?.state === nextItem.relay?.state &&
+    sameIssues(previousItem, nextItem) &&
     previousItem.compatibility.state === nextItem.compatibility.state &&
     previousItem.compatibility.mode === nextItem.compatibility.mode &&
     previousItem.compatibility.worker.running === nextItem.compatibility.worker.running &&
@@ -329,7 +330,8 @@ function sameOverviewPreviewProps(previous: OverviewPreviewProps, next: Overview
     previousItem.available === nextItem.available &&
     previousItem.online === nextItem.online &&
     previousItem.outputReady === nextItem.outputReady &&
-    previousItem.whepPath === nextItem.whepPath;
+    previousItem.whepPath === nextItem.whepPath &&
+    sameIssues(previousItem, nextItem);
 }
 
 function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<typeof useWHEPPlayer>["state"], hasVideo: boolean, hasAudio: boolean) {
@@ -337,6 +339,7 @@ function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<
   if (stale) return "Status stale";
   if (!item.enabled) return "Channel disabled";
   if (item.applyState === "deleting") return "Deletion pending";
+  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.summary ?? "Input rejected";
   if (!item.outputReady) return item.available && item.online ? "Preparing output" : "Waiting for input";
   if (state === "connecting") return "Connecting";
   if (state === "error") return "Preview unavailable";
@@ -349,6 +352,7 @@ function overviewStateLabel(item: Channel) {
   if (!item.enabled) return "Disabled";
   if (item.applyState === "error") return "Config error";
   if (item.applyState === "pending") return "Applying";
+  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.summary ?? "Input rejected";
   if (item.compatibility.state === "error") return "Output error";
   if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
   if (item.relay?.state === "starting") return "Restarting";
@@ -359,6 +363,16 @@ function overviewStateLabel(item: Channel) {
   }
   if (item.applyState === "applied" && item.input.mode === "srt-push") return "Listener ready";
   return "Waiting input";
+}
+
+function sameIssues(previous: Channel, next: Channel) {
+  if (previous.issues.length !== next.issues.length) return false;
+  return previous.issues.every((issue, index) => {
+    const candidate = next.issues[index];
+    return issue.code === candidate.code && issue.severity === candidate.severity &&
+      issue.message === candidate.message && issue.lastSeenAt === candidate.lastSeenAt &&
+      issue.occurrences === candidate.occurrences;
+  });
 }
 
 function OverviewState({ children, headingRef }: { children: ReactNode; headingRef?: RefObject<HTMLHeadingElement | null> }) {

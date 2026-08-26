@@ -158,6 +158,7 @@ type activeMediaListeners struct {
 	SRT       string `json:"srt"`
 	WebRTCUDP string `json:"webRTCUDP"`
 	WebRTCTCP string `json:"webRTCTCP"`
+	RTMP      string `json:"rtmp"`
 }
 
 type gatewayStatus struct {
@@ -199,63 +200,76 @@ type srtInputRequest struct {
 }
 
 type channelResponse struct {
-	ID                   string                `json:"id"`
-	Revision             int                   `json:"revision"`
-	Number               int                   `json:"number"`
-	Name                 string                `json:"name"`
-	Path                 string                `json:"path"`
-	Enabled              bool                  `json:"enabled"`
-	AutomaticPreview     bool                  `json:"automaticPreview"`
-	Input                inputResponse         `json:"input"`
-	MaxReaders           int                   `json:"maxReaders"`
-	UseAbsoluteTimestamp bool                  `json:"useAbsoluteTimestamp"`
-	ApplyState           channel.ApplyState    `json:"applyState"`
-	ApplyError           string                `json:"applyError,omitempty"`
-	CreatedAt            time.Time             `json:"createdAt"`
-	UpdatedAt            time.Time             `json:"updatedAt"`
-	WHEPPath             string                `json:"whepPath"`
-	ViewerPath           string                `json:"viewerPath"`
-	EmbedPath            string                `json:"embedPath"`
-	Available            bool                  `json:"available"`
-	AvailableTime        *string               `json:"availableTime,omitempty"`
-	Online               bool                  `json:"online"`
-	OnlineTime           *string               `json:"onlineTime,omitempty"`
-	InboundBytes         uint64                `json:"inboundBytes"`
-	OutputInboundBytes   uint64                `json:"outputInboundBytes"`
-	OutputAvailableTime  *string               `json:"outputAvailableTime,omitempty"`
-	OutboundBytes        uint64                `json:"outboundBytes"`
-	InboundFramesInError uint64                `json:"inboundFramesInError"`
-	Source               *mediamtx.PathSource  `json:"source,omitempty"`
-	Readers              []mediamtx.PathReader `json:"readers"`
-	Tracks               []mediamtx.Track      `json:"tracks"`
-	OutputReady          bool                  `json:"outputReady"`
-	OutputTracks         []mediamtx.Track      `json:"outputTracks"`
-	Compatibility        compatibility.State   `json:"compatibility"`
-	Relay                *srtrelay.Status      `json:"relay,omitempty"`
+	ID                   string                 `json:"id"`
+	Revision             int                    `json:"revision"`
+	Number               int                    `json:"number"`
+	Name                 string                 `json:"name"`
+	Path                 string                 `json:"path"`
+	Enabled              bool                   `json:"enabled"`
+	AutomaticPreview     bool                   `json:"automaticPreview"`
+	Input                inputResponse          `json:"input"`
+	MaxReaders           int                    `json:"maxReaders"`
+	UseAbsoluteTimestamp bool                   `json:"useAbsoluteTimestamp"`
+	ApplyState           channel.ApplyState     `json:"applyState"`
+	ApplyError           string                 `json:"applyError,omitempty"`
+	CreatedAt            time.Time              `json:"createdAt"`
+	UpdatedAt            time.Time              `json:"updatedAt"`
+	WHEPPath             string                 `json:"whepPath"`
+	ViewerPath           string                 `json:"viewerPath"`
+	EmbedPath            string                 `json:"embedPath"`
+	Available            bool                   `json:"available"`
+	AvailableTime        *string                `json:"availableTime,omitempty"`
+	Online               bool                   `json:"online"`
+	OnlineTime           *string                `json:"onlineTime,omitempty"`
+	InboundBytes         uint64                 `json:"inboundBytes"`
+	OutputInboundBytes   uint64                 `json:"outputInboundBytes"`
+	OutputAvailableTime  *string                `json:"outputAvailableTime,omitempty"`
+	OutboundBytes        uint64                 `json:"outboundBytes"`
+	InboundFramesInError uint64                 `json:"inboundFramesInError"`
+	Source               *mediamtx.PathSource   `json:"source,omitempty"`
+	Readers              []mediamtx.PathReader  `json:"readers"`
+	Tracks               []mediamtx.Track       `json:"tracks"`
+	OutputReady          bool                   `json:"outputReady"`
+	OutputTracks         []mediamtx.Track       `json:"outputTracks"`
+	Compatibility        compatibility.State    `json:"compatibility"`
+	Relay                *srtrelay.Status       `json:"relay,omitempty"`
+	Issues               []channelIssueResponse `json:"issues"`
+}
+
+type channelIssueResponse struct {
+	Code        string    `json:"code"`
+	Source      string    `json:"source"`
+	Severity    string    `json:"severity"`
+	Summary     string    `json:"summary"`
+	Message     string    `json:"message"`
+	FirstSeenAt time.Time `json:"firstSeenAt"`
+	LastSeenAt  time.Time `json:"lastSeenAt"`
+	Occurrences int       `json:"occurrences"`
 }
 
 type runtimeChannelResponse struct {
-	ID                   string              `json:"id"`
-	Revision             int                 `json:"revision"`
-	ApplyState           channel.ApplyState  `json:"applyState"`
-	ApplyError           string              `json:"applyError,omitempty"`
-	Available            bool                `json:"available"`
-	AvailableTime        *string             `json:"availableTime,omitempty"`
-	Online               bool                `json:"online"`
-	OnlineTime           *string             `json:"onlineTime,omitempty"`
-	InputGeneration      string              `json:"inputGeneration"`
-	InboundBytes         uint64              `json:"inboundBytes"`
-	OutputInboundBytes   uint64              `json:"outputInboundBytes"`
-	OutputAvailableTime  *string             `json:"outputAvailableTime,omitempty"`
-	OutputGeneration     string              `json:"outputGeneration"`
-	OutboundBytes        uint64              `json:"outboundBytes"`
-	InboundFramesInError uint64              `json:"inboundFramesInError"`
-	ReaderCount          int                 `json:"readerCount"`
-	Tracks               []mediamtx.Track    `json:"tracks"`
-	OutputReady          bool                `json:"outputReady"`
-	OutputTracks         []mediamtx.Track    `json:"outputTracks"`
-	Compatibility        compatibility.State `json:"compatibility"`
-	Relay                *srtrelay.Status    `json:"relay,omitempty"`
+	ID                   string                 `json:"id"`
+	Revision             int                    `json:"revision"`
+	ApplyState           channel.ApplyState     `json:"applyState"`
+	ApplyError           string                 `json:"applyError,omitempty"`
+	Available            bool                   `json:"available"`
+	AvailableTime        *string                `json:"availableTime,omitempty"`
+	Online               bool                   `json:"online"`
+	OnlineTime           *string                `json:"onlineTime,omitempty"`
+	InputGeneration      string                 `json:"inputGeneration"`
+	InboundBytes         uint64                 `json:"inboundBytes"`
+	OutputInboundBytes   uint64                 `json:"outputInboundBytes"`
+	OutputAvailableTime  *string                `json:"outputAvailableTime,omitempty"`
+	OutputGeneration     string                 `json:"outputGeneration"`
+	OutboundBytes        uint64                 `json:"outboundBytes"`
+	InboundFramesInError uint64                 `json:"inboundFramesInError"`
+	ReaderCount          int                    `json:"readerCount"`
+	Tracks               []mediamtx.Track       `json:"tracks"`
+	OutputReady          bool                   `json:"outputReady"`
+	OutputTracks         []mediamtx.Track       `json:"outputTracks"`
+	Compatibility        compatibility.State    `json:"compatibility"`
+	Relay                *srtrelay.Status       `json:"relay,omitempty"`
+	Issues               []channelIssueResponse `json:"issues"`
 }
 
 type inputResponse struct {
@@ -340,6 +354,7 @@ type diagnosticsChannel struct {
 	OutputReady   bool                     `json:"outputReady"`
 	Relay         *srtrelay.Status         `json:"relay,omitempty"`
 	Compatibility diagnosticsCompatibility `json:"compatibility"`
+	Issues        []channelIssueResponse   `json:"issues"`
 }
 
 type diagnosticsRuntime struct {
@@ -623,7 +638,7 @@ func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
 				OnlineTime: raw.OnlineTime, OutputAvailableTime: output.AvailableTime,
 				Source: raw.Source, Readers: readers,
 			},
-			OutputReady: view.OutputReady, Relay: view.Relay,
+			OutputReady: view.OutputReady, Relay: view.Relay, Issues: view.Issues,
 			Compatibility: diagnosticsCompatibility{
 				State: state.State, Mode: state.Mode, Required: state.Required, Reasons: reasons, LastError: state.LastError,
 				Worker: diagnosticsCompatibilityWorker{
@@ -638,7 +653,8 @@ func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
 
 func listenersFromGlobal(global mediamtx.GlobalConfig) *activeMediaListeners {
 	return &activeMediaListeners{
-		SRT: global.SRTAddress, WebRTCUDP: global.WebRTCLocalUDPAddress, WebRTCTCP: global.WebRTCLocalTCPAddress,
+		SRT: global.SRTAddress, WebRTCUDP: global.WebRTCLocalUDPAddress,
+		WebRTCTCP: global.WebRTCLocalTCPAddress, RTMP: global.RTMPAddress,
 	}
 }
 
@@ -1583,6 +1599,13 @@ func (s *server) attachRelayStatus(item channel.Channel, view *channelResponse) 
 	}
 	status := s.relays.Snapshot(item.ID)
 	view.Relay = &status
+	if issue := status.Issue; issue != nil {
+		view.Issues = append(view.Issues, channelIssueResponse{
+			Code: issue.Code, Source: issue.Source, Severity: "error", Summary: issue.Summary,
+			Message: issue.Message, FirstSeenAt: issue.FirstSeenAt, LastSeenAt: issue.LastSeenAt,
+			Occurrences: issue.Occurrences,
+		})
+	}
 }
 
 func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, compatibilityState compatibility.State) channelResponse {
@@ -1632,6 +1655,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		OutputReady:          outputReady,
 		OutputTracks:         outputTracks,
 		Compatibility:        compatibilityState,
+		Issues:               []channelIssueResponse{},
 	}
 	if view.Readers == nil {
 		view.Readers = []mediamtx.PathReader{}
@@ -1683,6 +1707,7 @@ func runtimeChannel(item channelResponse) runtimeChannelResponse {
 		OutputTracks:         item.OutputTracks,
 		Compatibility:        item.Compatibility,
 		Relay:                item.Relay,
+		Issues:               item.Issues,
 	}
 }
 

@@ -75,6 +75,7 @@ type GlobalConfig struct {
 	UDPMaxPayloadSize           int      `json:"udpMaxPayloadSize"`
 	UDPReadBufferSize           uint64   `json:"udpReadBufferSize"`
 	SRTAddress                  string   `json:"srtAddress"`
+	RTMPAddress                 string   `json:"rtmpAddress,omitempty"`
 	WebRTCLocalUDPAddress       string   `json:"webrtcLocalUDPAddress"`
 	WebRTCLocalTCPAddress       string   `json:"webrtcLocalTCPAddress"`
 	WebRTCIPsFromInterfaces     bool     `json:"webrtcIPsFromInterfaces"`

@@ -15,6 +15,7 @@ import {
   mediaHost,
   mergeChannelRuntimes,
   parseInterfaceBinding,
+  primaryChannelIssue,
   readChannelRuntimes,
   readChannelSnapshot,
   readChannelSnapshots,
@@ -1034,6 +1035,7 @@ function Dashboard() {
           />}
           {selected && deleteError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Deletion failed: ${deleteError}`} />}
           {selected?.enabled && selected.applyState !== "deleting" && selected.relay && (selected.relay.state === "retrying" || selected.relay.state === "stopped") && <ScopedNotice scope={`Channel · ${selected.name}`} message={`SRT listener is unavailable: ${selected.relay.lastError ?? "the relay process stopped"}. Gateway will retry automatically.`} />}
+          {selected?.issues.map((issue) => <ScopedNotice key={`${issue.source}:${issue.code}`} scope={`${issue.summary} · ${selected.name}`} message={issue.message} />)}
           {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Preview was not updated: ${previewSettingError}`} />}
         </div>
         </>)}
@@ -2293,6 +2295,7 @@ function previewOfflineDetail(item: Channel) {
   if (item.applyState === "deleting") return "Channel cleanup is pending and will be retried automatically.";
   if (!item.enabled) return "This channel is disabled.";
   if (item.applyState === "error") return item.applyError ?? "The channel configuration could not be applied.";
+  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.message ?? "The input was rejected.";
   if (item.compatibility.state === "error") return item.compatibility.lastError ?? "A browser-compatible output is unavailable.";
   if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return item.relay.lastError ?? "The SRT listener process is unavailable.";
   if (item.available && item.online) return "The encoder is connected and browser-compatible output is being prepared.";

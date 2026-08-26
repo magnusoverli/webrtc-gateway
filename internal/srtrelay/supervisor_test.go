@@ -49,6 +49,56 @@ func TestBuildInputEndpointUsesCabledLANDefaults(t *testing.T) {
 	}
 }
 
+func TestNewRequiresCredentialFreeLoopbackRTMP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, endpoint := range []string{
+		"http://127.0.0.1:1935",
+		"rtmp://media.example:1935",
+		"rtmp://user:secret@127.0.0.1:1935",
+		"rtmp://127.0.0.1:1935?token=secret",
+		"rtmp://127.0.0.1:1935#secret",
+		"rtmp://127.0.0.1:1935/base",
+	} {
+		if _, err := New(logger, "unused", "unused", endpoint); err == nil {
+			t.Errorf("New(%q) error = nil", endpoint)
+		} else if strings.Contains(err.Error(), "secret") {
+			t.Errorf("New(%q) exposed sensitive input: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{"rtmp://localhost:1935", "rtmp://127.0.0.1:1935/", "rtmps://[::1]:1935"} {
+		supervisor, err := New(logger, "unused", "unused", endpoint)
+		if err != nil {
+			t.Errorf("New(%q) error = %v", endpoint, err)
+			continue
+		}
+		if err := supervisor.Close(); err != nil {
+			t.Errorf("Close(%q) error = %v", endpoint, err)
+		}
+	}
+}
+
+func TestBridgeFailureReportsGatewayIssue(t *testing.T) {
+	var issue *reportedIssue
+	err := bridgeFailed("RTMP connection refused")
+	if !errors.As(err, &issue) || issue.code != "srt.media_bridge_failed" || issue.source != "gateway" ||
+		issue.summary != "Media bridge failed" || issue.message != "RTMP connection refused" {
+		t.Fatalf("bridge issue = %#v, %v", issue, err)
+	}
+}
+
+func TestInputEndWithinDistinguishesSenderDisconnect(t *testing.T) {
+	disconnected := errors.New("sender disconnected")
+	ended := make(chan error, 1)
+	ended <- disconnected
+	if err, ok := inputEndWithin(inputSession{wait: ended}, time.Second); !ok || !errors.Is(err, disconnected) {
+		t.Fatalf("ended input = %v, %t", err, ok)
+	}
+	waiting := make(chan error)
+	if err, ok := inputEndWithin(inputSession{wait: waiting}, time.Millisecond); ok || err != nil {
+		t.Fatalf("connected input = %v, %t", err, ok)
+	}
+}
+
 func TestPrepareSelectsPublisherForAutomaticTSPayloads(t *testing.T) {
 	supervisor := newTestSupervisor(t, "srt-live-transmit")
 	t.Cleanup(func() { _ = supervisor.Close() })
@@ -175,6 +225,17 @@ func TestClassifyPayloadFindsRawTSSyncAcrossMessages(t *testing.T) {
 	}
 }
 
+func TestClassifyPayloadDetectsMatroskaAcrossMessages(t *testing.T) {
+	stream := append([]byte(matroskaHeader), []byte{0x9f, 0x42, 0x86, 0x81, 0x01}...)
+	reader := packetReaderForMessages(stream[:1], stream[1:3], stream[3:])
+	defer reader.close()
+
+	mode, initial, err := classifyPayload(reader)
+	if err != nil || mode != payloadMatroska || !slices.Equal(initial, stream) {
+		t.Fatalf("classifyPayload() = %v, %x, %v", mode, initial, err)
+	}
+}
+
 func TestClassifyPayloadRequiresTwoRTPMP2TMessages(t *testing.T) {
 	payload := make([]byte, 188)
 	payload[0] = 0x47
@@ -225,7 +286,7 @@ func TestClassifyPayloadBoundsTinyMalformedMessages(t *testing.T) {
 			reader := newPacketReader(context.Background(), packets)
 			defer reader.close()
 			_, _, err := classifyPayload(reader)
-			want := "SRT payload is neither MPEG-TS nor RTP/MP2T payload type 33 after 65536 bytes"
+			want := "SRT payload is neither MPEG-TS, Matroska nor RTP/MP2T payload type 33 after 65536 bytes"
 			if err == nil || err.Error() != want {
 				t.Fatalf("classifyPayload() error = %v", err)
 			}
@@ -259,6 +320,31 @@ func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
 	}
 }
 
+func TestMatroskaRemuxArgsUseStreamCopyAndLowAnalysisBudget(t *testing.T) {
+	args := matroskaRemuxArgs("rtmp://127.0.0.1:1935/studio-camera")
+	for _, pair := range [][2]string{
+		{"-f", "matroska"}, {"-probesize", "65536"}, {"-analyzeduration", "100000"}, {"-i", "pipe:0"},
+		{"-map", "0:v:0?"}, {"-map", "0:a:0?"}, {"-c", "copy"}, {"-strict", "unofficial"},
+		{"-flush_packets", "1"}, {"-flvflags", "no_duration_filesize"}, {"-f", "flv"},
+	} {
+		if !containsArgumentPair(args, pair[0], pair[1]) {
+			t.Fatalf("Matroska remux args missing %q %q: %#v", pair[0], pair[1], args)
+		}
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "libx264") || strings.Contains(joined, "libopus") || strings.Contains(joined, "passphrase") {
+		t.Fatalf("Matroska remux performs processing or exposes a passphrase: %s", joined)
+	}
+}
+
+func TestMediaPathURLPreservesEscapedPath(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	got := supervisor.mediaPathURL("studio/camera ? 100%")
+	if got != "rtmp://127.0.0.1:1935/studio%2Fcamera%20%3F%20100%25" {
+		t.Fatalf("mediaPathURL() = %q", got)
+	}
+}
+
 func TestElementaryRelayNotifiesAfterFirstValidPacket(t *testing.T) {
 	inputPackets, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -281,7 +367,7 @@ func TestElementaryRelayNotifiesAfterFirstValidPacket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, relayErr := supervisor.relayConnection(ctx, plan, input)
+		_, relayErr := supervisor.relayConnection(ctx, plan, input, 1)
 		result <- relayErr
 	}()
 
@@ -345,7 +431,7 @@ func TestAutomaticRelayNotifiesAfterRemuxAcceptsInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, relayErr := supervisor.relayConnection(ctx, plan, input)
+		_, relayErr := supervisor.relayConnection(ctx, plan, input, 1)
 		result <- relayErr
 	}()
 	sender, err := net.DialUDP("udp4", nil, inputPackets.LocalAddr().(*net.UDPAddr))
@@ -408,7 +494,7 @@ func TestBoundedWriterPreservesTrimmedTailAcrossWraps(t *testing.T) {
 }
 
 func TestRemuxErrorRedactsPassphrase(t *testing.T) {
-	err := remuxError(errors.New("exit status 1"), "failed srt://host?passphrase=supersecret", "supersecret")
+	err := remuxError("MPEG-TS", errors.New("exit status 1"), "failed srt://host?passphrase=supersecret", "supersecret")
 	if strings.Contains(err.Error(), "supersecret") || !strings.Contains(err.Error(), "withheld") {
 		t.Fatalf("remux error = %q", err)
 	}
@@ -489,7 +575,7 @@ func TestElementaryRelayTerminatesInputAfterSocketError(t *testing.T) {
 	supervisor := newTestSupervisor(t, "unused")
 	result := make(chan error, 1)
 	go func() {
-		_, relayErr := supervisor.relayConnection(context.Background(), plan, input)
+		_, relayErr := supervisor.relayConnection(context.Background(), plan, input, 1)
 		result <- relayErr
 	}()
 	select {
@@ -804,7 +890,7 @@ func TestSupervisorReportsRestartFailures(t *testing.T) {
 		}
 		return inputSession{}, errors.New("restart failed")
 	}
-	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession, uint64) (string, error) {
 		return "mpegts", errors.New("connection ended")
 	}
 	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
@@ -832,12 +918,76 @@ func TestSupervisorReportsRestartFailures(t *testing.T) {
 	}
 }
 
+func TestSupervisorRetainsIssueUntilMediaIsAccepted(t *testing.T) {
+	supervisor := newTestSupervisor(t, "unused")
+	supervisor.startFn = func(context.Context, string) (inputSession, error) {
+		return inputSession{wait: make(chan error)}, nil
+	}
+	var attempts atomic.Int32
+	supervisor.relayFn = func(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession, _ uint64) (string, error) {
+		if attempts.Add(1) == 1 {
+			return "unknown", rejectInput("srt.unsupported_payload", "unsupported test payload")
+		}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
+		ChannelID: "channel-1", Path: "studio-camera", Mode: channel.InputSRTPush,
+		Port: 10000, DestinationAddress: ":8890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	defer supervisor.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status := supervisor.Snapshot("channel-1")
+		if status.State == StateRunning && status.Restarts == 1 && status.Issue != nil {
+			if status.Issue.Code != "srt.unsupported_payload" || status.Issue.Source != "ingest" || status.Issue.Summary != "Input rejected" || status.Issue.Message != "unsupported test payload" || status.Issue.Occurrences != 1 {
+				t.Fatalf("input issue = %#v", status.Issue)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay status = %#v", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	supervisor.notifyInputStarted("channel-1", 2)
+	if status := supervisor.Snapshot("channel-1"); status.Issue == nil {
+		t.Fatal("issue cleared before MediaMTX accepted the input")
+	}
+	supervisor.ClearIssue("channel-1", 2)
+	if status := supervisor.Snapshot("channel-1"); status.Issue != nil {
+		t.Fatalf("input issue was not cleared: %#v", status.Issue)
+	}
+	process := supervisor.listeners["channel-1"]
+	process.setIssue(&reportedIssue{code: "newer", source: "gateway", summary: "Newer issue", message: "newer failure"}, 3)
+	supervisor.ClearIssue("channel-1", 2)
+	if status := supervisor.Snapshot("channel-1"); status.Issue == nil || status.Issue.Code != "newer" {
+		t.Fatalf("newer issue was cleared by older acceptance: %#v", status.Issue)
+	}
+	supervisor.ClearIssue("channel-1", 3)
+	if status := supervisor.Snapshot("channel-1"); status.Issue == nil || status.Issue.Code != "newer" {
+		t.Fatalf("same-attempt failure was cleared by delayed acceptance: %#v", status.Issue)
+	}
+	supervisor.ClearIssue("channel-1", 4)
+	if status := supervisor.Snapshot("channel-1"); status.Issue != nil {
+		t.Fatalf("previous-attempt issue was not cleared: %#v", status.Issue)
+	}
+}
+
 func TestSupervisorReportsSafeLocalPushListener(t *testing.T) {
 	supervisor := newTestSupervisor(t, "unused")
 	supervisor.startFn = func(context.Context, string) (inputSession, error) {
 		return inputSession{wait: make(chan error)}, nil
 	}
-	supervisor.relayFn = func(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession) (string, error) {
+	supervisor.relayFn = func(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession, _ uint64) (string, error) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	}
@@ -868,7 +1018,7 @@ func TestSupervisorBacksOffRepeatedPostLaunchExits(t *testing.T) {
 		starts.Add(1)
 		return inputSession{wait: wait}, nil
 	}
-	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession, uint64) (string, error) {
 		return "", errors.New("process exited")
 	}
 	plan, err := supervisor.Prepare(context.Background(), channel.SRTListener{
@@ -907,7 +1057,7 @@ func TestSnapshotDoesNotBlockWhileListenerIsStopping(t *testing.T) {
 	supervisor.startFn = func(context.Context, string) (inputSession, error) {
 		return inputSession{wait: wait}, nil
 	}
-	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession) (string, error) {
+	supervisor.relayFn = func(context.Context, channel.SRTIngestPlan, inputSession, uint64) (string, error) {
 		close(relayStarted)
 		<-releaseRelay
 		return "", nil
@@ -956,7 +1106,11 @@ func TestRestartDelayIsCapped(t *testing.T) {
 
 func newTestSupervisor(t *testing.T, srtExecutable string) *Supervisor {
 	t.Helper()
-	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), srtExecutable, "ffmpeg")
+	supervisor, err := New(slog.New(slog.NewTextHandler(io.Discard, nil)), srtExecutable, "ffmpeg", "rtmp://127.0.0.1:1935")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return supervisor
 }
 
 func containsArgumentPair(arguments []string, name, value string) bool {
@@ -977,7 +1131,7 @@ type recordingInputObserver struct {
 	started chan string
 }
 
-func (o *recordingInputObserver) SRTInputStarted(channelID string) {
+func (o *recordingInputObserver) SRTInputStarted(channelID string, _ uint64) {
 	o.started <- channelID
 }
 
@@ -1073,7 +1227,7 @@ func (timeoutError) Error() string   { return "timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
-func blockingRelay(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession) (string, error) {
+func blockingRelay(ctx context.Context, _ channel.SRTIngestPlan, _ inputSession, _ uint64) (string, error) {
 	<-ctx.Done()
 	return "", ctx.Err()
 }

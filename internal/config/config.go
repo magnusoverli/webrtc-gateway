@@ -15,6 +15,7 @@ type Config struct {
 	MediaMTXAPIURL  string
 	MediaMTXWHEPURL string
 	MediaMTXRTSPURL string
+	MediaMTXRTMPURL string
 	StatePath       string
 	EncoderThreads  int
 	WorkerCapacity  int
@@ -36,6 +37,7 @@ func Load() (Config, error) {
 		MediaMTXAPIURL:  envOrDefault("GATEWAY_MEDIAMTX_API_URL", "http://127.0.0.1:9997"),
 		MediaMTXWHEPURL: envOrDefault("GATEWAY_MEDIAMTX_WHEP_URL", "http://127.0.0.1:8889"),
 		MediaMTXRTSPURL: envOrDefault("GATEWAY_MEDIAMTX_RTSP_URL", "rtsp://127.0.0.1:8554"),
+		MediaMTXRTMPURL: envOrDefault("GATEWAY_MEDIAMTX_RTMP_URL", "rtmp://127.0.0.1:1935"),
 		StatePath:       envOrDefault("GATEWAY_STATE_PATH", "gateway.db"),
 		EncoderThreads:  encoderThreads,
 		WorkerCapacity:  workerCapacity,
@@ -55,6 +57,7 @@ func Load() (Config, error) {
 		"GATEWAY_MEDIAMTX_API_URL":  cfg.MediaMTXAPIURL,
 		"GATEWAY_MEDIAMTX_WHEP_URL": cfg.MediaMTXWHEPURL,
 		"GATEWAY_MEDIAMTX_RTSP_URL": cfg.MediaMTXRTSPURL,
+		"GATEWAY_MEDIAMTX_RTMP_URL": cfg.MediaMTXRTMPURL,
 	} {
 		parsed, err := url.Parse(value)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {

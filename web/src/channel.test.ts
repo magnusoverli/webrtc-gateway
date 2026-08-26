@@ -56,6 +56,7 @@ const baseChannel: Channel = {
   tracks: [],
   outputReady: false,
   outputTracks: [],
+  issues: [],
   compatibility: {
     state: "offline",
     mode: "direct",
@@ -274,6 +275,13 @@ describe("channelStateLabel", () => {
     expect(channelStateLabel({ ...baseChannel, applyState: "error" })).toBe("Configuration error");
     expect(channelStateLabel({ ...baseChannel, applyState: "pending" })).toBe("Applying configuration");
     expect(channelStateLabel({ ...baseChannel, applyState: "deleting" })).toBe("Deletion pending");
+    const rejected = { ...baseChannel, issues: [{
+      code: "srt.unsupported_payload", source: "ingest", severity: "error" as const,
+      summary: "Input rejected", message: "Unsupported payload", firstSeenAt: "2026-08-26T10:46:42Z",
+      lastSeenAt: "2026-08-26T10:46:42Z", occurrences: 1,
+    }] };
+    expect(channelStateLabel(rejected)).toBe("Input rejected");
+    expect(channelHasFault(rejected)).toBe(true);
     expect(channelStateLabel({ ...baseChannel, relay: { state: "retrying", restarts: 2, lastError: "bind failed", listenerActive: false } })).toBe("Listener error");
     expect(channelHasFault({ ...baseChannel, relay: { state: "retrying", restarts: 2, listenerActive: false } })).toBe(true);
     expect(channelHasFault({ ...baseChannel, enabled: false, relay: { state: "stopped", restarts: 0, listenerActive: false } })).toBe(false);
@@ -338,6 +346,7 @@ function runtimeFor(channel: Channel, overrides: Partial<ChannelRuntime> = {}): 
     outputTracks: channel.outputTracks,
     compatibility: channel.compatibility,
     relay: channel.relay,
+    issues: channel.issues,
     ...overrides,
   };
 }

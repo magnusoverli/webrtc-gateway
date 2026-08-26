@@ -63,14 +63,19 @@ func main() {
 		logger.Error("configure management listener", "error", err)
 		os.Exit(1)
 	}
-	relaySupervisor := srtrelay.New(logger, "srt-live-transmit", "ffmpeg")
+	relaySupervisor, err := srtrelay.New(logger, "srt-live-transmit", "ffmpeg", cfg.MediaMTXRTMPURL)
+	if err != nil {
+		logger.Error("create SRT relay supervisor", "error", err)
+		os.Exit(1)
+	}
 	defer relaySupervisor.Close()
 	control := controlplane.NewCoordinator()
 	channelService := channel.NewService(channelStore, mediaClient, settingsStore, relaySupervisor, control)
 	settingsService := settings.NewService(settingsStore, mediaClient, channelService, control)
 	compatibilityManager, err := compatibility.New(compatibility.Options{
 		Logger: logger, Channels: channelService, MediaMTX: mediaClient,
-		MediaRTSPURL: cfg.MediaMTXRTSPURL, EncoderThreads: cfg.EncoderThreads,
+		InputAccepted: relaySupervisor.ClearIssue,
+		MediaRTSPURL:  cfg.MediaMTXRTSPURL, EncoderThreads: cfg.EncoderThreads,
 		WorkerCapacity: cfg.WorkerCapacity,
 	})
 	if err != nil {

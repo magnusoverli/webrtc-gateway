@@ -266,6 +266,39 @@ func TestClassifyTracksProbesDirectVideoButNotAudioOnly(t *testing.T) {
 	}
 }
 
+func TestClassifyTracksSkipsProbeForVP9ProfileZero(t *testing.T) {
+	called := false
+	result, err := classifyTracks(context.Background(), []mediamtx.Track{
+		{Codec: "VP9", CodecProps: map[string]any{"profile": float64(0)}},
+		{Codec: "Opus"},
+	}, func(context.Context) (videoCharacteristics, error) {
+		called = true
+		return videoCharacteristics{}, errors.New("unexpected probe")
+	})
+	if err != nil || result.required || called {
+		t.Fatalf("classification = %#v, %v; probe called = %v", result, err, called)
+	}
+}
+
+func TestClassifyTracksProbesVP9WithoutProfileZero(t *testing.T) {
+	for name, properties := range map[string]map[string]any{
+		"missing":     nil,
+		"profile one": {"profile": float64(1)},
+		"malformed":   {"profile": "unknown"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			result, err := classifyTracks(context.Background(), []mediamtx.Track{{Codec: "VP9", CodecProps: properties}}, func(context.Context) (videoCharacteristics, error) {
+				calls++
+				return progressiveVideo("vp9", "yuv420p", 1920, 1080), nil
+			})
+			if err != nil || result.required || calls != 1 {
+				t.Fatalf("classification = %#v, %v; probe calls = %d", result, err, calls)
+			}
+		})
+	}
+}
+
 func TestFFmpegArgsPreserveCadenceAndForceKeyframes(t *testing.T) {
 	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", decision{transcodeVideo: true, videoWidth: 1920, videoHeight: 1080}, 8)
 	if !containsPair(args, "-fps_mode:v", "passthrough") {
@@ -944,6 +977,7 @@ func TestNextIntervalUsesEventsDeadlinesAndFallback(t *testing.T) {
 
 func TestSRTInputStartedWakesWithFreshStatus(t *testing.T) {
 	configured := srtChannel("channel", "raw")
+	accepted := make(chan string, 1)
 	media := &wakeMediaManager{
 		status:      mediamtx.Status{Channels: []mediamtx.Channel{{Name: "raw"}}},
 		freshStatus: mediamtx.Status{Channels: []mediamtx.Channel{srtRuntime("generation-a", []mediamtx.Track{{Codec: "Opus"}})}},
@@ -953,7 +987,8 @@ func TestSRTInputStartedWakesWithFreshStatus(t *testing.T) {
 	manager, err := New(Options{
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Channels: reconcileChannelReader{items: []channel.Channel{configured}}, MediaMTX: media,
-		MediaRTSPURL: "rtsp://127.0.0.1:8554", Interval: time.Hour, ActiveInterval: 10 * time.Millisecond,
+		InputAccepted: func(channelID string, _ uint64) { accepted <- channelID },
+		MediaRTSPURL:  "rtsp://127.0.0.1:8554", Interval: time.Hour, ActiveInterval: 10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -966,7 +1001,7 @@ func TestSRTInputStartedWakesWithFreshStatus(t *testing.T) {
 	}()
 	waitClosed(t, media.statusCalls, "initial cached status")
 
-	manager.SRTInputStarted(configured.ID)
+	manager.SRTInputStarted(configured.ID, 1)
 	waitClosed(t, media.freshCalls, "fresh status after SRT input")
 	waitForState(t, manager, configured.ID, func(state State) bool {
 		return state.State == StateReady && state.Mode == ModeDirect
@@ -977,10 +1012,18 @@ func TestSRTInputStartedWakesWithFreshStatus(t *testing.T) {
 	if discovering {
 		t.Fatal("input discovery remained active after MediaMTX reported the path online")
 	}
+	select {
+	case channelID := <-accepted:
+		if channelID != configured.ID {
+			t.Fatalf("accepted channel = %q", channelID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted input was not reported")
+	}
 
 	cancel()
 	waitClosed(t, runDone, "manager run")
-	manager.SRTInputStarted(configured.ID)
+	manager.SRTInputStarted(configured.ID, 2)
 	assertNoSignal(t, media.freshCalls, "fresh status requested after manager close")
 }
 
@@ -1001,7 +1044,7 @@ func TestInputDiscoveryWaitsForNewSourceFingerprint(t *testing.T) {
 			state: State{State: StateReady, Mode: ModeDirect},
 		}},
 		discovering: map[string]inputDiscovery{configured.ID: {
-			deadline: time.Now().Add(time.Second), previousFingerprint: fingerprint(oldRuntime),
+			deadline: time.Now().Add(-time.Second), previousFingerprint: fingerprint(oldRuntime),
 		}},
 	}
 

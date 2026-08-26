@@ -41,6 +41,8 @@ describe("DiagnosticsDialog", () => {
     expect(screen.getByText("FFmpeg exited with status 1")).toBeDefined();
     expect(screen.getByText("192.0.2.20:10000")).toBeDefined();
     expect(screen.getByText("H264 has B-frames")).toBeDefined();
+    expect(screen.getByText("Unsupported payload")).toBeDefined();
+    expect(screen.getByText("srt.unsupported_payload")).toBeDefined();
     const readers = screen.getByText("Active readers", { selector: "summary" }).closest("details");
     expect(readers).not.toBeNull();
     expect(within(readers as HTMLElement).getByText("reader-with-a-very-long-id")).toBeDefined();
@@ -119,7 +121,7 @@ function diagnostics() {
       reachable: true,
       version: "1.20.1",
       started: "2026-08-25T08:01:00Z",
-      activeListeners: { srt: ":8890", webRTCUDP: ":8189", webRTCTCP: ":8189" },
+      activeListeners: { srt: ":8890", webRTCUDP: ":8189", webRTCTCP: ":8189", rtmp: "127.0.0.1:1935" },
     },
     settings: { revision: 4, applyState: "applied", updatedAt: "2026-08-25T08:02:00Z" },
     resources: {
@@ -156,6 +158,11 @@ function diagnostics() {
         readers: [{ type: "whepSession", id: "reader-with-a-very-long-id" }],
       },
       outputReady: true,
+      issues: [{
+        code: "srt.unsupported_payload", source: "ingest", severity: "error", summary: "Input rejected",
+        message: "Unsupported payload", firstSeenAt: "2026-08-25T08:05:00Z",
+        lastSeenAt: "2026-08-25T08:05:01Z", occurrences: 2,
+      }],
       relay: {
         state: "running", restarts: 2, listenerAddress: "192.0.2.20:10000", listenerActive: true,
       },
