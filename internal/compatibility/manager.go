@@ -61,12 +61,19 @@ type State struct {
 	OutputPath       string         `json:"-"`
 	InputFingerprint string         `json:"-"`
 	InputVideo       *VideoMetadata `json:"-"`
+	InputAudio       *AudioMetadata `json:"-"`
+	OutputAudio      *AudioMetadata `json:"-"`
 }
 
 type VideoMetadata struct {
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
 	FrameRate string `json:"frameRate,omitempty"`
+}
+
+type AudioMetadata struct {
+	SampleRate   int
+	ChannelCount int
 }
 
 type ChannelReader interface {
@@ -106,6 +113,7 @@ type Manager struct {
 	encoderThreads int
 	workerCapacity int
 	probeVideo     func(context.Context, string) (videoCharacteristics, error)
+	probeAudio     func(context.Context, string) (*AudioMetadata, error)
 	startCommand   func(*exec.Cmd) error
 	inputAccepted  func(string, uint64)
 	now            func() time.Time
@@ -140,6 +148,8 @@ type entry struct {
 	classified         bool
 	decision           decision
 	inputVideo         *VideoMetadata
+	inputAudio         *AudioMetadata
+	outputAudio        *AudioMetadata
 	state              State
 	worker             *worker
 	retryAt            time.Time
@@ -254,6 +264,14 @@ func (m *Manager) Snapshot(channelID string) State {
 	if item.inputVideo != nil {
 		metadata := *item.inputVideo
 		result.InputVideo = &metadata
+	}
+	if item.inputAudio != nil {
+		metadata := *item.inputAudio
+		result.InputAudio = &metadata
+	}
+	if item.outputAudio != nil {
+		metadata := *item.outputAudio
+		result.OutputAudio = &metadata
 	}
 	return result
 }
@@ -563,6 +581,8 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 		current.classified = false
 		current.decision = decision{}
 		current.inputVideo = nil
+		current.inputAudio = nil
+		current.outputAudio = nil
 		current.retryAt = time.Time{}
 		current.outputResetPending = byPath[compatPath].Name != ""
 		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
@@ -634,7 +654,9 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 		expectedVideoCodec = ""
 	}
 	var characteristics videoCharacteristics
-	metadataOnly := normalizeCodec(expectedVideoCodec) == "vp9" && expectedVideoProfile == "0"
+	probeVideoMetadata := normalizeCodec(expectedVideoCodec) == "vp9" && expectedVideoProfile == "0"
+	inputAudio := audioMetadataFromTracks(tracks)
+	probeAudioMetadata := firstAudioTrack(tracks) && inputAudio == nil
 	result, err := classifyTracks(task.ctx, tracks, func(ctx context.Context) (videoCharacteristics, error) {
 		if m.probeVideo != nil {
 			var err error
@@ -664,9 +686,12 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	}
 	current.classified = true
 	current.decision = result
-	if metadataOnly {
+	current.inputAudio = inputAudio
+	current.outputAudio = outputAudioMetadata(result, inputAudio)
+	if probeVideoMetadata || probeAudioMetadata {
 		current.metadataProbe = task
-	} else {
+	}
+	if !probeVideoMetadata {
 		current.inputVideo = videoMetadata(characteristics)
 	}
 	current.retryAt = time.Time{}
@@ -681,13 +706,31 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	}
 	m.mu.Unlock()
 	m.notify()
-	if metadataOnly {
-		m.runInputVideoMetadata(channelID, probeURL, fingerprint, task)
+	if probeVideoMetadata || probeAudioMetadata {
+		m.runInputMetadata(channelID, probeURL, fingerprint, task, probeVideoMetadata, probeAudioMetadata, result)
 	}
 }
 
-func (m *Manager) runInputVideoMetadata(channelID, probeURL, fingerprint string, task *probeTask) {
-	characteristics, err := m.probeVideoStreamMetadata(task.ctx, probeURL)
+func (m *Manager) runInputMetadata(channelID, probeURL, fingerprint string, task *probeTask, probeVideo, probeAudio bool, result decision) {
+	var inputVideo *VideoMetadata
+	if probeVideo {
+		characteristics, err := m.probeVideoStreamMetadata(task.ctx, probeURL)
+		if err == nil {
+			inputVideo = videoMetadata(characteristics)
+		}
+	}
+	var inputAudio *AudioMetadata
+	if probeAudio && task.ctx.Err() == nil {
+		var err error
+		if m.probeAudio != nil {
+			inputAudio, err = m.probeAudio(task.ctx, probeURL)
+		} else {
+			inputAudio, err = m.probeAudioStreamMetadata(task.ctx, probeURL)
+		}
+		if err != nil {
+			inputAudio = nil
+		}
+	}
 	m.mu.Lock()
 	current := m.entries[channelID]
 	if current == nil || current.generation != task.generation || current.fingerprint != fingerprint || current.metadataProbe != task || task.ctx.Err() != nil {
@@ -695,8 +738,12 @@ func (m *Manager) runInputVideoMetadata(channelID, probeURL, fingerprint string,
 		return
 	}
 	current.metadataProbe = nil
-	if err == nil {
-		current.inputVideo = videoMetadata(characteristics)
+	if inputVideo != nil {
+		current.inputVideo = inputVideo
+	}
+	if inputAudio != nil {
+		current.inputAudio = inputAudio
+		current.outputAudio = outputAudioMetadata(result, inputAudio)
 	}
 	m.mu.Unlock()
 	m.notify()
@@ -963,6 +1010,8 @@ func (m *Manager) setInactive(channelID, path, state string) {
 	current.outputResetPending = false
 	current.classified = false
 	current.inputVideo = nil
+	current.inputAudio = nil
+	current.outputAudio = nil
 	current.retryAt = time.Time{}
 	current.state = State{State: state, Mode: ModeDirect, Reasons: []string{}, OutputPath: path}
 }
@@ -975,6 +1024,8 @@ func (m *Manager) setDirect(channelID, path, fingerprint string, result decision
 		m.nextGeneration++
 		current.generation = m.nextGeneration
 		current.inputVideo = nil
+		current.inputAudio = nil
+		current.outputAudio = nil
 	}
 	cancelProbeLocked(current)
 	stopWorkerLocked(current)
@@ -1212,6 +1263,21 @@ func (m *Manager) probeVideoStreamMetadata(ctx context.Context, sourceURL string
 	return parseVideoStreamMetadata(output)
 }
 
+func (m *Manager) probeAudioStreamMetadata(ctx context.Context, sourceURL string) (*AudioMetadata, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, videoInspectionLimit)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, m.ffprobe,
+		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "a:0",
+		"-show_entries", "stream=sample_rate,channels",
+		"-of", "json", sourceURL,
+	)
+	output, err := ffprobeOutput(probeCtx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	return parseAudioStreamMetadata(output)
+}
+
 func ffprobeOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -1347,6 +1413,26 @@ func parseVideoStreamMetadata(data []byte) (videoCharacteristics, error) {
 	}, nil
 }
 
+func parseAudioStreamMetadata(data []byte) (*AudioMetadata, error) {
+	var output struct {
+		Streams []struct {
+			SampleRate ffprobeInteger `json:"sample_rate"`
+			Channels   ffprobeInteger `json:"channels"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(data, &output); err != nil {
+		return nil, fmt.Errorf("decode ffprobe audio stream metadata JSON: %w", err)
+	}
+	if len(output.Streams) != 1 {
+		return nil, fmt.Errorf("ffprobe returned %d audio streams", len(output.Streams))
+	}
+	stream := output.Streams[0]
+	if !stream.SampleRate.set || stream.SampleRate.value <= 0 || !stream.Channels.set || stream.Channels.value <= 0 {
+		return nil, errors.New("ffprobe did not return complete audio stream metadata")
+	}
+	return &AudioMetadata{SampleRate: stream.SampleRate.value, ChannelCount: stream.Channels.value}, nil
+}
+
 func parseVideoCharacteristics(data []byte) (videoCharacteristics, error) {
 	var output struct {
 		Streams []struct {
@@ -1470,6 +1556,50 @@ func videoMetadata(characteristics videoCharacteristics) *VideoMetadata {
 		return nil
 	}
 	return &VideoMetadata{Width: characteristics.width, Height: characteristics.height, FrameRate: characteristics.frameRate}
+}
+
+func audioMetadataFromTracks(tracks []mediamtx.Track) *AudioMetadata {
+	for _, track := range tracks {
+		if !isAudioCodec(normalizeCodec(track.Codec)) {
+			continue
+		}
+		sampleRate := positiveIntProperty(track.CodecProps, "sampleRate")
+		channelCount := positiveIntProperty(track.CodecProps, "channelCount")
+		if sampleRate > 0 && channelCount > 0 {
+			return &AudioMetadata{SampleRate: sampleRate, ChannelCount: channelCount}
+		}
+		return nil
+	}
+	return nil
+}
+
+func outputAudioMetadata(result decision, input *AudioMetadata) *AudioMetadata {
+	if result.transcodeAudio {
+		return &AudioMetadata{SampleRate: 48000, ChannelCount: 2}
+	}
+	if input == nil {
+		return nil
+	}
+	metadata := *input
+	return &metadata
+}
+
+func firstAudioTrack(tracks []mediamtx.Track) bool {
+	for _, track := range tracks {
+		if isAudioCodec(normalizeCodec(track.Codec)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isAudioCodec(codec string) bool {
+	switch codec {
+	case "opus", "g722", "g711", "pcma", "pcmu", "aac", "mpeg4audio", "mp3", "mpeg12audio", "ac3", "eac3", "vorbis", "flac", "lpcm":
+		return true
+	default:
+		return false
+	}
 }
 
 func fieldOrderDescription(characteristics videoCharacteristics) string {

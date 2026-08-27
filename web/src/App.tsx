@@ -1192,7 +1192,7 @@ function Dashboard() {
                     <StreamFact label="Delivered total" value={formatBytes(selected.outboundBytes)} />
                     <StreamFact label="Preview transport" help="ICE network path used by this browser's dashboard preview, such as UDP or TCP." value={preview.stats?.icePath ?? (selected.automaticPreview ? "Gathering" : "Preview disabled")} />
                   </div>
-                  <MediaTracks direction="output" tracks={selected.outputTracks} previewStats={preview.stats} />
+                  <MediaTracks direction="output" tracks={selected.outputTracks} inputVideo={selected.inputVideo} previewStats={preview.stats} />
                 </> : <StreamIdle title="No active output" detail={hasInput ? "The input is connected while browser-compatible output is being prepared." : "Output statistics will appear after an input stream is detected."} />}
                 {selected.tracks.length > 0 && <div className={selected.compatibility.state === "error" ? "compatibility warning" : "compatibility compatible"}>
                   <span>{compatibilityTitle(selected)}</span>
@@ -2164,7 +2164,7 @@ function MediaTracks({ direction, tracks, inputVideo, previewStats }: {
               track={track}
               kind={group.kind}
               direction={direction}
-              frameRate={direction === "input" ? frameRateValue(inputVideo?.frameRate) : previewStats?.video?.framesPerSecond}
+              frameRate={previewStats?.video?.framesPerSecond || frameRateValue(inputVideo?.frameRate)}
             />
           ))}
         </section>

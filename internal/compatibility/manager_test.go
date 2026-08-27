@@ -46,7 +46,8 @@ func TestClassifyTracksConvertsOnlyIncompatibleTracks(t *testing.T) {
 	}
 
 	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", result, 8)
-	if !containsPair(args, "-c:v", "copy") || !containsPair(args, "-c:a", "libopus") {
+	if !containsPair(args, "-c:v", "copy") || !containsPair(args, "-c:a", "libopus") ||
+		!containsPair(args, "-ar", "48000") || !containsPair(args, "-ac", "2") {
 		t.Fatalf("FFmpeg args = %#v", args)
 	}
 	if !containsPair(args, "-fflags", "nobuffer") || !containsPair(args, "-flags", "low_delay") || !containsPair(args, "-max_delay", "0") {
@@ -169,6 +170,23 @@ func TestParseVideoStreamMetadataUsesAverageThenNominalFrameRate(t *testing.T) {
 				t.Fatalf("parseVideoStreamMetadata() = %#v, %v; frame rate want %q", got, err, test.want)
 			}
 		})
+	}
+}
+
+func TestParseAudioStreamMetadata(t *testing.T) {
+	got, err := parseAudioStreamMetadata([]byte(`{"streams":[{"sample_rate":"44100","channels":1}]}`))
+	want := &AudioMetadata{SampleRate: 44100, ChannelCount: 1}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseAudioStreamMetadata() = %#v, %v; want %#v", got, err, want)
+	}
+	for _, input := range []string{
+		`not json`, `{"streams":[]}`, `{"streams":[{},{}]}`,
+		`{"streams":[{"sample_rate":"N/A","channels":2}]}`,
+		`{"streams":[{"sample_rate":"48000","channels":0}]}`,
+	} {
+		if result, err := parseAudioStreamMetadata([]byte(input)); err == nil {
+			t.Fatalf("parseAudioStreamMetadata(%q) = %#v, nil", input, result)
+		}
 	}
 }
 
@@ -618,6 +636,30 @@ func TestMetadataReadyProbesImmediately(t *testing.T) {
 	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
 	if got := manager.Snapshot(configured.ID).InputVideo; got == nil || got.Width != 1280 || got.Height != 720 || got.FrameRate != "24000/1001" {
 		t.Fatalf("input video metadata = %#v", got)
+	}
+}
+
+func TestAudioMetadataProbeCapturesInputAndConvertedOutput(t *testing.T) {
+	clock := newTestClock()
+	manager := newProbeTestManager(t, clock, func(_ context.Context, _ string) (videoCharacteristics, error) {
+		return progressiveVideo("h264", "yuv420p", 1920, 1080), nil
+	})
+	manager.probeAudio = func(context.Context, string) (*AudioMetadata, error) {
+		return &AudioMetadata{SampleRate: 44100, ChannelCount: 1}, nil
+	}
+	t.Cleanup(manager.Close)
+	configured := srtChannel("channel", "raw")
+	runtime := srtRuntime("generation-a", []mediamtx.Track{
+		{Codec: "H264", CodecProps: map[string]any{"width": 1920, "height": 1080, "profile": "Baseline"}},
+		{Codec: "MPEG-1/2 Audio"},
+	})
+
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": runtime})
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.InputAudio != nil })
+	state := manager.Snapshot(configured.ID)
+	if !reflect.DeepEqual(state.InputAudio, &AudioMetadata{SampleRate: 44100, ChannelCount: 1}) ||
+		!reflect.DeepEqual(state.OutputAudio, &AudioMetadata{SampleRate: 48000, ChannelCount: 2}) {
+		t.Fatalf("audio metadata = input %#v, output %#v", state.InputAudio, state.OutputAudio)
 	}
 }
 
@@ -1783,6 +1825,7 @@ func newProbeTestManager(t *testing.T, clock *testClock, probe func(context.Cont
 	return &Manager{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)), rtspURL: rtspURL,
 		entries: make(map[string]*entry), workerCapacity: 1, now: clock.Now, probeVideo: probe,
+		probeAudio: func(context.Context, string) (*AudioMetadata, error) { return nil, nil },
 	}
 }
 

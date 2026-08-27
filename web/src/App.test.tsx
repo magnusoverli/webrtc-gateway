@@ -208,14 +208,20 @@ describe("dashboard navigation", () => {
       ...channelWithMode("srt-push"),
       available: true,
       online: true,
-      tracks: [{ codec: "H264" }],
+      tracks: [{ codec: "H264" }, { codec: "MPEG-1/2 Audio", codecProps: { sampleRate: 44100, channelCount: 1 } }],
       inputVideo: { width: 1920, height: 1080, frameRate: "60000/1001" },
+      outputReady: true,
+      outputTracks: [{ codec: "H264" }, { codec: "Opus", codecProps: { sampleRate: 48000, channelCount: 2 } }],
     };
     window.history.replaceState(null, "", `/?channel=${item.id}`);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(statusWith([item]))));
     render(<App />);
 
-    expect(await screen.findByText("59.9 fps", { selector: ".media-fact strong" })).toBeDefined();
+    expect(await screen.findAllByText("59.9 fps", { selector: ".media-fact strong" })).toHaveLength(2);
+    expect(screen.getByText("44.1 kHz", { selector: ".media-fact strong" })).toBeDefined();
+    expect(screen.getByText("1 · mono", { selector: ".media-fact strong" })).toBeDefined();
+    expect(screen.getByText("48 kHz", { selector: ".media-fact strong" })).toBeDefined();
+    expect(screen.getByText("2 · stereo", { selector: ".media-fact strong" })).toBeDefined();
   });
 
   it("uses compact runtime polling after the full snapshot", async () => {

@@ -519,12 +519,16 @@ func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
 	router := &fakeCompatibility{state: compatibility.State{
 		State: compatibility.StateReady, Mode: compatibility.ModeTranscoded,
 		OutputPath: "compat-channel-1", Reasons: []string{},
-		InputVideo: &compatibility.VideoMetadata{Width: 1920, Height: 1080, FrameRate: "24000/1001"},
+		InputVideo:  &compatibility.VideoMetadata{Width: 1920, Height: 1080, FrameRate: "24000/1001"},
+		InputAudio:  &compatibility.AudioMetadata{SampleRate: 44100, ChannelCount: 1},
+		OutputAudio: &compatibility.AudioMetadata{SampleRate: 48000, ChannelCount: 2},
 	}}
 	handler := newTestHandlerWithCompatibility(t, fakeMediaMTX{status: mediamtx.Status{
 		Channels: []mediamtx.Channel{
-			{Name: "demo", Available: true, Online: true, AvailableTime: &inputTime, InboundBytes: 1000},
-			{Name: "compat-channel-1", Available: true, Online: true, AvailableTime: &outputTime, InboundBytes: 700, OutboundBytes: 1400},
+			{Name: "demo", Available: true, Online: true, AvailableTime: &inputTime, InboundBytes: 1000,
+				Tracks: []mediamtx.Track{{Codec: "H264"}, {Codec: "MPEG-1/2 Audio"}}},
+			{Name: "compat-channel-1", Available: true, Online: true, AvailableTime: &outputTime, InboundBytes: 700, OutboundBytes: 1400,
+				Tracks: []mediamtx.Track{{Codec: "H264"}, {Codec: "Opus", CodecProps: map[string]any{"channelCount": float64(2)}}}},
 		},
 	}}, channels, "http://127.0.0.1:1", router)
 
@@ -535,8 +539,16 @@ func TestStatusExposesDistinctInputOutputAndDeliveryCounters(t *testing.T) {
 		!strings.Contains(body, `"outputInboundBytes":700`) ||
 		!strings.Contains(body, `"outputAvailableTime":"2026-08-23T20:00:01Z"`) ||
 		!strings.Contains(body, `"outboundBytes":1400`) ||
-		!strings.Contains(body, `"inputVideo":{"width":1920,"height":1080,"frameRate":"24000/1001"}`) {
+		!strings.Contains(body, `"inputVideo":{"width":1920,"height":1080,"frameRate":"24000/1001"}`) ||
+		!strings.Contains(body, `{"codec":"MPEG-1/2 Audio","codecProps":{"channelCount":1,"sampleRate":44100}}`) ||
+		!strings.Contains(body, `{"codec":"Opus","codecProps":{"channelCount":2,"sampleRate":48000}}`) {
 		t.Fatalf("response = %d %s", res.Code, body)
+	}
+	runtime := httptest.NewRecorder()
+	handler.ServeHTTP(runtime, httptest.NewRequest(http.MethodGet, "/api/v1/status/runtime", nil))
+	if runtime.Code != http.StatusOK || !strings.Contains(runtime.Body.String(), `"sampleRate":44100`) ||
+		!strings.Contains(runtime.Body.String(), `"sampleRate":48000`) {
+		t.Fatalf("runtime response = %d %s", runtime.Code, runtime.Body.String())
 	}
 }
 

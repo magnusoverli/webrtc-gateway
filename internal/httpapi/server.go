@@ -1861,7 +1861,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		outputAvailableTime = output.AvailableTime
 		outboundBytes = output.OutboundBytes
 		readers = output.Readers
-		outputTracks = output.Tracks
+		outputTracks = enrichAudioTrack(output.Tracks, compatibilityState.OutputAudio)
 	}
 	view := channelResponse{
 		ID:                   item.ID,
@@ -1892,7 +1892,7 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		InboundFramesInError: runtime.InboundFramesInError,
 		Source:               runtime.Source,
 		Readers:              readers,
-		Tracks:               runtime.Tracks,
+		Tracks:               enrichAudioTrack(runtime.Tracks, compatibilityState.InputAudio),
 		InputVideo:           compatibilityState.InputVideo,
 		OutputReady:          outputReady,
 		OutputTracks:         outputTracks,
@@ -1912,6 +1912,55 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		view.Compatibility.Reasons = []string{}
 	}
 	return view
+}
+
+func enrichAudioTrack(tracks []mediamtx.Track, metadata *compatibility.AudioMetadata) []mediamtx.Track {
+	if metadata == nil {
+		return tracks
+	}
+	result := append([]mediamtx.Track(nil), tracks...)
+	for index, track := range result {
+		if !audioCodec(track.Codec) {
+			continue
+		}
+		properties := make(map[string]any, len(track.CodecProps)+2)
+		for name, value := range track.CodecProps {
+			properties[name] = value
+		}
+		if positiveTrackProperty(properties["sampleRate"]) == 0 {
+			properties["sampleRate"] = metadata.SampleRate
+		}
+		if positiveTrackProperty(properties["channelCount"]) == 0 {
+			properties["channelCount"] = metadata.ChannelCount
+		}
+		result[index].CodecProps = properties
+		break
+	}
+	return result
+}
+
+func audioCodec(value string) bool {
+	codec := strings.NewReplacer(" ", "", "-", "", "_", "", "/", "").Replace(strings.ToLower(value))
+	switch codec {
+	case "opus", "g722", "g711", "pcma", "pcmu", "aac", "mpeg4audio", "mp3", "mpeg12audio", "ac3", "eac3", "vorbis", "flac", "lpcm":
+		return true
+	default:
+		return false
+	}
+}
+
+func positiveTrackProperty(value any) int {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return typed
+		}
+	case float64:
+		if typed > 0 && typed == float64(int(typed)) {
+			return int(typed)
+		}
+	}
+	return 0
 }
 
 func runtimeChannels(channels []channelResponse) []runtimeChannelResponse {
