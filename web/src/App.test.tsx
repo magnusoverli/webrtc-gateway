@@ -61,6 +61,7 @@ function statusWith(channels: Channel[], overrides: { settings?: Record<string, 
     settings: {
       revision: 2,
       managementBindAddress: "*",
+      managementPort: 8080,
       mediaBindAddress: "*",
       logLevel: "info",
       readTimeout: "5s",
@@ -200,6 +201,21 @@ describe("dashboard navigation", () => {
 
     expect(await screen.findByText("Matroska header is invalid")).toBeDefined();
     expect(screen.getByText("Input rejected", { selector: ".state-pill" })).toBeDefined();
+  });
+
+  it("shows nominal input frame rate when track properties omit it", async () => {
+    const item = {
+      ...channelWithMode("srt-push"),
+      available: true,
+      online: true,
+      tracks: [{ codec: "H264" }],
+      inputVideo: { width: 1920, height: 1080, frameRate: "60000/1001" },
+    };
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(statusWith([item]))));
+    render(<App />);
+
+    expect(await screen.findByText("59.9 fps", { selector: ".media-fact strong" })).toBeDefined();
   });
 
   it("uses compact runtime polling after the full snapshot", async () => {

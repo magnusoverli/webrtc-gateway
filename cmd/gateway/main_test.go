@@ -16,6 +16,16 @@ func TestManagementListenerUsesSavedBindingWithPortFromEnvironment(t *testing.T)
 	}
 }
 
+func TestManagementListenerUsesSavedPort(t *testing.T) {
+	address, active, port, locked, err := managementListenerDesired(":8080", "127.0.0.1", 9090, networkbind.Interfaces)
+	if err != nil {
+		t.Fatalf("managementListenerDesired() error = %v", err)
+	}
+	if address != "127.0.0.1:9090" || active != "127.0.0.1" || port != 9090 || locked {
+		t.Fatalf("managementListenerDesired() = %q, %q, %d, %t", address, active, port, locked)
+	}
+}
+
 func TestManagementListenerFollowsSavedInterface(t *testing.T) {
 	address, active, port, locked, err := managementListenerWithInterfaces(
 		":8080",

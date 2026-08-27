@@ -488,7 +488,8 @@ export function srtPublishURL(path: string, listenerAddress: string | undefined,
 
 export function managementOrigin(managementBindAddress: string, port: number | undefined, location: BrowserLocation) {
   if (!managementBindAddress || managementBindAddress === "*" || managementBindAddress === "custom") {
-    return location.origin;
+    if (!port) return location.origin;
+    return `${location.protocol}//${urlHost(location.hostname)}:${port}`;
   }
   const portSuffix = port ? `:${port}` : "";
   return `${location.protocol}//${urlHost(managementBindAddress)}${portSuffix}`;

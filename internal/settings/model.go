@@ -26,6 +26,7 @@ var ErrRevisionConflict = errors.New("settings revision conflict")
 type Settings struct {
 	Revision                 int        `json:"revision"`
 	ManagementBindAddress    string     `json:"managementBindAddress"`
+	ManagementPort           int        `json:"managementPort"`
 	MediaBindAddress         string     `json:"mediaBindAddress"`
 	LogLevel                 string     `json:"logLevel"`
 	ReadTimeout              string     `json:"readTimeout"`
@@ -53,6 +54,7 @@ func Defaults(now time.Time) Settings {
 	return Settings{
 		Revision:                 1,
 		ManagementBindAddress:    networkbind.All,
+		ManagementPort:           8080,
 		MediaBindAddress:         networkbind.All,
 		LogLevel:                 "info",
 		ReadTimeout:              "5s",
@@ -87,6 +89,9 @@ func Validate(value Settings, now time.Time) (Settings, error) {
 	}
 	value.ManagementBindAddress = managementBind
 	value.MediaBindAddress = mediaBind
+	if value.ManagementPort < 1 || value.ManagementPort > 65535 {
+		return Settings{}, invalid("managementPort must be between 1 and 65535")
+	}
 
 	value.LogLevel = strings.ToLower(strings.TrimSpace(value.LogLevel))
 	switch value.LogLevel {

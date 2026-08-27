@@ -3,6 +3,7 @@ export type StatsSample = {
   bytesReceived: number;
   videoBytesReceived: number;
   audioBytesReceived: number;
+  videoFramesDecoded: number;
 };
 
 export type ReceiverStats = {
@@ -78,6 +79,7 @@ export function summarizeRTCStats(report: RTCStatsReport, previous?: StatsSample
   const bytesReceived = inbound.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
   const videoBytesReceived = videoEntries.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
   const audioBytesReceived = audioEntries.reduce((total, entry) => total + numberValue(entry.bytesReceived), 0);
+  const videoFramesDecoded = videoEntries.reduce((total, entry) => total + numberValue(entry.framesDecoded), 0);
   const reportedTimestamp = Math.max(0, ...inbound.map((entry) => numberValue(entry.timestamp)));
   const timestamp = reportedTimestamp || performance.now();
   const elapsedMs = previous ? timestamp - previous.timestamp : 0;
@@ -99,7 +101,7 @@ export function summarizeRTCStats(report: RTCStatsReport, previous?: StatsSample
       bitrateBps,
       video: video ? {
         ...receiverStats(videoEntries, entries, previous?.videoBytesReceived, videoBytesReceived, elapsedMs),
-        framesPerSecond: numberValue(video.framesPerSecond),
+        framesPerSecond: numberValue(video.framesPerSecond) || receiverRate(previous?.videoFramesDecoded, videoFramesDecoded, elapsedMs),
         width: numberValue(video.frameWidth),
         height: numberValue(video.frameHeight),
         framesDecoded: numberValue(video.framesDecoded),
@@ -110,7 +112,7 @@ export function summarizeRTCStats(report: RTCStatsReport, previous?: StatsSample
         : undefined,
       icePath,
     },
-    sample: { timestamp, bytesReceived, videoBytesReceived, audioBytesReceived },
+    sample: { timestamp, bytesReceived, videoBytesReceived, audioBytesReceived, videoFramesDecoded },
   };
 }
 
@@ -135,6 +137,12 @@ function receiverBitrate(previous: number | undefined, current: number, elapsedM
   return previous !== undefined && current >= previous && elapsedMs > 0
     ? ((current - previous) * 8000) / elapsedMs
     : null;
+}
+
+function receiverRate(previous: number | undefined, current: number, elapsedMs: number) {
+  return previous !== undefined && current >= previous && elapsedMs > 0
+    ? ((current - previous) * 1000) / elapsedMs
+    : 0;
 }
 
 export function codecWarnings(tracks: Array<{ codec: string; codecProps?: Record<string, string | number | boolean | null> }>) {

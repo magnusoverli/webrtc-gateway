@@ -20,12 +20,12 @@ describe("summarizeRTCStats", () => {
       { id: "audio", type: "inbound-rtp", kind: "audio", timestamp: 2000, bytesReceived: 1000, packetsLost: 1, jitter: 0.002, codecId: "audio-codec" },
       { id: "video-codec", type: "codec", mimeType: "video/H264" },
       { id: "audio-codec", type: "codec", mimeType: "audio/opus" },
-    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 1500, audioBytesReceived: 500 });
+    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 1500, audioBytesReceived: 500, videoFramesDecoded: 50 });
 
     expect(result.stats.bitrateBps).toBe(16000);
     expect(result.stats.video).toMatchObject({ codec: "H264", bitrateBps: 12000, width: 1280, height: 720, framesPerSecond: 30, packetsLost: 2, jitterMs: 4 });
     expect(result.stats.audio).toMatchObject({ codec: "opus", bitrateBps: 4000, packetsLost: 1, jitterMs: 2 });
-    expect(result.sample).toEqual({ timestamp: 2000, bytesReceived: 4000, videoBytesReceived: 3000, audioBytesReceived: 1000 });
+    expect(result.sample).toEqual({ timestamp: 2000, bytesReceived: 4000, videoBytesReceived: 3000, audioBytesReceived: 1000, videoFramesDecoded: 80 });
   });
 
   it("reports audio-only receiver details", () => {
@@ -43,8 +43,20 @@ describe("summarizeRTCStats", () => {
       { id: "video-1", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 3000, packetsLost: 1, codecId: "codec" },
       { id: "video-2", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 2000, packetsLost: 2, codecId: "codec" },
       { id: "codec", type: "codec", mimeType: "video/H264" },
-    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 2000, audioBytesReceived: 0 });
+    ]), { timestamp: 1000, bytesReceived: 2000, videoBytesReceived: 2000, audioBytesReceived: 0, videoFramesDecoded: 0 });
     expect(result.stats.video).toMatchObject({ codec: "H264", bitrateBps: 24000, packetsLost: 3 });
+  });
+
+  it("derives video frame rate from decoded-frame counters when the browser omits it", () => {
+    const first = summarizeRTCStats(report([
+      { id: "video", type: "inbound-rtp", kind: "video", timestamp: 1000, bytesReceived: 1000, framesDecoded: 60 },
+    ]));
+    const second = summarizeRTCStats(report([
+      { id: "video", type: "inbound-rtp", kind: "video", timestamp: 2000, bytesReceived: 2000, framesDecoded: 90 },
+    ]), first.sample);
+
+    expect(first.stats.video?.framesPerSecond).toBe(0);
+    expect(second.stats.video?.framesPerSecond).toBe(30);
   });
 });
 

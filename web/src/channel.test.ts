@@ -87,7 +87,7 @@ describe("connection URLs", () => {
     expect(srtPublishURL("studio-main", ":8890", location.hostname)).toBe(
       "srt://desk.local:8890?streamid=publish:studio-main&pkt_size=1316",
     );
-    expect(managementOrigin("*", 9000, location)).toBe(location.origin);
+    expect(managementOrigin("*", 9000, location)).toBe("http://desk.local:9000");
   });
 
   it("does not combine an active listener host with a configured port", () => {

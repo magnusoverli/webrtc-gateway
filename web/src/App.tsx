@@ -30,6 +30,7 @@ import {
   type BindingInterface,
   type Channel,
   type ChannelRuntime,
+  type InputVideoMetadata,
   type InputMode,
   type Track,
 } from "./channel";
@@ -40,6 +41,7 @@ import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./Cha
 import { ArrowLeftIcon, ChevronLeftIcon, ChevronRightIcon } from "./Icons";
 import { ModalShell } from "./Modal";
 import { DiagnosticsDialog } from "./DiagnosticsDialog";
+import { ProjectsDialog } from "./ProjectsDialog";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { ToastProvider, useOptionalToast, useToast } from "./Toast";
 import { readOverviewLayout, writeOverviewLayout } from "./uiPreferences";
@@ -50,6 +52,7 @@ import { codecWarnings, type PreviewStats, type ReceiverStats, type VideoReceive
 type GlobalSettings = {
   revision: number;
   managementBindAddress: string;
+  managementPort: number;
   mediaBindAddress: string;
   logLevel: "error" | "warn" | "info" | "debug";
   readTimeout: string;
@@ -82,6 +85,7 @@ type BindingStatus = {
   resolvedAddress?: string;
   resolutionError?: string;
   port?: number;
+  desiredPort?: number;
   restartRequired: boolean;
   locked?: boolean;
   activeListeners?: {
@@ -246,6 +250,7 @@ function Dashboard() {
   const [diagnosticsTarget, setDiagnosticsTarget] = useState<
     { scope: "system" } | { scope: "channel"; channelID: string; channelName: string } | null
   >(null);
+  const [projectsOpen, setProjectsOpen] = useState(false);
   const [liveAnnouncement, setLiveAnnouncement] = useState("");
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
@@ -420,7 +425,7 @@ function Dashboard() {
     window.location,
   );
   const pendingOutputOrigin = managementBinding.desiredAddress
-    ? managementOrigin(managementBinding.desiredAddress, status?.network.management.port, window.location)
+    ? managementOrigin(managementBinding.desiredAddress, status?.network.management.desiredPort ?? status?.settings.managementPort, window.location)
     : "";
   const viewerURL = selected ? absolutePath(outputOrigin, selected.viewerPath) : "";
   const pendingViewerURL = selected && pendingOutputOrigin ? absolutePath(pendingOutputOrigin, selected.viewerPath) : "";
@@ -546,7 +551,7 @@ function Dashboard() {
     }
     const desiredOrigin = managementOrigin(
       desiredAddress,
-      status.network.management.port,
+      status.network.management.desiredPort ?? status.settings.managementPort,
       window.location,
     );
     const destination = new URL("/", `${desiredOrigin}/`);
@@ -918,7 +923,7 @@ function Dashboard() {
   const displayedPassphrase = selected && revealedPassphrase && revealedPassphrase.channelID === selected.id && revealedPassphrase.revision === selected.revision
     ? revealedPassphrase.value
     : null;
-  const modalOpen = Boolean(form || settingsForm || diagnosticsTarget);
+  const modalOpen = Boolean(form || settingsForm || diagnosticsTarget || projectsOpen);
 
   return (
     <div className="app-shell">
@@ -934,11 +939,12 @@ function Dashboard() {
 
         <nav className="topnav-links" aria-label="Primary">
           <button
-            className={!settingsForm ? "topnav-link active" : "topnav-link"}
+            className={!settingsForm && !projectsOpen ? "topnav-link active" : "topnav-link"}
             type="button"
-            aria-current={!settingsForm ? "page" : undefined}
+            aria-current={!settingsForm && !projectsOpen ? "page" : undefined}
             onClick={() => showOverview()}
           >Overview</button>
+          <button className={projectsOpen ? "topnav-link active" : "topnav-link"} type="button" aria-current={projectsOpen ? "page" : undefined} aria-haspopup="dialog" onClick={() => setProjectsOpen(true)}>Projects</button>
           <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
         </nav>
 
@@ -1167,7 +1173,7 @@ function Dashboard() {
                     <StreamFact label="Input errors" help="Media frames MediaMTX could not parse correctly during the current input generation." value={`${selected.inboundFramesInError} frames`} warning={selected.inboundFramesInError > 0} />
                     <StreamFact label="Tracks" value={String(selected.tracks.length)} />
                   </div>
-                  <MediaTracks direction="input" tracks={selected.tracks} />
+                  <MediaTracks direction="input" tracks={selected.tracks} inputVideo={selected.inputVideo} />
                 </> : <StreamIdle title="No active input" detail="Stream statistics and media details will appear when the source connects." />}
               </article>
 
@@ -1279,6 +1285,21 @@ function Dashboard() {
 
       {diagnosticsTarget?.scope === "system" && <DiagnosticsDialog scope="system" onClose={() => setDiagnosticsTarget(null)} />}
       {diagnosticsTarget?.scope === "channel" && <DiagnosticsDialog scope="channel" channelID={diagnosticsTarget.channelID} channelName={diagnosticsTarget.channelName} onClose={() => setDiagnosticsTarget(null)} />}
+      {projectsOpen && <ProjectsDialog
+        mutationBlocked={!status || statusStale}
+        onClose={() => setProjectsOpen(false)}
+        onLoadIndeterminate={refreshStatus}
+        onLoaded={(result) => {
+          statusMutationGenerationRef.current += 1;
+          rateSamplesRef.current = new Map();
+          setStreamRates({});
+          setProjectsOpen(false);
+          refreshStatus();
+          if (result.managementRestartRequired) {
+            showToast({ kind: "info", message: "Project loaded. Restart Gateway to move the management interface." });
+          }
+        }}
+      />}
     </div>
   );
 }
@@ -1487,6 +1508,7 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
   const managementRestartRequired = network.management.activeAddress === undefined
     ? network.management.restartRequired
     : network.management.activeAddress !== resolveInterfaceBinding(form.managementBindAddress, network.interfaces) ||
+      network.management.port !== form.managementPort ||
       network.management.activeSelection !== form.managementBindAddress;
 
   const changeManagementBinding = (managementBindAddress: string) => {
@@ -1531,6 +1553,10 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
                   <BindingOptions value={form.managementBindAddress} interfaces={network.interfaces} />
                 </select>
               </label>
+              <label className="field">
+                <FieldTitle help="TCP port used by the dashboard, API, viewer pages, and WHEP signaling. Changing it requires a Gateway restart.">Web UI &amp; API port</FieldTitle>
+                <input type="number" min="1" max="65535" value={form.managementPort} disabled={network.management.locked} onChange={(event) => updateNumber("managementPort", event.target.value)} />
+              </label>
               {network.management.locked ? (
                 <p><code>GATEWAY_LISTEN_ADDR</code> owns this binding. Change the environment variable and restart the Gateway container.</p>
               ) : (
@@ -1539,8 +1565,8 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
               {managementRestartRequired && (
                 <div className="binding-status restart">
                   <strong>Restart required</strong>
-                  <span>Active: {network.management.activeAddress === undefined ? "Not reported" : bindingLabel(network.management.activeAddress, network.interfaces)}</span>
-                  <span>Desired: {bindingLabel(form.managementBindAddress, network.interfaces)}</span>
+                  <span>Active: {network.management.activeAddress === undefined ? "Not reported" : `${bindingLabel(network.management.activeAddress, network.interfaces)}:${network.management.port ?? "—"}`}</span>
+                  <span>Desired: {bindingLabel(form.managementBindAddress, network.interfaces)}:{form.managementPort}</span>
                 </div>
               )}
             </div>
@@ -2105,9 +2131,10 @@ function StreamIdle({ title, detail }: { title: string; detail: string }) {
   return <div className="stream-idle"><strong>{title}</strong><p>{detail}</p></div>;
 }
 
-function MediaTracks({ direction, tracks, previewStats }: {
+function MediaTracks({ direction, tracks, inputVideo, previewStats }: {
   direction: "input" | "output";
   tracks: Track[];
+  inputVideo?: InputVideoMetadata | null;
   previewStats?: PreviewStats | null;
 }) {
   if (!tracks.length) {
@@ -2137,6 +2164,7 @@ function MediaTracks({ direction, tracks, previewStats }: {
               track={track}
               kind={group.kind}
               direction={direction}
+              frameRate={direction === "input" ? frameRateValue(inputVideo?.frameRate) : previewStats?.video?.framesPerSecond}
             />
           ))}
         </section>
@@ -2145,16 +2173,17 @@ function MediaTracks({ direction, tracks, previewStats }: {
   );
 }
 
-function MediaTrack({ track, kind, direction }: {
+function MediaTrack({ track, kind, direction, frameRate }: {
   track: Track;
   kind: "video" | "audio" | "unknown";
   direction: "input" | "output";
+  frameRate?: number;
 }) {
   const facts: Array<{ label: string; value: string }> = [];
   if (kind === "video") {
     facts.push(
       { label: "Resolution", value: formatResolution(undefined, undefined, track) },
-      { label: "Frame rate", value: formatFrameRate(undefined, track) },
+      { label: "Frame rate", value: formatFrameRate(frameRate, track) },
       { label: "Profile", value: stringTrackProperty(track, "profile") || "Not reported" },
     );
     const level = stringTrackProperty(track, "level");
@@ -2269,6 +2298,13 @@ function formatFrameRate(value: number | undefined, track: Track) {
   const resolved = value || numberTrackProperty(track, "frameRate") || numberTrackProperty(track, "fps");
   if (resolved) return `${resolved.toFixed(resolved % 1 === 0 ? 0 : 1)} fps`;
   return "Not reported";
+}
+
+function frameRateValue(value?: string) {
+  if (!value) return 0;
+  const [numerator, denominator, extra] = value.split("/").map(Number);
+  if (extra !== undefined || !Number.isFinite(numerator) || !Number.isFinite(denominator) || numerator <= 0 || denominator <= 0) return 0;
+  return numerator / denominator;
 }
 
 function formatSampleRate(value: number) {
@@ -2448,7 +2484,7 @@ function isGlobalSettings(value: unknown): value is GlobalSettings {
   if (!value || typeof value !== "object") return false;
   const item = value as Partial<GlobalSettings>;
   return typeof item.revision === "number" && item.revision >= 1 &&
-    typeof item.managementBindAddress === "string" && typeof item.mediaBindAddress === "string" &&
+    typeof item.managementBindAddress === "string" && typeof item.managementPort === "number" && typeof item.mediaBindAddress === "string" &&
     typeof item.applyState === "string" && typeof item.updatedAt === "string" &&
     Array.isArray(item.webRTCAdditionalHosts);
 }

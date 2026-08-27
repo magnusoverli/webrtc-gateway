@@ -370,6 +370,29 @@ func errorWithPrefix(prefix string, err error) error {
 	return fmt.Errorf("%s: %w", prefix, err)
 }
 
+// CleanupRuntime removes runtime resources for a configuration that is no longer live.
+// It intentionally leaves persistence untouched; project loading replaces desired state separately.
+func (s *Service) CleanupRuntime(ctx context.Context, items []Channel) error {
+	ctx, release, err := s.control.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	var failures []error
+	for _, item := range items {
+		var relayErr error
+		if s.srt != nil {
+			relayErr = s.srt.Stop(ctx, item.ID)
+		}
+		mediaErr := s.media.DeletePath(ctx, item.Path)
+		if cleanupErr := errors.Join(relayErr, errorWithPrefix("remove MediaMTX path", mediaErr)); cleanupErr != nil {
+			failures = append(failures, fmt.Errorf("channel %s: %w", item.ID, cleanupErr))
+		}
+	}
+	return errors.Join(failures...)
+}
+
 func (s *Service) Reconcile(ctx context.Context) error {
 	ctx, release, err := s.control.Acquire(ctx)
 	if err != nil {

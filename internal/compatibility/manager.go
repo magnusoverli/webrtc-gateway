@@ -157,6 +157,7 @@ type probeTask struct {
 
 type worker struct {
 	cancel     context.CancelFunc
+	done       chan struct{}
 	cmd        *exec.Cmd
 	stderr     *ringWriter
 	started    time.Time
@@ -401,6 +402,45 @@ func (m *Manager) Close() {
 	m.reconcileMu.Lock()
 	m.reconcileMu.Unlock()
 	m.workers.Wait()
+}
+
+// ResetChannels synchronously retires compatibility state before a project cutover.
+func (m *Manager) ResetChannels(ctx context.Context, channels []channel.Channel) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
+	m.mu.Lock()
+	workerDone := make([]<-chan struct{}, 0, len(channels))
+	for _, configured := range channels {
+		if item := m.entries[configured.ID]; item != nil {
+			cancelProbeLocked(item)
+			cancelMetadataProbeLocked(item)
+			stopWorkerLocked(item)
+			if item.worker != nil && item.worker.done != nil {
+				workerDone = append(workerDone, item.worker.done)
+			}
+			delete(m.entries, configured.ID)
+		}
+		delete(m.discovering, configured.ID)
+	}
+	m.freshStatus = true
+	m.mu.Unlock()
+	for _, done := range workerDone {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+	}
+
+	var failures []error
+	for _, configured := range channels {
+		if err := m.media.DeletePath(ctx, CompatibilityPath(configured.ID)); err != nil {
+			failures = append(failures, fmt.Errorf("remove compatibility path for channel %s: %w", configured.ID, err))
+		}
+	}
+	m.notify()
+	return errors.Join(failures...)
 }
 
 func (m *Manager) reconcile(ctx context.Context) {
@@ -782,7 +822,7 @@ func (m *Manager) reserveWorkerLocked(ctx context.Context, item channel.Channel,
 	}
 	cmd.WaitDelay = 3 * time.Second
 	running := &worker{
-		cancel: cancel, cmd: cmd, stderr: stderr, spawning: true,
+		cancel: cancel, done: make(chan struct{}), cmd: cmd, stderr: stderr, spawning: true,
 		generation: current.generation, units: reservation,
 	}
 	current.worker = running
@@ -814,6 +854,9 @@ func (m *Manager) startReservedWorker(channelID string, running *worker, result 
 			}
 		}
 		m.mu.Unlock()
+		if running.done != nil {
+			close(running.done)
+		}
 		m.workers.Done()
 		m.notify()
 		return
@@ -836,6 +879,9 @@ func (m *Manager) startReservedWorker(channelID string, running *worker, result 
 			current.worker = nil
 		}
 		m.mu.Unlock()
+		if running.done != nil {
+			close(running.done)
+		}
 		m.workers.Done()
 		m.notify()
 		return
@@ -866,7 +912,12 @@ func (m *Manager) usedWorkerCapacityLocked() int {
 }
 
 func (m *Manager) waitWorker(channelID string, running *worker) {
-	defer m.workers.Done()
+	defer func() {
+		if running.done != nil {
+			close(running.done)
+		}
+		m.workers.Done()
+	}()
 	err := running.cmd.Wait()
 	running.cancel()
 	m.mu.Lock()

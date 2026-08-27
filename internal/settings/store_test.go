@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,5 +134,27 @@ func TestSQLiteStoreMigratesLegacyBindingFields(t *testing.T) {
 	}
 	if loaded.ManagementBindAddress != "*" || loaded.MediaBindAddress != "custom" {
 		t.Fatalf("migrated bindings = management %q, media %q", loaded.ManagementBindAddress, loaded.MediaBindAddress)
+	}
+}
+
+func TestSQLiteStoreNormalizesNullAdditionalHosts(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(`UPDATE global_settings SET settings_json = json_set(settings_json, '$.webRTCAdditionalHosts', json('null')) WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.WebRTCAdditionalHosts == nil || !strings.Contains(string(encoded), `"webRTCAdditionalHosts":[]`) {
+		t.Fatalf("additional hosts were not normalized: %s", encoded)
 	}
 }

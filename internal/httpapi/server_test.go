@@ -23,6 +23,7 @@ import (
 	"webrtc-gateway/internal/compatibility"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
+	"webrtc-gateway/internal/project"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
 	"webrtc-gateway/internal/telemetry"
@@ -136,6 +137,30 @@ type fakeSettings struct {
 	err   error
 }
 
+type fakeProjects struct {
+	item    project.Project
+	loadErr error
+}
+
+func (f *fakeProjects) List(context.Context) ([]project.Summary, error) {
+	return []project.Summary{f.item.Summary()}, nil
+}
+func (f *fakeProjects) Get(context.Context, string) (project.Project, error)  { return f.item, nil }
+func (f *fakeProjects) Save(context.Context, string) (project.Project, error) { return f.item, nil }
+func (f *fakeProjects) Import(context.Context, project.Manifest) (project.Project, error) {
+	return f.item, nil
+}
+func (f *fakeProjects) Rename(context.Context, string, string, int) (project.Project, error) {
+	return f.item, nil
+}
+func (f *fakeProjects) Overwrite(context.Context, string, string, int) (project.Project, error) {
+	return f.item, nil
+}
+func (f *fakeProjects) Delete(context.Context, string, int) error { return nil }
+func (f *fakeProjects) Load(context.Context, string, int) (project.LoadResult, error) {
+	return project.LoadResult{ProjectID: f.item.ID, ProjectRevision: f.item.Revision, ChannelCount: len(f.item.Configuration.Channels)}, f.loadErr
+}
+
 type fakeCompatibility struct {
 	state compatibility.State
 }
@@ -221,6 +246,43 @@ func TestDeleteReportsAcceptedWhileCleanupIsPending(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodDelete, "/api/v1/channels/channel-1", nil))
 	if res.Code != http.StatusAccepted || !strings.Contains(res.Body.String(), `"status":"deleting"`) {
 		t.Fatalf("response = %d %s", res.Code, res.Body.String())
+	}
+}
+
+func TestProjectListRedactsSecretsAndExportIncludesThem(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	projects := &fakeProjects{item: project.Project{
+		ID: "project-1", Revision: 2, Name: "Studio", CreatedAt: now, UpdatedAt: now,
+		Configuration: project.Configuration{Channels: []project.Channel{{
+			ID: "12345678-1234-4234-8234-123456789abc", Number: 1, Name: "Camera", Path: "camera-12345678",
+			Input: channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000, Passphrase: "secret-passphrase"}},
+		}}},
+	}}
+	handler := newProjectTestHandler(t, projects)
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/projects", nil))
+	if list.Code != http.StatusOK || strings.Contains(list.Body.String(), "secret-passphrase") || !strings.Contains(list.Body.String(), `"channelCount":1`) {
+		t.Fatalf("list response = %d %s", list.Code, list.Body.String())
+	}
+
+	export := httptest.NewRecorder()
+	handler.ServeHTTP(export, httptest.NewRequest(http.MethodGet, "/api/v1/projects/project-1/export", nil))
+	if export.Code != http.StatusOK || !strings.Contains(export.Body.String(), "secret-passphrase") || !strings.Contains(export.Header().Get("Content-Disposition"), "Studio.json") {
+		t.Fatalf("export response = %d %s", export.Code, export.Body.String())
+	}
+}
+
+func TestProjectLoadReportsSuccessfulRollback(t *testing.T) {
+	projects := &fakeProjects{item: project.Project{ID: "project-1", Revision: 2, Name: "Studio"}}
+	projects.loadErr = &project.LoadError{Cause: errors.New("listener unavailable")}
+	handler := newProjectTestHandler(t, projects)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/projects/project-1/load", nil)
+	request.Header.Set("If-Match", `"2"`)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"rollbackSucceeded":true`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
 }
 
@@ -1151,7 +1213,7 @@ func TestSettingsRejectRangeExcludingAChannel(t *testing.T) {
 		Input: channel.Input{Mode: channel.InputRTPUnicast, RTP: &channel.RTPInput{Port: 22000}},
 	}}}
 	handler := newTestHandler(t, fakeMediaMTX{}, channels, "http://127.0.0.1:1")
-	body := `{"logLevel":"info","readTimeout":"10s","writeTimeout":"10s","writeQueueSize":1024,"udpMaxPayloadSize":1452,"udpReadBufferSize":4194304,"srtAddress":":8890","webRTCLocalUDPAddress":":8189","webRTCLocalTCPAddress":"","webRTCIPsFromInterfaces":true,"webRTCAdditionalHosts":[],"webRTCHandshakeTimeout":"10s","webRTCTrackGatherTimeout":"2s","rtpPortMin":23000,"rtpPortMax":23999,"statisticsIntervalMs":2000,"defaultMaxReaders":0}`
+	body := `{"managementPort":8080,"logLevel":"info","readTimeout":"10s","writeTimeout":"10s","writeQueueSize":1024,"udpMaxPayloadSize":1452,"udpReadBufferSize":4194304,"srtAddress":":8890","webRTCLocalUDPAddress":":8189","webRTCLocalTCPAddress":"","webRTCIPsFromInterfaces":true,"webRTCAdditionalHosts":[],"webRTCHandshakeTimeout":"10s","webRTCTrackGatherTimeout":"2s","rtpPortMin":23000,"rtpPortMax":23999,"statisticsIntervalMs":2000,"defaultMaxReaders":0}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("If-Match", `"1"`)
@@ -1169,7 +1231,7 @@ func TestSettingsRejectGlobalListenerUsingChannelSRTSlot(t *testing.T) {
 		Input: channel.Input{Mode: channel.InputSRTPush, SRT: &channel.SRTInput{Port: 10000}},
 	}}}
 	handler := newTestHandler(t, fakeMediaMTX{}, channels, "http://127.0.0.1:1")
-	body := `{"logLevel":"info","readTimeout":"10s","writeTimeout":"10s","writeQueueSize":1024,"udpMaxPayloadSize":1452,"udpReadBufferSize":4194304,"srtAddress":":10000","webRTCLocalUDPAddress":":8189","webRTCLocalTCPAddress":"","webRTCIPsFromInterfaces":true,"webRTCAdditionalHosts":[],"webRTCHandshakeTimeout":"10s","webRTCTrackGatherTimeout":"2s","rtpPortMin":22000,"rtpPortMax":22999,"statisticsIntervalMs":2000,"defaultMaxReaders":0}`
+	body := `{"managementPort":8080,"logLevel":"info","readTimeout":"10s","writeTimeout":"10s","writeQueueSize":1024,"udpMaxPayloadSize":1452,"udpReadBufferSize":4194304,"srtAddress":":10000","webRTCLocalUDPAddress":":8189","webRTCLocalTCPAddress":"","webRTCIPsFromInterfaces":true,"webRTCAdditionalHosts":[],"webRTCHandshakeTimeout":"10s","webRTCTrackGatherTimeout":"2s","rtpPortMin":22000,"rtpPortMax":22999,"statisticsIntervalMs":2000,"defaultMaxReaders":0}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("If-Match", `"1"`)
@@ -1490,7 +1552,7 @@ func TestSPAHandlerNegotiatesCompressionAndCaching(t *testing.T) {
 
 func settingsRequestFrom(value settings.Settings) settingsRequest {
 	return settingsRequest{
-		ManagementBindAddress: value.ManagementBindAddress, MediaBindAddress: value.MediaBindAddress,
+		ManagementBindAddress: value.ManagementBindAddress, ManagementPort: value.ManagementPort, MediaBindAddress: value.MediaBindAddress,
 		LogLevel: value.LogLevel, ReadTimeout: value.ReadTimeout, WriteTimeout: value.WriteTimeout,
 		WriteQueueSize: value.WriteQueueSize, UDPMaxPayloadSize: value.UDPMaxPayloadSize,
 		UDPReadBufferSize: value.UDPReadBufferSize, SRTAddress: value.SRTAddress,
@@ -1517,6 +1579,25 @@ func newTestHandlerWithCompatibility(t *testing.T, media mediaStatusReader, chan
 		MediaMTXWHEPURL: whepURL,
 		Version:         "test",
 		StartedAt:       time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC),
+		Management:      ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return handler
+}
+
+func newProjectTestHandler(t *testing.T, projects projectService) http.Handler {
+	t.Helper()
+	handler, err := New(Options{
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MediaMTX:        fakeMediaMTX{},
+		Channels:        fakeChannels{},
+		Settings:        fakeSettings{value: settings.Defaults(time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC))},
+		Projects:        projects,
+		MediaMTXWHEPURL: "http://127.0.0.1:1",
+		Version:         "test",
+		StartedAt:       time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
 		Management:      ManagementBinding{ActiveAddress: "*", Selection: "*", Port: 8080},
 	})
 	if err != nil {

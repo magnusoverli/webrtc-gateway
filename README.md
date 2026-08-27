@@ -59,6 +59,16 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the channel input show `-`.
 4. Send the stable multiview URL to LAN users or copy the channel's embed URL or iframe snippet into another LAN application. Embed URLs use the channel number and do not change when that channel is renamed or switches between direct and compatibility output.
 
+### Projects
+
+Open **Projects** to save the complete applied Gateway configuration as a named snapshot. Saving a project does not change listeners, channels, sources, or viewers. A project contains all UI-managed global settings and channels, including stable channel IDs, numbers, paths, and SRT passphrases. Projects can be renamed, updated from the current configuration, deleted, exported, and imported. Importing stores a project without loading it.
+
+Loading a project replaces the running desired configuration and can interrupt inputs and viewers. Gateway validates the complete snapshot first, removes the previous runtime resources, and applies the project's global settings and channels. If cleanup or application fails, Gateway automatically restores and reapplies the previous configuration and reports whether rollback succeeded. Relevant service logs are available through `docker compose logs gateway` and `docker compose logs mediamtx`.
+
+Project files are versioned JSON and contain plaintext SRT passphrases. Treat them as sensitive credentials, transfer and store them accordingly, and delete copies that are no longer needed. Container-owned deployment values such as the state path, private health listener, internal MediaMTX URLs, compatibility worker capacity, and memory/PID limits are not part of a project.
+
+The management interface and Web UI/API port are included. When loading a project changes either, the dashboard reports the exact pending origin and requires a Gateway restart. The existing restart control acknowledges the request before navigating the browser to the new origin. An explicit host in `GATEWAY_LISTEN_ADDR` remains deployment-locked and cannot be overridden by a project.
+
 The multiview and channel embed routes are:
 
 ```text
@@ -99,7 +109,7 @@ Compatibility normalization is bounded by startup configuration:
 | `GATEWAY_COMPATIBILITY_CAPACITY` | 75% of logical CPUs, rounded down | Total worker capacity units; the remaining CPU headroom is reserved for ingest, routing, WebRTC, and the host |
 | `GATEWAY_MEMORY_LIMIT` | `8g` | Gateway container memory safety limit |
 | `GATEWAY_PIDS_LIMIT` | `2048` | Gateway container process/thread safety limit |
-| `GATEWAY_LISTEN_ADDR` | `:8080` | Public management port; a non-wildcard host overrides and locks the UI-selected management interface |
+| `GATEWAY_LISTEN_ADDR` | `:8080` | Initial public management address; a non-wildcard host overrides and locks the UI-selected management interface and port |
 | `GATEWAY_HEALTH_LISTEN_ADDR` | `127.0.0.1:18080` | Private health listener used by Docker Compose |
 
 These values are applied when the Gateway container starts. If worker capacity is occupied, additional incompatible sources remain in a visible queued state and start automatically when capacity is released. An individual worker larger than the configured capacity is allowed to run alone.
@@ -128,7 +138,7 @@ Following is offered only when an interface has one usable address in the select
 - RTP multicast keeps its per-channel multicast group and multicast interface. SRT pull is outbound and is not affected by the listener binding.
 - Following a media interface also limits interface-derived WebRTC ICE candidates to that interface, preventing Docker bridge addresses from being advertised. Explicit additional advertised hosts remain separate and are not filtered.
 
-An explicit host in `GATEWAY_LISTEN_ADDR`, such as `127.0.0.1:8080`, overrides and locks the management selector. The default `:8080` leaves the port under startup configuration while allowing the persisted interface selection to supply its host. MediaMTX control services and Gateway health remain on loopback regardless of either public selection.
+An explicit host in `GATEWAY_LISTEN_ADDR`, such as `127.0.0.1:8080`, overrides and locks the management selector and port. The default `:8080` supplies initial values while allowing persisted management interface and port selections to take effect after restart. MediaMTX control services and Gateway health remain on loopback regardless of either public selection.
 
 When an unlocked management-interface change is pending, the UI shows **Restart Gateway**. This sends a graceful restart request after acknowledging it to the browser, then Docker's `restart: unless-stopped` policy starts Gateway on the desired interface. MediaMTX continues running and direct media paths remain available during the Gateway restart. No restart control is shown when `GATEWAY_LISTEN_ADDR` locks the management host because persisted interface changes cannot override that environment setting.
 

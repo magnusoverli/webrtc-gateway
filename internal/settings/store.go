@@ -19,16 +19,21 @@ type Repository interface {
 }
 
 type SQLiteStore struct {
-	db *sql.DB
+	db                    *sql.DB
+	defaultManagementPort int
 }
 
 func OpenSQLite(path string) (*SQLiteStore, error) {
+	return OpenSQLiteWithManagementPort(path, 8080)
+}
+
+func OpenSQLiteWithManagementPort(path string, managementPort int) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open settings database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	store := &SQLiteStore{db: db}
+	store := &SQLiteStore{db: db, defaultManagementPort: managementPort}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -62,6 +67,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	}
 
 	defaults := Defaults(time.Now())
+	defaults.ManagementPort = s.defaultManagementPort
 	encoded, err := json.Marshal(defaults)
 	if err != nil {
 		return fmt.Errorf("encode default settings: %w", err)
@@ -112,6 +118,7 @@ func (s *SQLiteStore) Get(ctx context.Context) (Settings, error) {
 		return Settings{}, fmt.Errorf("get settings: %w", err)
 	}
 	value := Defaults(time.Now())
+	value.ManagementPort = s.defaultManagementPort
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(encoded), &fields); err != nil {
 		return Settings{}, fmt.Errorf("decode settings fields: %w", err)
@@ -126,6 +133,9 @@ func (s *SQLiteStore) Get(ctx context.Context) (Settings, error) {
 		value.MediaBindAddress = networkbind.LegacyMediaBinding(
 			value.SRTAddress, value.WebRTCLocalUDPAddress, value.WebRTCLocalTCPAddress,
 		)
+	}
+	if value.WebRTCAdditionalHosts == nil {
+		value.WebRTCAdditionalHosts = []string{}
 	}
 	value.ApplyState = applyState
 	value.ApplyError = applyError

@@ -20,6 +20,7 @@ import (
 	"webrtc-gateway/internal/httpapi"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
+	"webrtc-gateway/internal/project"
 	"webrtc-gateway/internal/reconcile"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
@@ -47,18 +48,26 @@ func main() {
 		os.Exit(1)
 	}
 	defer channelStore.Close()
-	settingsStore, err := settings.OpenSQLite(cfg.StatePath)
+	_, configuredPortText, _ := net.SplitHostPort(cfg.ListenAddr)
+	configuredManagementPort, _ := strconv.Atoi(configuredPortText)
+	settingsStore, err := settings.OpenSQLiteWithManagementPort(cfg.StatePath, configuredManagementPort)
 	if err != nil {
 		logger.Error("open settings database", "error", err)
 		os.Exit(1)
 	}
 	defer settingsStore.Close()
+	projectStore, err := project.OpenSQLite(cfg.StatePath)
+	if err != nil {
+		logger.Error("open project database", "error", err)
+		os.Exit(1)
+	}
+	defer projectStore.Close()
 	globalSettings, err := settingsStore.Get(context.Background())
 	if err != nil {
 		logger.Error("read global settings", "error", err)
 		os.Exit(1)
 	}
-	managementAddress, activeManagementBind, managementPort, managementLocked, err := managementListener(cfg.ListenAddr, globalSettings.ManagementBindAddress)
+	managementAddress, activeManagementBind, managementPort, managementLocked, err := managementListenerDesired(cfg.ListenAddr, globalSettings.ManagementBindAddress, globalSettings.ManagementPort, networkbind.Interfaces)
 	if err != nil {
 		logger.Error("configure management listener", "error", err)
 		os.Exit(1)
@@ -72,6 +81,17 @@ func main() {
 	control := controlplane.NewCoordinator()
 	channelService := channel.NewService(channelStore, mediaClient, settingsStore, relaySupervisor, control)
 	settingsService := settings.NewService(settingsStore, mediaClient, channelService, control)
+	projectService := project.NewService(projectStore, channelService, settingsService, control)
+	projectService.SetEnvironmentValidator(func(configuration project.Configuration) error {
+		interfaces, err := networkbind.Interfaces()
+		if err != nil {
+			return err
+		}
+		return project.ValidateEnvironment(configuration, project.Environment{
+			ManagementLocked: managementLocked, ActiveManagementAddress: activeManagementBind,
+			ActiveManagementPort: managementPort, Interfaces: interfaces,
+		})
+	})
 	compatibilityManager, err := compatibility.New(compatibility.Options{
 		Logger: logger, Channels: channelService, MediaMTX: mediaClient,
 		InputAccepted: relaySupervisor.ClearIssue,
@@ -83,6 +103,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer compatibilityManager.Close()
+	projectService.SetCompatibility(compatibilityManager)
 	relaySupervisor.SetInputObserver(compatibilityManager)
 	logger.Info("compatibility capacity configured", "encoderThreads", cfg.EncoderThreads, "capacityUnits", cfg.WorkerCapacity)
 	restartRequests := make(chan struct{}, 1)
@@ -93,6 +114,7 @@ func main() {
 		MediaMTX:        mediaClient,
 		Channels:        channelService,
 		Settings:        settingsService,
+		Projects:        projectService,
 		Compatibility:   compatibilityManager,
 		Relays:          relaySupervisor,
 		Resources:       resourceSampler,
@@ -235,6 +257,15 @@ func managementListenerWithInterfaces(
 	desired string,
 	interfaces func() ([]networkbind.InterfaceAddress, error),
 ) (address, activeBind string, port int, locked bool, err error) {
+	return managementListenerDesired(configured, desired, 0, interfaces)
+}
+
+func managementListenerDesired(
+	configured string,
+	desired string,
+	desiredPort int,
+	interfaces func() ([]networkbind.InterfaceAddress, error),
+) (address, activeBind string, port int, locked bool, err error) {
 	host, portText, err := net.SplitHostPort(configured)
 	if err != nil {
 		return "", "", 0, false, err
@@ -244,6 +275,9 @@ func managementListenerWithInterfaces(
 		return "", "", 0, false, fmt.Errorf("GATEWAY_LISTEN_ADDR host: %w", err)
 	}
 	locked = host != ""
+	if !locked && desiredPort > 0 {
+		portText = strconv.Itoa(desiredPort)
+	}
 	if !locked {
 		activeBind, err = networkbind.Normalize(desired, false)
 		if err != nil {

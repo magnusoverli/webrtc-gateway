@@ -24,6 +24,7 @@ import (
 	"webrtc-gateway/internal/compatibility"
 	"webrtc-gateway/internal/mediamtx"
 	"webrtc-gateway/internal/networkbind"
+	"webrtc-gateway/internal/project"
 	"webrtc-gateway/internal/settings"
 	"webrtc-gateway/internal/srtrelay"
 	"webrtc-gateway/internal/telemetry"
@@ -53,6 +54,17 @@ type settingsService interface {
 	UpdateExpected(context.Context, settings.Settings, int) (settings.Settings, error)
 }
 
+type projectService interface {
+	List(context.Context) ([]project.Summary, error)
+	Get(context.Context, string) (project.Project, error)
+	Save(context.Context, string) (project.Project, error)
+	Import(context.Context, project.Manifest) (project.Project, error)
+	Rename(context.Context, string, string, int) (project.Project, error)
+	Overwrite(context.Context, string, string, int) (project.Project, error)
+	Delete(context.Context, string, int) error
+	Load(context.Context, string, int) (project.LoadResult, error)
+}
+
 type compatibilityReader interface {
 	Snapshot(string) compatibility.State
 }
@@ -70,6 +82,7 @@ type Options struct {
 	MediaMTX        mediaStatusReader
 	Channels        channelService
 	Settings        settingsService
+	Projects        projectService
 	Compatibility   compatibilityReader
 	Relays          relayStatusReader
 	Resources       resourceReader
@@ -93,6 +106,7 @@ type server struct {
 	mediaMTX    mediaStatusReader
 	channels    channelService
 	settings    settingsService
+	projects    projectService
 	compat      compatibilityReader
 	relays      relayStatusReader
 	resources   resourceReader
@@ -150,6 +164,7 @@ type bindingStatus struct {
 	ResolvedAddress string                `json:"resolvedAddress,omitempty"`
 	ResolutionError string                `json:"resolutionError,omitempty"`
 	Port            int                   `json:"port,omitempty"`
+	DesiredPort     int                   `json:"desiredPort,omitempty"`
 	RestartRequired bool                  `json:"restartRequired"`
 	Locked          bool                  `json:"locked,omitempty"`
 }
@@ -291,6 +306,7 @@ type srtInputResponse struct {
 
 type settingsRequest struct {
 	ManagementBindAddress    string   `json:"managementBindAddress"`
+	ManagementPort           int      `json:"managementPort"`
 	MediaBindAddress         string   `json:"mediaBindAddress"`
 	LogLevel                 string   `json:"logLevel"`
 	ReadTimeout              string   `json:"readTimeout"`
@@ -309,6 +325,10 @@ type settingsRequest struct {
 	RTPPortMax               int      `json:"rtpPortMax"`
 	StatisticsIntervalMS     int      `json:"statisticsIntervalMs"`
 	DefaultMaxReaders        int      `json:"defaultMaxReaders"`
+}
+
+type projectNameRequest struct {
+	Name string `json:"name"`
 }
 
 type channelPatchRequest struct {
@@ -420,6 +440,7 @@ func New(options Options) (http.Handler, error) {
 		settings:    options.Settings,
 		compat:      options.Compatibility,
 		relays:      options.Relays,
+		projects:    options.Projects,
 		resources:   options.Resources,
 		version:     options.Version,
 		startedAt:   options.StartedAt,
@@ -437,6 +458,10 @@ func New(options Options) (http.Handler, error) {
 	mux.HandleFunc("GET /api/v1/diagnostics", s.diagnostics)
 	mux.HandleFunc("GET /api/v1/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/v1/settings", s.updateSettings)
+	mux.HandleFunc("GET /api/v1/projects", s.listProjects)
+	mux.HandleFunc("POST /api/v1/projects", s.saveProject)
+	mux.HandleFunc("POST /api/v1/projects/import", s.importProject)
+	mux.HandleFunc("/api/v1/projects/", s.projectAction)
 	mux.HandleFunc("POST /api/v1/restart", s.restartGateway)
 	mux.HandleFunc("GET /api/v1/channels", s.listChannels)
 	mux.HandleFunc("GET /api/v1/channels/runtime", s.listRuntimeChannels)
@@ -527,7 +552,7 @@ func (s *server) statusSnapshot(ctx context.Context) (statusResponse, string, er
 	response.Network.Management = bindingStatus{
 		ActiveAddress: s.management.ActiveAddress, ActiveSelection: s.management.Selection,
 		DesiredAddress: globalSettings.ManagementBindAddress,
-		Port:           s.management.Port, Locked: s.management.Locked,
+		Port:           s.management.Port, DesiredPort: globalSettings.ManagementPort, Locked: s.management.Locked,
 	}
 	if s.management.Locked {
 		response.Network.Management.ResolvedAddress = s.management.ActiveAddress
@@ -536,7 +561,7 @@ func (s *server) statusSnapshot(ctx context.Context) (statusResponse, string, er
 		response.Network.Management.RestartRequired = true
 	} else {
 		response.Network.Management.ResolvedAddress = resolved
-		response.Network.Management.RestartRequired = s.management.ActiveAddress != resolved ||
+		response.Network.Management.RestartRequired = s.management.ActiveAddress != resolved || s.management.Port != globalSettings.ManagementPort ||
 			s.management.Selection != globalSettings.ManagementBindAddress
 	}
 	response.Gateway.RestartRequired = response.Network.Management.RestartRequired
@@ -731,9 +756,15 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.management.Port > 0 && addressPort(effective.WebRTCLocalTCPAddress) == s.management.Port &&
-		(bindingsOverlap(s.management.ActiveAddress, mediaTCPBinding(effective, resolvedMedia)) ||
-			(!s.management.Locked && bindingsOverlap(resolvedManagement, mediaTCPBinding(effective, resolvedMedia)))) {
+	mediaTCPBind := mediaTCPBinding(effective, resolvedMedia)
+	webRTCTCPPort := addressPort(effective.WebRTCLocalTCPAddress)
+	desiredManagementPort := value.ManagementPort
+	if s.management.Locked {
+		desiredManagementPort = s.management.Port
+	}
+	if webRTCTCPPort > 0 &&
+		((webRTCTCPPort == s.management.Port && bindingsOverlap(s.management.ActiveAddress, mediaTCPBind)) ||
+			(webRTCTCPPort == desiredManagementPort && bindingsOverlap(resolvedManagement, mediaTCPBind))) {
 		writeError(w, http.StatusBadRequest, "WebRTC TCP fallback cannot use the management listener port on the same interface")
 		return
 	}
@@ -777,6 +808,213 @@ func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("ETag", revisionETag(value.Revision))
 	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *server) listProjects(w http.ResponseWriter, r *http.Request) {
+	if s.projects == nil {
+		writeError(w, http.StatusServiceUnavailable, "project storage is unavailable")
+		return
+	}
+	items, err := s.projects.List(r.Context())
+	if err != nil {
+		s.logger.Error("list projects", "error", err)
+		writeError(w, http.StatusInternalServerError, "projects are unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"projects": items})
+}
+
+func (s *server) saveProject(w http.ResponseWriter, r *http.Request) {
+	if s.projects == nil {
+		writeError(w, http.StatusServiceUnavailable, "project storage is unavailable")
+		return
+	}
+	var request projectNameRequest
+	if err := decodeStrictJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	item, err := s.projects.Save(r.Context(), request.Name)
+	if err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/projects/"+url.PathEscape(item.ID))
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusCreated, item.Summary())
+}
+
+func (s *server) importProject(w http.ResponseWriter, r *http.Request) {
+	if s.projects == nil {
+		writeError(w, http.StatusServiceUnavailable, "project storage is unavailable")
+		return
+	}
+	defer r.Body.Close()
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
+	decoder.DisallowUnknownFields()
+	var manifest project.Manifest
+	if err := decoder.Decode(&manifest); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid project file: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "project file must contain one JSON object")
+		return
+	}
+	item, err := s.projects.Import(r.Context(), manifest)
+	if err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/projects/"+url.PathEscape(item.ID))
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusCreated, item.Summary())
+}
+
+func (s *server) projectAction(w http.ResponseWriter, r *http.Request) {
+	if s.projects == nil {
+		writeError(w, http.StatusServiceUnavailable, "project storage is unavailable")
+		return
+	}
+	remainder := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/projects/"), "/")
+	parts := strings.Split(remainder, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	id := parts[0]
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPatch:
+			s.renameProject(id, w, r)
+		case http.MethodPut:
+			s.overwriteProject(id, w, r)
+		case http.MethodDelete:
+			s.deleteProject(id, w, r)
+		default:
+			w.Header().Set("Allow", "PATCH, PUT, DELETE")
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+	if len(parts) == 2 && parts[1] == "load" && r.Method == http.MethodPost {
+		s.loadProject(id, w, r)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "export" && r.Method == http.MethodGet {
+		s.exportProject(id, w, r)
+		return
+	}
+	writeError(w, http.StatusNotFound, "not found")
+}
+
+func (s *server) renameProject(id string, w http.ResponseWriter, r *http.Request) {
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
+	var request projectNameRequest
+	if err := decodeStrictJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	item, err := s.projects.Rename(r.Context(), id, request.Name, expectedRevision)
+	if err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusOK, item.Summary())
+}
+
+func (s *server) overwriteProject(id string, w http.ResponseWriter, r *http.Request) {
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
+	var request projectNameRequest
+	if err := decodeStrictJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	item, err := s.projects.Overwrite(r.Context(), id, request.Name, expectedRevision)
+	if err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusOK, item.Summary())
+}
+
+func (s *server) deleteProject(id string, w http.ResponseWriter, r *http.Request) {
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
+	if err := s.projects.Delete(r.Context(), id, expectedRevision); err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) loadProject(id string, w http.ResponseWriter, r *http.Request) {
+	expectedRevision, ok := requireIfMatch(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.projects.Load(r.Context(), id, expectedRevision)
+	if err != nil {
+		var loadErr *project.LoadError
+		if errors.As(err, &loadErr) {
+			status := http.StatusConflict
+			writeJSON(w, status, map[string]any{
+				"error": map[string]any{
+					"code": "project_load_failed", "message": loadErr.Error(),
+					"rollbackSucceeded": loadErr.RollbackErr == nil,
+				},
+			})
+			return
+		}
+		writeProjectError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) exportProject(id string, w http.ResponseWriter, r *http.Request) {
+	item, err := s.projects.Get(r.Context(), id)
+	if err != nil {
+		writeProjectError(w, err)
+		return
+	}
+	filename := strings.Map(func(value rune) rune {
+		if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '-' || value == '_' {
+			return value
+		}
+		return '-'
+	}, item.Name)
+	if filename == "" {
+		filename = "gateway-project"
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.json"`, filename))
+	w.Header().Set("ETag", revisionETag(item.Revision))
+	writeJSON(w, http.StatusOK, item.Manifest(time.Now()))
+}
+
+func writeProjectError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, project.ErrNotFound):
+		writeError(w, http.StatusNotFound, "project not found")
+	case errors.Is(err, project.ErrRevisionConflict):
+		writeAPIError(w, http.StatusPreconditionFailed, "revision_conflict", "project changed since it was read")
+	case errors.Is(err, project.ErrNameConflict):
+		writeAPIError(w, http.StatusConflict, "name_conflict", "a project with this name already exists")
+	case errors.Is(err, project.ErrInvalid), errors.Is(err, project.ErrLiveNotSettled):
+		writeError(w, http.StatusBadRequest, strings.TrimPrefix(strings.TrimPrefix(err.Error(), project.ErrInvalid.Error()+": "), project.ErrLiveNotSettled.Error()+": "))
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
+	}
 }
 
 func addressPort(address string) int {
@@ -1511,6 +1749,7 @@ func (r channelRequest) toDraft(current *channel.Channel) channel.Draft {
 func (r settingsRequest) settings() settings.Settings {
 	return settings.Settings{
 		ManagementBindAddress:    r.ManagementBindAddress,
+		ManagementPort:           r.ManagementPort,
 		MediaBindAddress:         r.MediaBindAddress,
 		LogLevel:                 r.LogLevel,
 		ReadTimeout:              r.ReadTimeout,
