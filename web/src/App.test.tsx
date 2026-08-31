@@ -54,7 +54,7 @@ function channelWithMode(mode: InputMode): Channel {
   };
 }
 
-function statusWith(channels: Channel[], overrides: { settings?: Record<string, unknown>; gateway?: Record<string, unknown>; media?: Record<string, unknown> } = {}) {
+function statusWith(channels: Channel[], overrides: { settings?: Record<string, unknown>; gateway?: Record<string, unknown>; media?: Record<string, unknown>; network?: Record<string, unknown> } = {}) {
   return {
     gateway: { version: "test", startedAt: "2026-08-25T08:00:00Z", restartRequired: false, ...overrides.gateway },
     media: { reachable: true, version: "1.0", ...overrides.media },
@@ -88,6 +88,7 @@ function statusWith(channels: Channel[], overrides: { settings?: Record<string, 
       interfaces: [],
       management: { activeAddress: "*", desiredAddress: "*", port: 8080, restartRequired: false },
       media: { activeAddress: "*", desiredAddress: "*", restartRequired: false, activeListeners: { srt: ":8890", webRTCUDP: ":8189", webRTCTCP: "" } },
+      ...overrides.network,
     },
     channels,
   };
@@ -582,6 +583,52 @@ describe("dashboard navigation", () => {
 
     await user.click(screen.getByRole("button", { name: "Reload latest" }));
     await waitFor(() => expect((screen.getByRole("combobox", { name: /Media server log level/ }) as HTMLSelectElement).value).toBe("debug"));
+  });
+
+  it("keeps long interface choices in an accessible wrapping picker", async () => {
+    const user = userEvent.setup();
+    const interfaceName = "broadcast-engineering-contribution-network-adapter";
+    const address = "2001:db8:1234:5678:90ab:cdef:1234:5678";
+    const status = statusWith([], {
+      network: {
+        interfaces: [{ name: interfaceName, address, family: "IPv6", loopback: false }],
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(status)));
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const managementPicker = screen.getByRole("button", { name: /^Web UI & API interface:/ });
+    expect(managementPicker.getAttribute("aria-haspopup")).toBe("listbox");
+    expect(managementPicker.getAttribute("aria-expanded")).toBe("false");
+
+    await user.click(managementPicker);
+    const listbox = screen.getByRole("listbox", { name: /Web UI & API interface/ });
+    const selected = within(listbox).getByRole("option", { name: "All interfaces" });
+    await waitFor(() => expect(document.activeElement).toBe(selected));
+    const followGroup = within(listbox).getByRole("group", { name: "Follow interface" });
+    const fullLabel = `${interfaceName} - ${address} (IPv6)`;
+    const followOption = within(followGroup).getByRole("option", { name: fullLabel });
+    expect(followOption.textContent).toBe(fullLabel);
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox", { name: /Web UI & API interface/ })).toBeNull();
+    expect(document.activeElement).toBe(managementPicker);
+
+    await user.click(managementPicker);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("option", { name: "All interfaces" })));
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(within(screen.getByRole("group", { name: "Follow interface" })).getByRole("option", { name: fullLabel }));
+    await user.keyboard("{Enter}");
+    expect(managementPicker.textContent).toContain(fullLabel);
+    expect(managementPicker.getAttribute("title")).toBe(fullLabel);
+    expect(screen.getByRole("button", { name: /^Media interface:/ }).textContent).toContain(fullLabel);
+
+    await user.click(managementPicker);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("option", { name: fullLabel, selected: true })));
+    await user.tab();
+    await waitFor(() => expect(screen.queryByRole("listbox", { name: /Web UI & API interface/ })).toBeNull());
+    expect(document.activeElement?.getAttribute("role")).not.toBe("option");
   });
 
   it("does not let an older channel poll overwrite a completed reload", async () => {

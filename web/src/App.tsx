@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import {
   absolutePath,
   activeListenerHost,
@@ -945,7 +945,7 @@ function Dashboard() {
             onClick={() => showOverview()}
           >Overview</button>
           <button className={projectsOpen ? "topnav-link active" : "topnav-link"} type="button" aria-current={projectsOpen ? "page" : undefined} aria-haspopup="dialog" onClick={() => setProjectsOpen(true)}>Projects</button>
-          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
+          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} aria-haspopup="dialog" onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
         </nav>
 
         <button
@@ -1543,16 +1543,17 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
                 <span>CONTROL PLANE</span>
                 {network.management.locked && <small>ENV LOCKED</small>}
               </div>
-              <label className="field">
-                <FieldTitle help="Address or interface used by the dashboard, API, viewer pages, and WHEP signaling. Changing it requires a Gateway restart.">Web UI &amp; API interface</FieldTitle>
-                <select
+              <div className="field">
+                <FieldTitle id="management-interface-label" help="Address or interface used by the dashboard, API, viewer pages, and WHEP signaling. Changing it requires a Gateway restart.">Web UI &amp; API interface</FieldTitle>
+                <BindingSelect
+                  label="Web UI & API interface"
+                  labelledBy="management-interface-label"
                   value={form.managementBindAddress}
                   disabled={network.management.locked}
-                  onChange={(event) => changeManagementBinding(event.target.value)}
-                >
-                  <BindingOptions value={form.managementBindAddress} interfaces={network.interfaces} />
-                </select>
-              </label>
+                  interfaces={network.interfaces}
+                  onChange={changeManagementBinding}
+                />
+              </div>
               <label className="field">
                 <FieldTitle help="TCP port used by the dashboard, API, viewer pages, and WHEP signaling. Changing it requires a Gateway restart.">Web UI &amp; API port</FieldTitle>
                 <input type="number" min="1" max="65535" value={form.managementPort} disabled={network.management.locked} onChange={(event) => updateNumber("managementPort", event.target.value)} />
@@ -1576,16 +1577,17 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
                 <span>MEDIA PLANE</span>
                 <small>LIVE APPLY</small>
               </div>
-              <label className="field">
-                <FieldTitle help="Address or interface used for SRT, RTP, and WebRTC media listeners. Changes apply live and briefly interrupt streams.">Media interface</FieldTitle>
-                <select value={form.mediaBindAddress} onChange={(event) => changeMediaBinding(event.target.value)}>
-                  <BindingOptions
-                    value={form.mediaBindAddress}
-                    interfaces={network.interfaces}
-                    includeCustom={currentMediaBindAddress === "custom"}
-                  />
-                </select>
-              </label>
+              <div className="field">
+                <FieldTitle id="media-interface-label" help="Address or interface used for SRT, RTP, and WebRTC media listeners. Changes apply live and briefly interrupt streams.">Media interface</FieldTitle>
+                <BindingSelect
+                  label="Media interface"
+                  labelledBy="media-interface-label"
+                  value={form.mediaBindAddress}
+                  interfaces={network.interfaces}
+                  includeCustom={currentMediaBindAddress === "custom"}
+                  onChange={changeMediaBinding}
+                />
+              </div>
               <p>Applies immediately and briefly interrupts SRT, RTP, and WebRTC listeners and active channels.</p>
               {network.media.activeAddress && (
                 <div className="binding-status">
@@ -1724,11 +1726,15 @@ function SettingsEditor({ form, error, conflict, saving, mutationBlocked, networ
   );
 }
 
-function BindingOptions({ value, interfaces, includeCustom = false }: {
+type BindingChoice = {
   value: string;
-  interfaces: NetworkInterface[];
-  includeCustom?: boolean;
-}) {
+  label: string;
+  group?: "Follow interface" | "Fixed address";
+  afterGroups?: boolean;
+};
+
+function bindingChoices(value: string, interfaces: NetworkInterface[], includeCustom: boolean) {
+  const choices: BindingChoice[] = [{ value: "*", label: "All interfaces" }];
   const selectedInterface = parseInterfaceBinding(value);
   const selectorCounts = new Map<string, number>();
   for (const item of interfaces) {
@@ -1743,22 +1749,155 @@ function BindingOptions({ value, interfaces, includeCustom = false }: {
   const fixedAvailable = fixedAddress && fixedOptions.some((item) => item.address === value);
   const available = value === "*" || value === "custom" || fixedAddress ||
     selectedInterface !== null && interfaceOptions.some((item) => interfaceBindingSelector(item) === value);
+  if (includeCustom || value === "custom") choices.push({ value: "custom", label: "Legacy custom addresses" });
+  if (fixedAddress && !fixedAvailable) choices.push({ value, label: `Fixed address - ${value} (unavailable)` });
+  for (const item of interfaceOptions) {
+    choices.push({ value: interfaceBindingSelector(item), label: interfaceLabel(item), group: "Follow interface" });
+  }
+  for (const item of fixedOptions) {
+    choices.push({ value: item.address, label: interfaceLabel(item), group: "Fixed address" });
+  }
+  if (!available) choices.push({ value, label: `${value} (current, unavailable)`, afterGroups: true });
+  return choices;
+}
+
+function BindingSelect({ label, labelledBy, value, interfaces, includeCustom = false, disabled = false, onChange }: {
+  label: string;
+  labelledBy: string;
+  value: string;
+  interfaces: NetworkInterface[];
+  includeCustom?: boolean;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const listboxId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const choices = bindingChoices(value, interfaces, includeCustom);
+  const selected = choices.find((choice) => choice.value === value) ?? { value, label: value };
+  const ungrouped = choices.filter((choice) => choice.group === undefined && !choice.afterGroups);
+  const trailing = choices.filter((choice) => choice.afterGroups);
+  const groups = (["Follow interface", "Fixed address"] as const).map((label) => ({
+    label,
+    choices: choices.filter((choice) => choice.group === label),
+  })).filter((group) => group.choices.length > 0);
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      rootRef.current?.querySelector<HTMLElement>('[role="option"][aria-selected="true"]')?.focus();
+    });
+    const closeOutside = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", closeOutside);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  const focusOption = (current: HTMLElement, offset: number | "first" | "last") => {
+    const options = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('[role="option"]') ?? []);
+    if (options.length === 0) return;
+    const currentIndex = options.indexOf(current);
+    const nextIndex = offset === "first" ? 0
+      : offset === "last" ? options.length - 1
+        : (currentIndex + offset + options.length) % options.length;
+    options[nextIndex]?.focus();
+  };
+
+  const handleOptionKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus();
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      focusOption(event.currentTarget, event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      focusOption(event.currentTarget, event.key === "Home" ? "first" : "last");
+    } else if (event.key.length === 1 && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      const options = Array.from(rootRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? []);
+      const start = options.indexOf(event.currentTarget);
+      const query = event.key.toLocaleLowerCase();
+      const match = [...options.slice(start + 1), ...options.slice(0, start + 1)]
+        .find((option) => option.textContent?.trim().toLocaleLowerCase().startsWith(query));
+      if (match) {
+        event.preventDefault();
+        match.focus();
+      }
+    }
+  };
+
+  const choose = (choice: BindingChoice) => {
+    onChange(choice.value);
+    setOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
+  const renderChoice = (choice: BindingChoice) => (
+    <button
+      key={`${choice.group ?? "general"}:${choice.value}`}
+      className="binding-select-option"
+      type="button"
+      role="option"
+      aria-selected={choice.value === value}
+      tabIndex={choice.value === value ? 0 : -1}
+      onClick={() => choose(choice)}
+      onKeyDown={handleOptionKeyDown}
+    >{choice.label}</button>
+  );
+
   return (
-    <>
-      <option value="*">All interfaces</option>
-      {(includeCustom || value === "custom") && <option value="custom">Legacy custom addresses</option>}
-      {fixedAddress && !fixedAvailable && <option value={value}>Fixed address - {value} (unavailable)</option>}
-      {interfaceOptions.length > 0 && <optgroup label="Follow interface">
-        {interfaceOptions.map((item) => {
-          const selector = interfaceBindingSelector(item);
-          return <option key={selector} value={selector}>{interfaceLabel(item)}</option>;
-        })}
-      </optgroup>}
-      {fixedOptions.length > 0 && <optgroup label="Fixed address">
-        {fixedOptions.map((item) => <option key={item.address} value={item.address}>{interfaceLabel(item)}</option>)}
-      </optgroup>}
-      {!available && <option value={value}>{value} (current, unavailable)</option>}
-    </>
+    <div
+      ref={rootRef}
+      className="binding-select"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+      }}
+    >
+      <button
+        ref={triggerRef}
+        className="binding-select-trigger"
+        type="button"
+        aria-label={`${label}: ${selected.label}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        disabled={disabled}
+        title={selected.label}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
+        <span className="binding-select-value">{selected.label}</span>
+        <span className="binding-select-chevron" aria-hidden="true" />
+      </button>
+      {open && (
+        <div id={listboxId} className="binding-select-list" role="listbox" aria-labelledby={labelledBy}>
+          {ungrouped.map(renderChoice)}
+          {groups.map((group) => (
+            <div key={group.label} className="binding-select-group" role="group" aria-label={group.label}>
+              <div className="binding-select-group-label" aria-hidden="true">{group.label}</div>
+              {group.choices.map(renderChoice)}
+            </div>
+          ))}
+          {trailing.map(renderChoice)}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2123,8 +2262,8 @@ function StreamFact({ label, help, value, warning = false }: { label: string; he
   );
 }
 
-function FieldTitle({ children, help }: { children: ReactNode; help: string }) {
-  return <span className="field-title">{children}<HelpTip label={String(children)} content={help} placement="left" /></span>;
+function FieldTitle({ children, help, id }: { children: ReactNode; help: string; id?: string }) {
+  return <span id={id} className="field-title">{children}<HelpTip label={String(children)} content={help} placement="left" /></span>;
 }
 
 function StreamIdle({ title, detail }: { title: string; detail: string }) {

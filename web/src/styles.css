@@ -136,7 +136,7 @@ button:disabled {
 
 .tooltip {
   position: fixed;
-  z-index: 50;
+  z-index: 200;
   width: max-content;
   max-width: min(280px, calc(100vw - 16px));
   padding: 9px 10px;
@@ -1264,17 +1264,11 @@ button.state-pill { cursor: pointer; }
 }
 
 .editor {
-  width: min(660px, 100%);
-  height: 100%;
   display: grid;
   grid-template-rows: auto 1fr auto;
   border-left: 1px solid var(--line);
   background: var(--panel-dialog);
   box-shadow: -24px 0 80px var(--shadow-light);
-}
-
-.settings-editor {
-  width: min(720px, 100%);
 }
 
 .editor-header,
@@ -1300,6 +1294,7 @@ button.state-pill { cursor: pointer; }
 .editor-body {
   padding: 24px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .icon-button {
@@ -1348,6 +1343,10 @@ button.state-pill { cursor: pointer; }
   border: 1px solid var(--line);
   border-top-color: var(--accent-alpha-50);
   background: var(--panel-raised);
+}
+
+.binding-card > .field + .field {
+  margin-top: 16px;
 }
 
 .binding-card-heading {
@@ -1485,8 +1484,113 @@ button.state-pill { cursor: pointer; }
 
 .field input,
 .field select {
-  height: 42px;
+  min-height: 42px;
   padding: 0 11px;
+}
+
+.binding-select {
+  min-width: 0;
+}
+
+.binding-select-trigger {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 11px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  outline: none;
+  background: var(--field);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.binding-select-trigger:focus-visible {
+  border-color: var(--accent-alpha-62);
+  box-shadow: 0 0 0 1px var(--accent-weak);
+}
+
+.binding-select-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.binding-select-chevron {
+  width: 8px;
+  height: 8px;
+  margin: -4px 2px 0 0;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  rotate: 45deg;
+  color: var(--muted);
+}
+
+.binding-select-list {
+  max-height: min(280px, 42dvh);
+  margin-top: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line-emphasis);
+  background: var(--panel-dialog);
+  box-shadow: 0 14px 34px var(--shadow);
+}
+
+.binding-select-group + .binding-select-group,
+.binding-select-option + .binding-select-group {
+  border-top: 1px solid var(--line);
+}
+
+.binding-select-group-label {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  padding: 8px 11px;
+  background: var(--panel-raised);
+  color: var(--accent);
+  font: 600 0.6rem/1 Inter, sans-serif;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.binding-select-option {
+  width: 100%;
+  padding: 9px 11px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-secondary);
+  font: 0.72rem/1.45 Inter, sans-serif;
+  overflow-wrap: anywhere;
+  text-align: left;
+  cursor: pointer;
+}
+
+.binding-select-list > .binding-select-option:first-child,
+.binding-select-group > .binding-select-option:nth-child(2) {
+  border-top: 0;
+}
+
+.binding-select-option:hover,
+.binding-select-option:focus-visible {
+  outline: none;
+  background: var(--accent-alpha-08);
+  color: var(--ink);
+}
+
+.binding-select-option:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.binding-select-option[aria-selected="true"] {
+  background: var(--accent-alpha-14);
+  color: var(--accent);
 }
 
 .field textarea {
@@ -1507,16 +1611,17 @@ button.state-pill { cursor: pointer; }
 }
 
 .suffix-input input {
-  padding-right: 45px;
+  padding-right: 70px;
 }
 
 .suffix-input span {
   position: absolute;
   top: 50%;
-  right: 11px;
+  right: 30px;
   translate: 0 -50%;
   color: var(--muted);
   font: 0.66rem/1 Inter, sans-serif;
+  pointer-events: none;
 }
 
 .check {
@@ -1587,6 +1692,13 @@ button.state-pill { cursor: pointer; }
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
+}
+
+.editor-alert > span {
+  min-width: 0;
+  flex: 1 1 240px;
+  overflow-wrap: anywhere;
 }
 
 .settings-notice {
@@ -1833,10 +1945,6 @@ button.state-pill { cursor: pointer; }
     padding: 0 20px 30px;
   }
 
-  .editor {
-    width: min(620px, 94%);
-  }
-
   .metric-strip {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -1953,11 +2061,6 @@ button.state-pill { cursor: pointer; }
     width: 100%;
   }
 
-  .editor {
-    width: 100%;
-    border-left: 0;
-  }
-
   .editor-header,
   .editor-body,
   .editor-footer {
@@ -2043,7 +2146,7 @@ button.state-pill { cursor: pointer; }
 }
 .tooltip { border-radius: 8px; }
 .button, .input, .connection-value input, .copy-action, .open-action, .icon-button,
-.help-tip, .field input, .field select, .field textarea,
+.help-tip, .field input, .field select, .field textarea, .binding-select-trigger, .binding-select-list,
 .connection-badge, .stream-state {
   border-radius: 8px;
 }
@@ -2447,21 +2550,24 @@ button.state-pill { cursor: pointer; }
   z-index: 100;
   align-items: center;
   justify-content: center;
-  padding: 32px;
+  padding: clamp(12px, 4vw, 32px);
   background: var(--overlay);
 }
 
-.editor,
-.settings-editor {
+.editor {
   position: relative;
-  width: min(640px, calc(100vw - 64px));
+  width: min(640px, 100%);
   height: auto;
-  max-height: 88vh;
+  max-height: min(88dvh, calc(100dvh - 24px));
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--panel-dialog);
   box-shadow: 0 28px 90px var(--shadow);
   overflow: hidden;
+}
+
+.settings-editor {
+  width: min(720px, 100%);
 }
 
 .editor > .icon-button {
@@ -3030,6 +3136,13 @@ button.state-pill { cursor: pointer; }
   font-size: 0.66rem;
 }
 
+@media (max-width: 720px) {
+  .settings-editor .form-grid,
+  .settings-editor .legacy-address-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 760px) {
   .diagnostics-dialog {
     width: calc(100vw - 24px);
@@ -3043,10 +3156,6 @@ button.state-pill { cursor: pointer; }
 }
 
 @media (max-width: 560px) {
-  .editor-backdrop {
-    padding: 12px;
-  }
-
   .diagnostics-header,
   .diagnostics-body,
   .diagnostics-footer {
@@ -3068,6 +3177,26 @@ button.state-pill { cursor: pointer; }
 
   .diagnostics-footer .button.primary {
     flex: 1;
+  }
+}
+
+@media (max-height: 500px) {
+  .editor-backdrop {
+    padding-block: 8px;
+  }
+
+  .editor {
+    max-height: calc(100dvh - 16px);
+  }
+
+  .editor-header,
+  .editor-footer {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .editor > .icon-button {
+    top: 8px;
   }
 }
 
