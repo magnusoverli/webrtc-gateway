@@ -251,6 +251,7 @@ function Dashboard() {
     { scope: "system" } | { scope: "channel"; channelID: string; channelName: string } | null
   >(null);
   const [projectsOpen, setProjectsOpen] = useState(false);
+  const [linksOpen, setLinksOpen] = useState(false);
   const [liveAnnouncement, setLiveAnnouncement] = useState("");
   const passphraseRequestRef = useRef<AbortController | null>(null);
   const rateSamplesRef = useRef<ReadonlyMap<string, ChannelRateSample>>(new Map());
@@ -923,7 +924,7 @@ function Dashboard() {
   const displayedPassphrase = selected && revealedPassphrase && revealedPassphrase.channelID === selected.id && revealedPassphrase.revision === selected.revision
     ? revealedPassphrase.value
     : null;
-  const modalOpen = Boolean(form || settingsForm || diagnosticsTarget || projectsOpen);
+  const modalOpen = Boolean(form || settingsForm || diagnosticsTarget || projectsOpen || linksOpen);
 
   return (
     <div className="app-shell">
@@ -1064,6 +1065,7 @@ function Dashboard() {
               previewSavingIDs={previewSavingIDs}
               onAutomaticPreviewChange={(item, enabled) => void updateAutomaticPreview(item, enabled)}
               onCreate={openCreate}
+              onShowLinks={() => setLinksOpen(true)}
               onRetry={refreshStatus}
               mutationsDisabled={statusStale}
               headingRef={overviewHeadingRef}
@@ -1283,6 +1285,32 @@ function Dashboard() {
         />
       )}
 
+      {linksOpen && <ModalShell labelledBy="links-dialog-title" className="links-dialog" onClose={() => setLinksOpen(false)} closeLabel="Close links and embeds">
+        <header className="editor-header">
+          <div><span className="eyebrow">VIEWER DELIVERY</span><h2 id="links-dialog-title">Links &amp; embeds</h2></div>
+        </header>
+        <div className="editor-body">
+          <p className="links-description">Open a WebRTC viewer URL in a browser, or use its iframe code to embed the player. All configured channels are listed, including offline and disabled channels.</p>
+          {statusStale && <p className="links-description" role="status">Showing links from the last known channel configuration.</p>}
+          {managementBinding.state === "pending-restart" && <p className="links-description" role="status">These links use the current management address. Reopen this dialog after the pending restart for updated links.</p>}
+          <section className="links-section" aria-label="Multiviewer">
+            <h3>Multiviewer</h3>
+            <p className="links-description">Plays all ready channels independently; there is no combined multiview WHEP endpoint.</p>
+            <ConnectionRow label="WebRTC viewer URL" value={absolutePath(outputOrigin, "/view")} openURL />
+            <ConnectionRow label="Iframe embed code" value={iframeEmbedCode(absolutePath(outputOrigin, "/view"), "Multiviewer")} />
+          </section>
+          {(status?.channels ?? []).map((channel) => {
+            const url = absolutePath(outputOrigin, channel.embedPath);
+            return <section className="links-section" key={channel.id} aria-label={`Channel ${channel.number}: ${channel.name}`}>
+              <span className="eyebrow">CHANNEL {channel.number}</span>
+              <h3>{channel.name}</h3>
+              <ConnectionRow label="WebRTC viewer URL" value={url} openURL />
+              <ConnectionRow label="Iframe embed code" value={iframeEmbedCode(url, channel.name)} />
+              <ConnectionRow label="WHEP API endpoint" value={absolutePath(outputOrigin, channel.whepPath)} />
+            </section>;
+          })}
+        </div>
+      </ModalShell>}
       {diagnosticsTarget?.scope === "system" && <DiagnosticsDialog scope="system" onClose={() => setDiagnosticsTarget(null)} />}
       {diagnosticsTarget?.scope === "channel" && <DiagnosticsDialog scope="channel" channelID={diagnosticsTarget.channelID} channelName={diagnosticsTarget.channelName} onClose={() => setDiagnosticsTarget(null)} />}
       {projectsOpen && <ProjectsDialog
@@ -2138,15 +2166,16 @@ export function ConnectionRow({ label, value, secondary = false, openURL = false
   secondary?: boolean;
   openURL?: boolean;
 }) {
+  const inputID = useId();
   const inputRef = useRef<HTMLInputElement>(null);
   const help = connectionHelp(label);
   const available = value !== "-" && !value.startsWith("Unavailable");
   return (
     <div className={`connection-row${secondary ? " secondary-row" : ""}`}>
-      <label htmlFor={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}>{label}{help && <HelpTip label={label} content={help} placement="right" />}</label>
+      <label htmlFor={inputID}>{label}{help && <HelpTip label={label} content={help} placement="right" />}</label>
       <div className="connection-value">
         <input
-          id={`connection-${label.replaceAll(" ", "-").toLowerCase()}`}
+          id={inputID}
           ref={inputRef}
           value={value}
           readOnly

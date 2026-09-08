@@ -1,6 +1,6 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode, type RefObject } from "react";
 import { channelPlaybackReady, channelStateLabel, channelTone, primaryChannelIssue, trackKind, type Channel, type ChannelStreamRates, type ChannelTone, type Track } from "./channel";
-import { GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
+import { CopyIcon, GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 
@@ -23,6 +23,7 @@ type Props = {
   previewSavingIDs: ReadonlySet<string>;
   onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
   onCreate: () => void;
+  onShowLinks: () => void;
   onRetry: () => void;
   mutationsDisabled?: boolean;
   headingRef?: RefObject<HTMLHeadingElement | null>;
@@ -47,6 +48,7 @@ export function ChannelOverview({
   previewSavingIDs,
   onAutomaticPreviewChange,
   onCreate,
+  onShowLinks,
   onRetry,
   mutationsDisabled = false,
   headingRef,
@@ -100,10 +102,13 @@ export function ChannelOverview({
         <span>NO CHANNELS</span>
         <h2 id="empty-channels-title">No channels configured</h2>
         <p>Create an RTP or SRT channel to begin routing media.</p>
-        <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
-          <PlusIcon aria-hidden="true" />
-          Create channel
-        </button>
+        <div className="overview-actions">
+          <button className="button secondary" type="button" onClick={onShowLinks} aria-haspopup="dialog"><CopyIcon /> Links &amp; embeds</button>
+          <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
+            <PlusIcon aria-hidden="true" />
+            Create channel
+          </button>
+        </div>
       </section>
     );
   }
@@ -113,10 +118,13 @@ export function ChannelOverview({
       <h1 id="channel-overview-title" className="visually-hidden" ref={headingRef} tabIndex={-1}>Channels</h1>
       <div className="overview-intro">
         <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
-        <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
-          <PlusIcon aria-hidden="true" />
-          Add channel
-        </button>
+        <div className="overview-actions">
+          <button className="button secondary" type="button" onClick={onShowLinks} aria-haspopup="dialog"><CopyIcon /> Links &amp; embeds</button>
+          <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
+            <PlusIcon aria-hidden="true" />
+            Add channel
+          </button>
+        </div>
       </div>
       {error && <div className="overview-stale"><span>Showing last known channel state. Gateway polling will retry automatically.</span><button className="button secondary" type="button" onClick={onRetry}>Retry now</button></div>}
 

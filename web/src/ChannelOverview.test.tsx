@@ -340,6 +340,7 @@ function overview(overrides: Overrides = {}) {
       previewSavingIDs={new Set()}
       onAutomaticPreviewChange={() => undefined}
       onCreate={() => undefined}
+      onShowLinks={() => undefined}
       onRetry={() => undefined}
       {...overrides}
     />

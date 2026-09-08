@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { createRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createRef, StrictMode, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ModalShell } from "./Modal";
@@ -133,7 +133,7 @@ describe("ModalShell", () => {
     expect(document.activeElement).toBe(dialog);
   });
 
-  it("restores prior focus on unmount and exposes the dialog ref", () => {
+  it("restores prior focus on unmount and exposes the dialog ref", async () => {
     const opener = document.createElement("button");
     document.body.append(opener);
     opener.focus();
@@ -149,7 +149,27 @@ describe("ModalShell", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Inside" }));
     view.unmount();
     expect(dialogRef.current).toBeNull();
-    expect(document.activeElement).toBe(opener);
+    await waitFor(() => expect(document.activeElement).toBe(opener));
     opener.remove();
+  });
+
+  it("restores the opener after background inert is removed in StrictMode", async () => {
+    const user = userEvent.setup();
+    function Example() {
+      const [open, setOpen] = useState(false);
+      return <>
+        <main inert={open ? true : undefined}><button onClick={() => setOpen(true)}>Open</button></main>
+        {open && <ModalShell labelledBy="modal-title" closeLabel="Close" onClose={() => setOpen(false)}><h2 id="modal-title">Editor</h2></ModalShell>}
+      </>;
+    }
+    render(<StrictMode><Example /></StrictMode>);
+    const opener = screen.getByRole("button", { name: "Open" });
+    const focus = vi.spyOn(opener, "focus");
+    await user.click(opener);
+    focus.mockClear();
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(focus).toHaveBeenCalledOnce();
+    expect(opener.closest("[inert]")).toBeNull();
+    expect(document.activeElement).toBe(opener);
   });
 });

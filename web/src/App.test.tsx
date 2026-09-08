@@ -161,6 +161,69 @@ describe("dashboard navigation", () => {
     expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("shares every channel and the multiview from the overview using the active management address", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const studio = channelWithMode("srt-push");
+    const backup = { ...studio, id: "backup", number: 7, name: 'Backup "A" & B', enabled: false, embedPath: "/embed/7", whepPath: "/api/v1/channels/backup/whep" };
+    const fetch = vi.fn((_input: RequestInfo | URL) => Promise.resolve(jsonResponse(statusWith([studio, backup], {
+      network: { management: { activeAddress: "192.0.2.10", desiredAddress: "192.0.2.20", port: 8080, desiredPort: 9090, restartRequired: true } },
+    }))));
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    const trigger = await screen.findByRole("button", { name: "Links & embeds" });
+    await user.type(screen.getByRole("searchbox", { name: "Search channels" }), "Studio");
+    expect(screen.queryByRole("heading", { name: backup.name })).toBeNull();
+    await user.click(trigger);
+
+    const dialog = screen.getByRole("dialog", { name: "Links & embeds" });
+    expect(document.querySelector("main")?.hasAttribute("inert")).toBe(true);
+    expect(within(dialog).getByText(/current management address/)).toBeDefined();
+    const multiview = within(within(dialog).getByRole("region", { name: "Multiviewer" }));
+    expect(multiview.getByRole("textbox", { name: "WebRTC viewer URL value" })).toHaveProperty("value", "http://192.0.2.10:8080/view");
+    expect(multiview.queryByRole("textbox", { name: "WHEP API endpoint value" })).toBeNull();
+    const channel = within(within(dialog).getByRole("region", { name: `Channel 7: ${backup.name}` }));
+    expect(channel.getByRole("textbox", { name: "WebRTC viewer URL value" })).toHaveProperty("value", "http://192.0.2.10:8080/embed/7");
+    expect(channel.getByRole("link", { name: "Open WebRTC viewer URL" }).getAttribute("href")).toBe("http://192.0.2.10:8080/embed/7");
+    expect(channel.getByRole("textbox", { name: "WHEP API endpoint value" })).toHaveProperty("value", "http://192.0.2.10:8080/api/v1/channels/backup/whep");
+    const snippet = channel.getByRole("textbox", { name: "Iframe embed code value" }) as HTMLInputElement;
+    expect(snippet.value).toContain('src="http://192.0.2.10:8080/embed/7"');
+    expect(snippet.value).toContain('title="Backup &quot;A&quot; &amp; B"');
+    await user.click(channel.getByRole("button", { name: "Copy Iframe embed code" }));
+    expect(writeText).toHaveBeenLastCalledWith(snippet.value);
+    const multiviewSnippet = multiview.getByRole("textbox", { name: "Iframe embed code value" }) as HTMLInputElement;
+    expect(multiviewSnippet.value).toContain('src="http://192.0.2.10:8080/view"');
+    await user.click(multiview.getByRole("button", { name: "Copy Iframe embed code" }));
+    expect(writeText).toHaveBeenLastCalledWith(multiviewSnippet.value);
+    const inputs = within(dialog).getAllByRole("textbox");
+    expect(inputs).toHaveLength(8);
+    expect(new Set(inputs.map((input) => input.id)).size).toBe(inputs.length);
+    expect(dialog.querySelector("iframe, video")).toBeNull();
+    expect(fetch.mock.calls.every(([input]) => !String(input).includes("whep"))).toBe(true);
+    expect(appPlayerHarness.calls.mock.calls.every(([options]) => !options.enabled)).toBe(true);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("offers multiview links without channels and selects text when clipboard access is unavailable", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse(statusWith([])))));
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Links & embeds" }));
+    const dialog = screen.getByRole("dialog", { name: "Links & embeds" });
+    expect(within(dialog).getAllByRole("region")).toHaveLength(1);
+    const input = within(dialog).getByRole("textbox", { name: "WebRTC viewer URL value" }) as HTMLInputElement;
+    await user.click(within(dialog).getByRole("button", { name: "Copy WebRTC viewer URL" }));
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(input.value.length);
+    await user.click(within(dialog).getByRole("button", { name: "Close links and embeds" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("synchronizes detail state with browser history", () => {
     window.history.replaceState(null, "", "/?channel=studio");
     render(<App />);

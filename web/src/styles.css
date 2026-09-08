@@ -2092,8 +2092,11 @@ button.state-pill { cursor: pointer; }
 /* --- Overview grid (Nocturne) --- */
 .overview { padding-top: 4px; }
 .overview-subtitle { color: var(--muted); font-size: 0.83rem; margin: 0 0 22px; }
-.overview-intro { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+.overview-intro { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
 .overview-intro .overview-subtitle { margin: 0; }
+.overview-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.blank-state .overview-actions { justify-content: center; }
+.blank-state .overview-actions .button { margin-inline: 0; }
 .overview-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; flex-wrap: wrap; }
 .overview-search { flex: 1; min-width: 220px; max-width: 320px; height: 36px; padding: 0 12px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; font: inherit; }
 .overview-filters { display: inline-flex; gap: 6px; }
@@ -2569,6 +2572,16 @@ button.state-pill { cursor: pointer; }
 .settings-editor {
   width: min(720px, 100%);
 }
+
+.links-dialog {
+  width: min(920px, 100%);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.links-dialog .editor-body { min-width: 0; }
+.links-description { color: var(--muted); font-size: 0.78rem; line-height: 1.6; margin: 0 0 16px; }
+.links-section + .links-section { margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--line-strong); }
+.links-section h3 { margin: 4px 0 12px; overflow-wrap: anywhere; }
 
 .editor > .icon-button {
   position: absolute;

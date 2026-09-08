@@ -54,14 +54,18 @@ export const ModalShell = forwardRef<HTMLElement, ModalShellProps>(function Moda
   closeLabel,
 }, forwardedRef) {
   const dialogRef = useRef<HTMLElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useLayoutEffect(() => {
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    previousFocusRef.current ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const dialog = dialogRef.current;
     if (dialog) (focusableElements(dialog)[0] ?? dialog).focus();
 
     return () => {
-      if (previousFocus?.isConnected) previousFocus.focus();
+      // Wait for React to remove background inert; ignore StrictMode's simulated unmount.
+      queueMicrotask(() => {
+        if (!dialog?.isConnected && previousFocusRef.current?.isConnected) previousFocusRef.current.focus();
+      });
     };
   }, []);
 
