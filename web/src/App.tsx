@@ -1295,7 +1295,7 @@ function Dashboard() {
           {managementBinding.state === "pending-restart" && <p className="links-description" role="status">These links use the current management address. Reopen this dialog after the pending restart for updated links.</p>}
           <section className="links-section" aria-label="Multiviewer">
             <h3>Multiviewer</h3>
-            <p className="links-description">Plays all ready channels independently; there is no combined multiview WHEP endpoint.</p>
+            <p className="links-description">Plays up to 12 channels per page in a 3-by-4 grid; there is no combined multiview WHEP endpoint.</p>
             <ConnectionRow label="WebRTC viewer URL" value={absolutePath(outputOrigin, "/view")} openURL />
             <ConnectionRow label="Iframe embed code" value={iframeEmbedCode(absolutePath(outputOrigin, "/view"), "Multiviewer")} />
           </section>
@@ -2421,7 +2421,7 @@ function connectionHelp(label: string) {
   if (label === "Destination port") return "Per-channel UDP listener used by SRT push senders.";
   if (label === "SRT mode") return "Caller means the encoder initiates the SRT connection to Gateway.";
   if (label.includes("stream-ID URL")) return "Alternative shared SRT endpoint for MPEG-TS senders that support MediaMTX stream IDs.";
-  if (label.includes("Viewer URL")) return "Standalone multiview link that plays every ready channel simultaneously.";
+  if (label.includes("Viewer URL")) return "Standalone multiview link with a 3-by-4 grid, 12 channels per page, and drag-and-drop ordering.";
   if (label.toLowerCase().includes("embed url")) return "Channel-only, transparent video route using the channel's persistent number.";
   if (label === "Iframe embed code") return "Transparent, control-free video for placing this channel directly inside another page.";
   if (label === "WHEP API endpoint") return "Low-level WebRTC-HTTP egress endpoint used by compatible players.";

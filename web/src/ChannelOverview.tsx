@@ -103,6 +103,7 @@ export function ChannelOverview({
         <h2 id="empty-channels-title">No channels configured</h2>
         <p>Create an RTP or SRT channel to begin routing media.</p>
         <div className="overview-actions">
+          <a className="button secondary" href="/view"><GridIcon /> Open multiviewer</a>
           <button className="button secondary" type="button" onClick={onShowLinks} aria-haspopup="dialog"><CopyIcon /> Links &amp; embeds</button>
           <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
             <PlusIcon aria-hidden="true" />
@@ -119,6 +120,7 @@ export function ChannelOverview({
       <div className="overview-intro">
         <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
         <div className="overview-actions">
+          <a className="button secondary" href="/view"><GridIcon /> Open multiviewer</a>
           <button className="button secondary" type="button" onClick={onShowLinks} aria-haspopup="dialog"><CopyIcon /> Links &amp; embeds</button>
           <button className="button primary" type="button" onClick={onCreate} disabled={mutationsDisabled}>
             <PlusIcon aria-hidden="true" />

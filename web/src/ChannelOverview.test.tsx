@@ -36,6 +36,15 @@ afterEach(() => {
 });
 
 describe("ChannelOverview", () => {
+  it.each([0, 1])("offers same-tab multiview navigation beside links and embeds with %i channels", (count) => {
+    renderOverview({ channels: count ? [channel("studio", "Studio", "idle")] : [] });
+    const link = screen.getByRole("link", { name: "Open multiviewer" });
+    expect(link.getAttribute("href")).toBe("/view");
+    expect(link.getAttribute("target")).toBeNull();
+    expect(link.className).toBe("button secondary");
+    expect(link.nextElementSibling).toBe(screen.getByRole("button", { name: "Links & embeds" }));
+  });
+
   it("reports controlled query and filter changes and preserves channel order", async () => {
     const user = userEvent.setup();
     const onQueryChange = vi.fn();

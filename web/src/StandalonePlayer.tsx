@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   channelHasFault,
   channelPlaybackReady,
@@ -15,6 +15,11 @@ import {
 import { startSerialPolling } from "./polling";
 import { requestJSON } from "./request";
 import { useWHEPPlayer } from "./useWHEPPlayer";
+import { ArrowLeftIcon, GripIcon } from "./Icons";
+import { ModalShell } from "./Modal";
+import { HelpTip } from "./Tooltip";
+import { readMultiviewOrder, writeMultiviewOrder } from "./uiPreferences";
+import { AudioMeter, useAudioMeterContext } from "./AudioMeter";
 
 export type StandaloneRoute =
   | { kind: "viewer" }
@@ -100,32 +105,167 @@ export function ChannelViewer() {
       ? "Loading channel status"
       : channels.length === 0
         ? "No channels configured"
-        : `${channels.length} ${channels.length === 1 ? "channel" : "channels"} · ${liveChannels} live`;
+        : `${channels.length} ${channels.length === 1 ? "channel" : "channels"} · ${liveChannels} ready`;
   return (
     <main className="standalone-player viewer-player multiview-player">
-      <header className="viewer-header">
-        <div className="viewer-brand"><span>SD</span><small>Signal Desk</small></div>
-        <div>
-          <h1>Channel multiview</h1>
-          <p>{summary}</p>
-        </div>
-      </header>
       <div className="multiview-content">
         {loadError && <div className="multiview-notice" role="alert">{loadError}. Status polling will retry automatically.</div>}
-        <MultiviewGrid channels={channels} loaded={loaded} />
+        <MultiviewGrid channels={channels} loaded={loaded} summary={summary} />
       </div>
-      <footer className="viewer-footer"><span className={liveChannels > 0 ? "signal online" : "signal"} />Live LAN WebRTC · {liveChannels} active</footer>
     </main>
   );
 }
 
-export function MultiviewGrid({ channels, loaded }: { channels: Channel[]; loaded: boolean }) {
+export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel[]; loaded: boolean; summary?: string }) {
+  const audioMeters = useAudioMeterContext();
+  const [order, setOrder] = useState(readMultiviewOrder);
+  const [page, setPage] = useState(0);
+  const [drag, setDrag] = useState<{ id: string; target: string | null } | null>(null);
+  const [moveID, setMoveID] = useState<string | null>(null);
+  const [destination, setDestination] = useState("");
+  const [announcement, setAnnouncement] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<{ pointerID: number; id: string; x: number; y: number; active: boolean; target: string | null } | null>(null);
+  const suppressClickRef = useRef(false);
+  const focusIDRef = useRef<string | null>(null);
+  const byID = new Map(channels.map((channel) => [channel.id, channel]));
+  const ids = [...new Set([...order, ...byID.keys()])].filter((id) => byID.has(id));
+  const pageCount = Math.max(1, Math.ceil(ids.length / 12));
+  const currentPage = Math.min(page, pageCount - 1);
+  const visibleIDs = ids.slice(currentPage * 12, (currentPage + 1) * 12);
+  const movingChannel = moveID ? byID.get(moveID) : undefined;
+  const reorderHelp = "Drag a tile's handle onto another tile or a page button. Click the handle to choose a position. Order is saved in this browser. Only the visible page plays.";
+
+  useEffect(() => {
+    // Reconcile only definitive snapshots, never the initial empty loading state.
+    if (loaded && (ids.length !== order.length || ids.some((id, index) => id !== order[index]))) {
+      setOrder(ids);
+      writeMultiviewOrder(ids);
+    }
+    if (page !== currentPage) setPage(currentPage);
+    if (moveID && !byID.has(moveID)) setMoveID(null);
+    if (drag && (!byID.has(drag.id) || (drag.target && !byID.has(drag.target)))) {
+      pointerRef.current = null;
+      setDrag(null);
+    }
+  }, [loaded, ids, order, page, currentPage, moveID, byID, drag]);
+
+  useLayoutEffect(() => {
+    if (!focusIDRef.current) return;
+    const tile = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-move-target]") ?? [])
+      .find((element) => element.dataset.moveTarget === focusIDRef.current && element.matches("article"));
+    tile?.querySelector<HTMLButtonElement>(".multiview-drag-handle")?.focus();
+    focusIDRef.current = null;
+  });
+
+  const moveChannel = (id: string, target: string) => {
+    const from = ids.indexOf(id);
+    const to = ids.indexOf(target);
+    if (from < 0 || to < 0) return;
+    const next = [...ids];
+    next.splice(from, 1);
+    next.splice(to, 0, id);
+    setOrder(next);
+    writeMultiviewOrder(next);
+    setPage(Math.floor(to / 12));
+    setMoveID(null);
+    focusIDRef.current = id;
+    setAnnouncement(`${byID.get(id)?.name} moved to page ${Math.floor(to / 12) + 1}, position ${to % 12 + 1}.`);
+  };
+
+  const startPointer = (event: ReactPointerEvent<HTMLButtonElement>, id: string) => {
+    if (event.button !== 0 || event.isPrimary === false || ids.length < 2) return;
+    suppressClickRef.current = false;
+    pointerRef.current = { pointerID: event.pointerId, id, x: event.clientX, y: event.clientY, active: false, target: null };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const updatePointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.pointerID !== event.pointerId) return;
+    if (!pointer.active && Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < 6) return;
+    pointer.active = true;
+    suppressClickRef.current = true;
+    const hit = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-move-target]");
+    pointer.target = hit && rootRef.current?.contains(hit) ? hit.dataset.moveTarget ?? null : null;
+    setDrag({ id: pointer.id, target: pointer.target });
+  };
+
+  const cancelPointer = () => {
+    pointerRef.current = null;
+    setDrag(null);
+  };
+
+  const finishPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = pointerRef.current;
+    if (!pointer || pointer.pointerID !== event.pointerId) return;
+    if (pointer.active && pointer.target) moveChannel(pointer.id, pointer.target);
+    cancelPointer();
+  };
+
   return (
-    <section className="multiview-grid" aria-label="All channels">
-      {channels.map((channel) => <MultiviewTile key={channel.id} channel={channel} />)}
-      {loaded && channels.length === 0 && <div className="multiview-empty">Create a channel in Signal Desk. It will appear here automatically.</div>}
-      {!loaded && channels.length === 0 && <div className="multiview-empty">Reading live output status.</div>}
-    </section>
+    <>
+      <div className="multiview-browser" ref={rootRef} inert={movingChannel ? true : undefined} aria-hidden={movingChannel ? true : undefined}
+        onPointerDownCapture={() => { suppressClickRef.current = false; }}
+        onClickCapture={(event) => {
+          if (suppressClickRef.current && event.detail > 0) {
+            suppressClickRef.current = false;
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        }}
+        onPointerMove={updatePointer} onPointerUp={finishPointer} onPointerCancel={cancelPointer} onLostPointerCapture={cancelPointer}
+        onKeyDown={(event) => { if (event.key === "Escape") cancelPointer(); }}>
+        <div className="multiview-toolbar">
+          <nav className="detail-breadcrumb multiview-breadcrumb" aria-label="Breadcrumb">
+            <a className="crumb-back" href="/"><ArrowLeftIcon /> Overview</a>
+            <span className="crumb-divider" aria-hidden="true">/</span>
+            <h1 className="crumb-current" aria-current="page">Multiviewer</h1>
+          </nav>
+          <div className="multiview-controls">
+            {summary && <p className="multiview-summary">{summary}</p>}
+            {(["suspended", "interrupted", "error"] as string[]).includes(audioMeters.state) && <button className="button secondary multiview-enable-meters" type="button" onClick={audioMeters.enable} title="Enable silent audio analysis; playback remains muted">Enable meters</button>}
+            {(audioMeters.state === "unsupported" || audioMeters.state === "closed") && <span className="multiview-summary" title="This browser cannot run audio analysis. Video playback is unaffected.">Meters unavailable</span>}
+            <HelpTip label="Reorder channels" content={reorderHelp} placement="bottom" />
+            <nav className="multiview-pagination" aria-label="Multiview pages">
+              <button className={`button secondary${drag && drag.target === ids[(currentPage - 1) * 12] ? " is-drop-target" : ""}`} type="button"
+                disabled={currentPage === 0} data-move-target={currentPage > 0 ? ids[(currentPage - 1) * 12] : undefined}
+                onClick={() => setPage(currentPage - 1)}>Previous page</button>
+              <span aria-live="polite">Page {currentPage + 1} of {pageCount}</span>
+              <button className={`button secondary${drag && drag.target === ids[(currentPage + 1) * 12] ? " is-drop-target" : ""}`} type="button"
+                disabled={currentPage === pageCount - 1} data-move-target={ids[(currentPage + 1) * 12]}
+                onClick={() => setPage(currentPage + 1)}>Next page</button>
+            </nav>
+          </div>
+        </div>
+        <p id="multiview-help" className="visually-hidden">{reorderHelp}</p>
+        <section className="multiview-grid" aria-label={`Channels on page ${currentPage + 1}`} hidden={ids.length === 0}>
+          {visibleIDs.map((id) => {
+            const channel = byID.get(id)!;
+            return <MultiviewTile key={id} channel={channel} audioContext={audioMeters.context} dragging={drag?.id === id} dropTarget={drag?.target === id} moveHandle={
+              <button className="multiview-drag-handle" type="button" aria-label={`Move ${channel.name}`} aria-describedby="multiview-help"
+                title="Drag to reorder or click to choose a position" disabled={ids.length < 2} onPointerDown={(event) => startPointer(event, id)}
+                onClick={() => {
+                  setMoveID(id);
+                  setDestination(id);
+                }}><GripIcon /></button>
+            } />;
+          })}
+        </section>
+        {ids.length === 0 && <div className="multiview-empty">{loaded ? "Create a channel in Signal Desk. It will appear here automatically." : "Reading live output status."}</div>}
+        <div className="visually-hidden" role="status">{announcement}</div>
+      </div>
+      {movingChannel && <ModalShell className="multiview-move-dialog" labelledBy="move-channel-title" closeLabel="Close move channel" onClose={() => setMoveID(null)}>
+        <header className="editor-header"><h2 id="move-channel-title">Move {movingChannel.name}</h2></header>
+        <div className="editor-body"><label className="field">Destination position
+          <select value={destination} onChange={(event) => setDestination(event.target.value)}>
+            {ids.map((id, index) => <option key={id} value={id}>Page {Math.floor(index / 12) + 1}, position {index % 12 + 1} - {byID.get(id)?.name}</option>)}
+          </select>
+        </label></div>
+        <footer className="editor-footer"><button className="button secondary" type="button" onClick={() => setMoveID(null)}>Cancel</button>
+          <button className="button primary" type="button" disabled={!byID.has(destination)} onClick={() => moveChannel(movingChannel.id, destination)}>Move channel</button></footer>
+      </ModalShell>}
+    </>
   );
 }
 
@@ -189,7 +329,7 @@ export function StandalonePlayer({ channelID }: { channelID: string }) {
   return <EmbeddedVideo channel={channel} />;
 }
 
-function MultiviewTile({ channel }: { channel: Channel }) {
+function MultiviewTile({ channel, audioContext, moveHandle, dragging, dropTarget }: { channel: Channel; audioContext: AudioContext | null; moveHandle: ReactNode; dragging: boolean; dropTarget: boolean }) {
   const playable = channelPlaybackReady(channel);
   const player = useWHEPPlayer({
     whepPath: channel?.whepPath ?? "",
@@ -200,18 +340,22 @@ function MultiviewTile({ channel }: { channel: Channel }) {
   const showAudioOnly = Boolean(playable && player.state === "playing" && player.hasAudio && !player.hasVideo);
 
   return (
-    <article className={`multiview-tile${playable ? " live" : ""}`}>
+    <article data-move-target={channel.id} className={`multiview-tile${playable ? " live" : ""}${dragging ? " is-dragging" : ""}${dropTarget ? " is-drop-target" : ""}`}>
       <header className="multiview-tile-header">
         <div><span className={channelHasFault(channel) ? "signal fault" : playable ? "signal online" : "signal"} /><h2>{channel.name}</h2></div>
         <small>{stateLabel}</small>
+        {moveHandle}
       </header>
       <section className="standalone-stage" aria-label={`${channel.name} player`}>
-        <video ref={player.videoRef} autoPlay playsInline muted controls aria-label={`${channel.name} video`} />
-        {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Audio is playing. This channel does not currently include a video track." />}
+        <div className="multiview-picture">
+        <video ref={player.videoRef} autoPlay playsInline muted aria-label={`${channel.name} video`} />
+        {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Monitoring muted. Audio levels are shown beside the player." />}
         {!playable && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channelHasFault(channel)} />}
         {playable && player.state === "connecting" && <PlayerMessage code="ICE" title="Connecting" detail="Establishing a WebRTC media session." pulse />}
         {playable && player.state === "error" && <PlayerMessage code="ERR" title="Playback interrupted" detail={`${player.error} Retrying automatically.`} error />}
         {playable && player.state === "playing" && !player.hasVideo && !player.hasAudio && <PlayerMessage code="LIVE" title="Connected" detail="Waiting for media tracks." pulse />}
+        </div>
+        <AudioMeter track={playable ? player.audioTrack : null} context={audioContext} name={channel.name} />
       </section>
     </article>
   );

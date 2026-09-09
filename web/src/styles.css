@@ -1768,7 +1768,43 @@ button.state-pill { cursor: pointer; }
   text-transform: uppercase;
 }
 
+.viewer-player.multiview-player {
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 420px;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px;
+}
+
+.multiview-player .viewer-header {
+  gap: 14px;
+  padding-bottom: 12px;
+}
+
+.multiview-player .viewer-header > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.multiview-player .viewer-header h1 {
+  font-size: clamp(1.15rem, 2vw, 1.6rem);
+}
+
+.multiview-player .viewer-header p {
+  margin-top: 4px;
+  font-size: 0.6rem;
+}
+
+.multiview-player .viewer-footer {
+  flex-wrap: wrap;
+  font-size: 0.55rem;
+  line-height: 1.4;
+}
+
 .multiview-notice {
+  flex: none;
   padding: 11px 13px;
   border-left: 2px solid var(--fault);
   background: var(--fault-alpha-06);
@@ -1777,22 +1813,107 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-content {
+  min-width: 0;
   min-height: 0;
-  display: grid;
-  gap: 16px;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.multiview-browser {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.multiview-toolbar {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.multiview-breadcrumb.detail-breadcrumb {
+  padding-top: 0;
+  gap: 4px;
+}
+
+.multiview-breadcrumb .crumb-back {
+  text-decoration: none;
+  min-height: 32px;
+}
+
+.multiview-breadcrumb h1 { margin: 0; }
+
+.multiview-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.multiview-summary {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font: 0.64rem/1.45 Inter, sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.multiview-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font: 0.62rem/1.4 Inter, sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.multiview-pagination > span {
+  white-space: nowrap;
+}
+
+.multiview-pagination .button {
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: 0.6rem;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+}
+
+.multiview-pagination .button.is-drop-target {
+  border-color: var(--accent);
+  background: var(--accent-alpha-18);
+  color: var(--ink-accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .multiview-grid {
   min-width: 0;
-  align-self: start;
+  min-height: 0;
+  flex: 1;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.multiview-grid[hidden] {
+  display: none;
 }
 
 .multiview-tile {
+  position: relative;
   min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--line);
   background: var(--page-deep);
@@ -1802,41 +1923,190 @@ button.state-pill { cursor: pointer; }
   border-color: var(--line-emphasis);
 }
 
+.multiview-tile.is-dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+/* Keep the drop ring above the video without changing tile geometry. */
+.multiview-tile.is-drop-target::after {
+  content: "";
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  pointer-events: none;
+}
+
 .multiview-tile-header {
   min-width: 0;
   display: flex;
-  gap: 16px;
+  gap: 8px;
   align-items: center;
   justify-content: space-between;
-  padding: 11px 13px;
+  padding: 5px 8px;
   border-bottom: 1px solid var(--line);
   background: var(--panel-deep);
 }
 
 .multiview-tile-header > div {
   min-width: 0;
+  flex: 1;
   display: flex;
-  gap: 9px;
+  gap: 6px;
   align-items: center;
 }
 
 .multiview-tile-header h2 {
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
-  font-size: 0.78rem;
+  font-size: 0.7rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .multiview-tile-header small {
-  flex: none;
+  min-width: 0;
+  max-width: 30%;
+  overflow: hidden;
   color: var(--muted);
   font: 0.56rem/1 Inter, sans-serif;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multiview-tile-header .signal {
+  flex: none;
+}
+
+.multiview-drag-handle {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.multiview-drag-handle svg {
+  width: 16px;
+  height: 16px;
+}
+
+.multiview-drag-handle:hover {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+  color: var(--ink-accent);
+}
+
+.multiview-drag-handle:active,
+.multiview-tile.is-dragging .multiview-drag-handle {
+  cursor: grabbing;
+}
+
+.multiview-drag-handle:focus-visible,
+.multiview-pagination .button:focus-visible,
+.multiview-move-dialog select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.multiview-tile .standalone-stage {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  aspect-ratio: auto;
+  align-self: stretch;
+  border: 0;
+  border-radius: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  place-items: stretch;
+}
+
+.multiview-picture {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.multiview-enable-meters { min-height: 32px; padding: 6px 10px; font-size: 0.6rem; }
+.audio-meter {
+  position: relative;
+  min-height: 0;
+  display: flex;
+  gap: 3px;
+  padding: 16px 5px 17px 3px;
+  border-left: 1px solid var(--line);
+  background: var(--page-deep);
+  color: var(--muted);
+  font: 500 0.48rem/1 Inter, sans-serif;
+}
+.audio-meter-axis { position: relative; width: 18px; }
+.audio-meter-axis > span { position: absolute; right: 2px; transform: translateY(50%); }
+.audio-meter-axis > .audio-meter-unit { bottom: -10px; right: 0; font-size: 0.4rem; }
+.audio-meter-channel { position: relative; width: 5px; background: #17271f; }
+.audio-meter-fill {
+  position: absolute;
+  inset: auto 0 0;
+  height: 0;
+  background-color: #44d98c;
+  background-image: repeating-linear-gradient(to top, transparent 0 3px, var(--page-deep) 3px 4px);
+}
+.audio-meter-channel[data-level="amber"] .audio-meter-fill { background-color: #edbc52; }
+.audio-meter-channel[data-level="red"] .audio-meter-fill { background-color: #f56b6b; }
+.audio-meter-peak { position: absolute; left: -1px; right: -1px; height: 2px; background: var(--ink); }
+.audio-meter-peak[hidden] { display: none; }
+.audio-meter-clip { position: absolute; top: -8px; width: 100%; height: 4px; background: var(--line); }
+.audio-meter-channel.is-clipping .audio-meter-clip { background: #f56b6b; box-shadow: 0 0 4px #f56b6b; }
+.audio-meter-label { position: absolute; bottom: -12px; width: 100%; text-align: center; font-size: 0.42rem; }
+.audio-meter.unavailable .audio-meter-channel { background: var(--line); }
+.audio-meter.unavailable .audio-meter-axis { opacity: 0.5; }
+.audio-meter-status { position: absolute; top: 2px; left: 3px; right: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.4rem; }
+
+.multiview-tile .preview-message {
+  min-width: 0;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  padding: 8px;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.multiview-tile .preview-icon {
+  width: 32px;
+  max-width: 100%;
+  height: 24px;
+  margin-bottom: 6px;
+  font-size: 0.55rem;
+  letter-spacing: 0.04em;
+}
+
+.multiview-tile .preview-message p {
+  margin-top: 5px;
+  font-size: 0.6rem;
+  line-height: 1.4;
 }
 
 .multiview-empty {
+  min-width: 0;
   min-height: 240px;
+  flex: 1;
   display: grid;
   place-items: center;
   padding: 28px;
@@ -1844,6 +2114,27 @@ button.state-pill { cursor: pointer; }
   color: var(--muted);
   font: 0.7rem/1.5 Inter, sans-serif;
   text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.multiview-move-dialog {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.multiview-move-dialog .editor-body {
+  min-width: 0;
+  min-height: 0;
+}
+
+.multiview-move-dialog .editor-header h2,
+.multiview-move-dialog .editor-body p {
+  overflow-wrap: anywhere;
+}
+
+.multiview-move-dialog .editor-body p {
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.5;
 }
 
 .standalone-stage {
@@ -1925,6 +2216,23 @@ button.state-pill { cursor: pointer; }
 }
 
 @media (max-width: 900px) {
+  .multiview-tile-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px;
+    padding: 5px;
+  }
+
+  .multiview-tile-header > div {
+    grid-column: 1 / -1;
+  }
+
+  .multiview-tile-header small {
+    max-width: 100%;
+    font-size: 0.5rem;
+    letter-spacing: 0;
+  }
+
   .resource-footer {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2048,8 +2356,45 @@ button.state-pill { cursor: pointer; }
     gap: 14px;
   }
 
-  .multiview-grid {
+  .viewer-player.multiview-player {
     gap: 10px;
+    padding: 8px;
+  }
+
+  .multiview-grid {
+    gap: 4px;
+  }
+
+  .multiview-pagination {
+    flex: 1;
+    justify-content: space-between;
+    gap: 4px;
+  }
+
+  .multiview-controls { width: 100%; }
+  .multiview-summary { flex-basis: 100%; }
+
+  .multiview-pagination .button {
+    min-height: 40px;
+    padding-inline: 6px;
+  }
+
+  .multiview-tile-header h2 {
+    font-size: 0.62rem;
+  }
+
+  .audio-meter { gap: 2px; padding-inline: 3px; }
+  .audio-meter-axis, .audio-meter-status { display: none; }
+  .audio-meter-channel { width: 4px; }
+  .audio-meter.unavailable::after { content: "--"; position: absolute; top: 2px; left: 0; right: 0; text-align: center; }
+
+  .multiview-tile .preview-message {
+    padding: 4px;
+    font-size: 0.6rem;
+  }
+
+  .multiview-tile .preview-message p {
+    font-size: 0.55rem;
   }
 
   .restart-banner-content {

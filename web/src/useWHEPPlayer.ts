@@ -62,8 +62,10 @@ export function useWHEPPlayer({
   const [stats, setStats] = useState<PreviewStats | null>(null);
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
+  const [audioTrack, setAudioTrack] = useState<MediaStreamTrack | null>(null);
 
   useEffect(() => {
+    setAudioTrack(null);
     let disposed = false;
     let pageInactive = false;
     let session: WHEPSession | null = null;
@@ -83,6 +85,7 @@ export function useWHEPPlayer({
       setStats(null);
       setHasVideo(false);
       setHasAudio(false);
+      setAudioTrack(null);
     };
     const clearRetryTimer = () => {
       if (retryTimer === undefined) return;
@@ -235,7 +238,10 @@ export function useWHEPPlayer({
         if (disposed || session !== current) return;
         stream.addTrack(event.track);
         if (event.track.kind === "video") setHasVideo(true);
-        if (event.track.kind === "audio") setHasAudio(true);
+        if (event.track.kind === "audio") {
+          setHasAudio(true);
+          setAudioTrack(event.track);
+        }
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.muted = true;
@@ -399,7 +405,7 @@ export function useWHEPPlayer({
     };
   }, [collectStats, enabled, random, retry, whepPath]);
 
-  return { videoRef, state, error, stats, hasVideo, hasAudio };
+  return { videoRef, state, error, stats, hasVideo, hasAudio, audioTrack };
 }
 
 async function closeWHEPSession(

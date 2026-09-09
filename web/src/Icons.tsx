@@ -67,6 +67,10 @@ export function CopyIcon(props: IconProps) {
   return <IconFrame {...props}><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></IconFrame>;
 }
 
+export function GripIcon(props: IconProps) {
+  return <IconFrame {...props}><path d="M8 5h.01M16 5h.01M8 12h.01M16 12h.01M8 19h.01M16 19h.01" strokeWidth="4" /></IconFrame>;
+}
+
 export function OpenIcon(props: IconProps) {
   return <IconFrame {...props}><path d="M14 4h6v6M20 4l-9 9" /><path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" /></IconFrame>;
 }

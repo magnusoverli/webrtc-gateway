@@ -30,6 +30,28 @@ afterEach(async () => {
 });
 
 describe("useWHEPPlayer", () => {
+  it("exposes the received audio track and clears it on session replacement, failure and disable", async () => {
+    const view = renderHook(({ path, enabled }) => useWHEPPlayer({ whepPath: path, enabled }), { initialProps: { path: "/one", enabled: true } });
+    await settle();
+    const oldPeer = MockPeer.instances[0];
+    const staleTrackHandler = oldPeer.ontrack!;
+    const track = { kind: "audio" } as MediaStreamTrack;
+    act(() => oldPeer.ontrack?.({ track } as RTCTrackEvent));
+    expect(view.result.current.audioTrack).toBe(track);
+    view.rerender({ path: "/two", enabled: true });
+    expect(view.result.current.audioTrack).toBeNull();
+    act(() => staleTrackHandler({ track } as RTCTrackEvent));
+    expect(view.result.current.audioTrack).toBeNull();
+    await settle();
+    const peer = MockPeer.instances[1];
+    act(() => peer.ontrack?.({ track } as RTCTrackEvent));
+    expect(view.result.current.audioTrack).toBe(track);
+    act(() => peer.setConnectionState("failed"));
+    expect(view.result.current.audioTrack).toBeNull();
+    view.rerender({ path: "/two", enabled: false });
+    expect(view.result.current.audioTrack).toBeNull();
+  });
+
   it("opts out of stats collection by default", async () => {
     const view = renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true }));
     await settle();
