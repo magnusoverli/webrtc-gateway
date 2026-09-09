@@ -498,6 +498,7 @@ describe("dashboard navigation", () => {
       throw new Error(`Unexpected request ${url}`);
     });
     vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
     render(<App />);
 
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -505,11 +506,11 @@ describe("dashboard navigation", () => {
     expect(fetch.mock.calls.some(([input]) => String(input) === "/api/v1/status/runtime")).toBe(true);
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Enable preview for Studio" }));
+      fireEvent.click(screen.getByRole("button", { name: "Enable preview" }));
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "Disable preview" }).getAttribute("aria-pressed")).toBe("true");
 
     await act(async () => {
       resolveRuntime(jsonResponse(runtimeStatus(full, [runtimeChannel(item)])));
@@ -517,7 +518,7 @@ describe("dashboard navigation", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "Disable preview" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("fetches a full status in the same poll on revision mismatch and preserves an open form", async () => {
@@ -980,6 +981,7 @@ describe("dashboard navigation", () => {
       available: true,
       online: true,
       outputReady: true,
+      outputTracks: [{ codec: "H264" }],
       readers: [{ type: "whep", id: "reader-1" }],
       compatibility: { ...channelWithMode("srt-push").compatibility, state: "ready" as const },
     };
@@ -996,11 +998,12 @@ describe("dashboard navigation", () => {
       throw new Error(`Unexpected request ${String(input)}`);
     });
     vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "Enable preview for Studio" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Disable preview for Studio" }).getAttribute("aria-pressed")).toBe("true"));
-    expect(screen.getByText("1", { selector: ".overview-card-stats strong" })).toBeDefined();
+    await user.click(await screen.findByRole("button", { name: "Enable preview" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Disable preview" }).getAttribute("aria-pressed")).toBe("true"));
+    expect(screen.getByText("Viewers").closest(".metric")?.textContent).toContain("1");
     expect(appPlayerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: item.whepPath, enabled: true }));
     const patchCall = fetch.mock.calls.find(([, init]) => init?.method === "PATCH");
     expect(new Headers(patchCall?.[1]?.headers).get("If-Match")).toBe('"7"');

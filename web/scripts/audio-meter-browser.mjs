@@ -65,7 +65,7 @@ try {
       window.receiverTrack = player.audioTrack;
       window.meterContext = meter.context;
       return h("div", null,
-        h("button", { onClick: () => { meter.enable(); void context.resume(); } }, "Start native test"),
+        h("button", { onClick: () => { void context.resume(); } }, "Start native test"),
         h("div", { className: "multiview-picture", style: { width: "100%", height: 180 } },
           h("video", { ref: player.videoRef, muted: true, autoPlay: true }),
           h(AudioMeter, { track: player.audioTrack, context: meter.context, name: "Native" })));

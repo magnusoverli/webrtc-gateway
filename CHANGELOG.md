@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Replaced overview video previews with input addresses and concise configuration/status cards; playback remains available in channel details and multiview.
+- Removed the manual Enable meters control; multiview audio analysis now starts and resumes automatically, using normal page interactions when required by the browser.
+- Made multiview tiles resizable from just outside their borders, with grab areas extending halfway into the gaps.
 - Updated React, frontend test tooling, Go/SQLite, Node, Alpine/FFmpeg, SRT, MediaMTX, and CI actions to current stable releases.
 - Fixed project cutovers reusing old revisions, whitespace in saved settings, WebRTC setup retries, relative WHEP session URLs, and converted-output reader diagnostics.
 - Restored full-edge resize targets and two-way cursors while retaining the library's default grip visuals.

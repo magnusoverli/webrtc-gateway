@@ -414,7 +414,6 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
           </nav>
           <div className="multiview-controls">
             {summary && <p className="multiview-summary">{summary}</p>}
-            {(["suspended", "interrupted", "error"] as string[]).includes(audioMeters.state) && <button className="button secondary multiview-enable-meters" type="button" onClick={audioMeters.enable} title="Enable silent audio analysis; playback remains muted">Enable meters</button>}
             {(audioMeters.state === "unsupported" || audioMeters.state === "closed") && <span className="multiview-summary" title="This browser cannot run audio analysis. Video playback is unaffected.">Meters unavailable</span>}
             <HelpTip label="Reorder channels" content={reorderHelp} placement="bottom" />
             <nav className="multiview-pagination" aria-label="Multiview pages">

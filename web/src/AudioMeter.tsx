@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-export type AudioMeterContextState = "initializing" | "running" | "suspended" | "interrupted" | "closed" | "unsupported" | "error";
+type AudioMeterContextState = "initializing" | "running" | "suspended" | "interrupted" | "closed" | "unsupported" | "error";
 
 function contextState(context: AudioContext): AudioMeterContextState {
   const state: string = context.state;
@@ -8,14 +8,14 @@ function contextState(context: AudioContext): AudioMeterContextState {
 }
 
 /** Call once per grid, not once per tile. The context is used only for silent analysis. */
-export function useAudioMeterContext(): { context: AudioContext | null; state: AudioMeterContextState; enable: () => void } {
+export function useAudioMeterContext(): { context: AudioContext | null; state: AudioMeterContextState } {
   const [value, setValue] = useState<{ context: AudioContext | null; state: AudioMeterContextState }>({ context: null, state: "initializing" });
-  const enableRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     let disposed = false;
     let context: AudioContext | null = null;
     let pending = false;
+    const gestures = ["pointerdown", "pointerup", "keydown", "click"];
     const publish = () => {
       if (!disposed && context) setValue({ context, state: contextState(context) });
     };
@@ -26,7 +26,7 @@ export function useAudioMeterContext(): { context: AudioContext | null; state: A
       }
       try {
         context = new AudioContext();
-        context.addEventListener("statechange", publish);
+        context.addEventListener("statechange", synchronize);
         publish();
       } catch {
         setValue({ context: null, state: "error" });
@@ -35,14 +35,16 @@ export function useAudioMeterContext(): { context: AudioContext | null; state: A
     const close = (owned: AudioContext) => {
       try { void owned.close().catch(() => {}); } catch { /* Already closed or unavailable. */ }
     };
-    enableRef.current = () => {
-      if (disposed || pending) return;
+    const resume = (event?: Event) => {
+      if (disposed || document.visibilityState === "hidden") return;
+      // A policy-blocked resume can stay pending until a gesture. Retry within
+      // that gesture rather than waiting for the original promise to settle.
+      if (pending && !gestures.includes(event?.type ?? "")) return;
       if (!context) create();
-      if (!context || context.state === "closed") return;
-      if (context.state === "running") { publish(); return; }
+      if (!context || context.state === "closed" || context.state === "running") return;
       const owned = context;
       try {
-        // Do not defer this call: resume must retain the toolbar's user activation.
+        // Keep the call synchronous to preserve the page interaction's activation.
         const resume = owned.resume();
         pending = true;
         void resume.then(() => {
@@ -58,18 +60,25 @@ export function useAudioMeterContext(): { context: AudioContext | null; state: A
         setValue({ context: owned, state: "error" });
       }
     };
+    const synchronize = () => { publish(); resume(); };
     create();
+    if (context) resume();
+    for (const gesture of gestures) document.addEventListener(gesture, resume, true);
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("pageshow", resume);
     return () => {
       disposed = true;
-      enableRef.current = () => {};
+      for (const gesture of gestures) document.removeEventListener(gesture, resume, true);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("pageshow", resume);
       if (context) {
-        context.removeEventListener("statechange", publish);
+        context.removeEventListener("statechange", synchronize);
         close(context);
       }
     };
   }, []);
 
-  return { ...value, enable: () => enableRef.current() };
+  return value;
 }
 
 const FLOOR = -60;
@@ -113,7 +122,7 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
       if (!context) return ["unavailable", "Audio metering unavailable"];
       if (failed) return ["error", "Audio analysis unavailable"];
       const current = contextState(context);
-      if (current !== "running") return [current, `Audio context ${current}${current === "suspended" ? "; enable meters to resume" : ""}`];
+      if (current !== "running") return [current, `Audio context ${current}${current === "suspended" ? "; resumes automatically when the browser permits" : ""}`];
       return ["running", "RMS and sample peak in dBFS (not true peak or LUFS)"];
     };
     const showState = (next: string, message: string) => {

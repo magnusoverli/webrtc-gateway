@@ -134,75 +134,77 @@ afterEach(() => {
 });
 
 describe("useAudioMeterContext", () => {
-  it("creates one context on mount without resume, reflects state changes, and closes on teardown", () => {
+  it("starts a suspended context automatically and releases its listeners on teardown", async () => {
+    MockContext.initialState = "suspended";
+    const remove = vi.spyOn(document, "removeEventListener");
     const view = renderHook(() => useAudioMeterContext());
     const context = MockContext.instances[0];
+    await act(async () => {});
     expect(MockContext.instances).toHaveLength(1);
     expect(view.result.current.context).toBe(context);
     expect(view.result.current.state).toBe("running");
-    expect(context.resume).not.toHaveBeenCalled();
-    for (const state of ["interrupted", "suspended", "running", "closed"]) {
-      act(() => context.changeState(state));
-      expect(view.result.current.state).toBe(state);
-    }
+    act(() => document.dispatchEvent(new Event("pointerdown")));
+    expect(context.resume).toHaveBeenCalledOnce();
     view.unmount();
     expect(context.close).toHaveBeenCalledOnce();
     expect(context.listenerCount()).toBe(0);
+    for (const event of ["pointerdown", "pointerup", "keydown", "click"]) {
+      expect(remove).toHaveBeenCalledWith(event, expect.any(Function), true);
+    }
   });
 
-  it("never auto-resumes suspended contexts, and calls resume synchronously in enable", async () => {
-    MockContext.initialState = "suspended";
+  it("resumes on visibility restoration and retries pending autoplay requests within ordinary gestures", async () => {
     const view = renderHook(() => useAudioMeterContext());
     const context = MockContext.instances[0];
-    expect(view.result.current.state).toBe("suspended");
-    expect(context.resume).not.toHaveBeenCalled();
+    const resolvers: Array<() => void> = [];
+    context.resume.mockImplementation(() => new Promise<void>(resolve => resolvers.push(resolve)));
     visibility("hidden");
+    act(() => context.changeState("suspended"));
+    expect(context.resume).not.toHaveBeenCalled();
     visibility("visible");
     act(() => window.dispatchEvent(new Event("pageshow")));
-    expect(context.resume).not.toHaveBeenCalled();
+    expect(context.resume).toHaveBeenCalledOnce();
     await act(async () => {
-      view.result.current.enable();
-      expect(context.resume).toHaveBeenCalledOnce();
-      view.result.current.enable();
-      expect(context.resume).toHaveBeenCalledOnce();
+      document.dispatchEvent(new Event("pointerup"));
+      expect(context.resume).toHaveBeenCalledTimes(2);
+      context.changeState("running");
+      resolvers.forEach(resolve => resolve());
     });
     expect(view.result.current.state).toBe("running");
-    act(() => view.result.current.enable());
-    expect(context.resume).toHaveBeenCalledOnce();
+    act(() => document.dispatchEvent(new Event("keydown")));
+    expect(context.resume).toHaveBeenCalledTimes(2);
   });
 
   it("handles rejected and synchronously throwing resume, allowing a gesture retry", async () => {
-    MockContext.initialState = "suspended";
     const view = renderHook(() => useAudioMeterContext());
     const context = MockContext.instances[0];
     context.resume.mockRejectedValueOnce(new Error("NotAllowedError"));
-    await act(async () => view.result.current.enable());
+    await act(async () => context.changeState("suspended"));
     expect(view.result.current.state).toBe("error");
     expect(view.result.current.context).toBe(context);
     context.resume.mockImplementationOnce(() => { throw new Error("blocked"); });
-    act(() => view.result.current.enable());
+    act(() => document.dispatchEvent(new Event("keydown")));
     expect(view.result.current.state).toBe("error");
-    await act(async () => view.result.current.enable());
+    await act(async () => document.dispatchEvent(new Event("click")));
     expect(view.result.current.state).toBe("running");
   });
 
-  it("reports unsupported and blocked construction without throwing, and retries construction on enable", () => {
+  it("reports unsupported and blocked construction without throwing, and retries on page interaction", () => {
     vi.stubGlobal("AudioContext", undefined);
     const unsupported = renderHook(() => useAudioMeterContext());
     expect(unsupported.result.current).toMatchObject({ context: null, state: "unsupported" });
-    act(() => unsupported.result.current.enable());
+    act(() => document.dispatchEvent(new Event("pointerup")));
     unsupported.unmount();
     vi.stubGlobal("AudioContext", MockContext);
     MockContext.blocked = true;
     const blocked = renderHook(() => useAudioMeterContext());
     expect(blocked.result.current).toMatchObject({ context: null, state: "error" });
     MockContext.blocked = false;
-    act(() => blocked.result.current.enable());
+    act(() => document.dispatchEvent(new Event("keydown")));
     expect(blocked.result.current.state).toBe("running");
   });
 
   it("isolates StrictMode contexts and ignores a late resume after unmount", async () => {
-    MockContext.initialState = "suspended";
     const view = renderHook(() => useAudioMeterContext(), { wrapper: StrictMode });
     expect(MockContext.instances).toHaveLength(2);
     const [old, current] = MockContext.instances;
@@ -211,8 +213,7 @@ describe("useAudioMeterContext", () => {
     expect(view.result.current.context).toBe(current);
     let resolve!: () => void;
     current.resume.mockImplementation(() => new Promise<void>((done) => { resolve = done; }));
-    act(() => view.result.current.enable());
-    const enable = view.result.current.enable;
+    act(() => current.changeState("interrupted"));
     view.unmount();
     expect(current.close).toHaveBeenCalledOnce();
     await act(async () => {
@@ -221,18 +222,17 @@ describe("useAudioMeterContext", () => {
     });
     expect(current.state).toBe("closed");
     expect(current.listenerCount()).toBe(0);
-    enable();
+    document.dispatchEvent(new Event("click"));
     expect(current.resume).toHaveBeenCalledOnce();
   });
 
   it("absorbs late resume rejection and close failure", async () => {
-    MockContext.initialState = "suspended";
     const view = renderHook(() => useAudioMeterContext());
     const context = MockContext.instances[0];
     let reject!: (reason: Error) => void;
     context.resume.mockImplementation(() => new Promise<void>((_resolve, fail) => { reject = fail; }));
     context.close.mockRejectedValueOnce(new Error("closed"));
-    act(() => view.result.current.enable());
+    act(() => context.changeState("suspended"));
     view.unmount();
     await act(async () => reject(new Error("disposed")));
     expect(context.listenerCount()).toBe(0);
@@ -364,8 +364,7 @@ describe("AudioMeter", () => {
     const { context, bars, root } = mountMeter();
     tick(0);
     expect(root.dataset.state).toBe("suspended");
-    expect(root.title).toContain("enable meters to resume");
-    expect(root.textContent).not.toContain("enable meters");
+    expect(root.title).toContain("resumes automatically when the browser permits");
     expect(bars[0].hasAttribute("aria-valuenow")).toBe(false);
     expect(context.analysers[0].getFloatTimeDomainData).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);

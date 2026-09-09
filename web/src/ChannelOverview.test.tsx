@@ -162,49 +162,30 @@ describe("ChannelOverview", () => {
     expect(onSelect).toHaveBeenCalledTimes(3);
   });
 
-  it("toggles preview without opening the channel", async () => {
-    const user = userEvent.setup();
-    const item = channel("one", "Studio", "live");
-    const onSelect = vi.fn();
-    const onAutomaticPreviewChange = vi.fn();
-    renderOverview({ channels: [item], onSelect, onAutomaticPreviewChange });
-
-    const toggle = screen.getByRole("button", { name: "Enable preview for Studio" });
-    expect(toggle.getAttribute("aria-pressed")).toBe("false");
-    await user.click(toggle);
-
-    expect(onAutomaticPreviewChange).toHaveBeenCalledWith(item, true);
-    expect(onSelect).not.toHaveBeenCalled();
-  });
-
-  it("disables overview playback and hides preview controls in list layout", () => {
+  it.each(["grid", "list"] as const)("shows configuration without creating players in %s layout", (layout) => {
     const item = { ...channel("one", "Studio", "live"), automaticPreview: true };
-    const view = renderOverview({ channels: [item], layout: "grid" });
-
-    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
-    expect(screen.getByRole("button", { name: "Disable preview for Studio" })).toBeDefined();
-
-    overviewPlayerHarness.calls.mockClear();
-    view.rerender(overview({ channels: [item], layout: "list" }));
-    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: false }));
-    expect(screen.queryByRole("button", { name: "Disable preview for Studio" })).toBeNull();
-    expect(screen.queryByLabelText(/Studio preview:/)).toBeNull();
-
-    overviewPlayerHarness.calls.mockClear();
-    view.rerender(overview({ channels: [item], layout: "grid" }));
-    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ enabled: true }));
-    expect(screen.getByRole("button", { name: "Disable preview for Studio" })).toBeDefined();
+    renderOverview({ channels: [item], layout });
+    expect(screen.getByText("Port 10000")).toBeDefined();
+    expect(screen.getByText("Output ready")).toBeDefined();
+    expect(document.querySelector("video")).toBeNull();
+    expect(screen.queryByRole("button", { name: /preview/i })).toBeNull();
+    expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
   });
 
-  it("shows preview state in the grid tile", () => {
+  it("refreshes input configuration when addresses, ports, or modes change", () => {
     const item = channel("one", "Studio", "idle");
     const view = renderOverview({ channels: [item] });
-    expect(screen.getByLabelText("Studio preview: Preview off").textContent).toContain("Preview off");
-    expect(screen.getByLabelText("Video format: resolution unavailable, frame rate unavailable").textContent).toBe("Resolution — · FPS —");
-    expect((screen.getByLabelText("Studio muted preview") as HTMLVideoElement).controls).toBe(false);
-
-    view.rerender(overview({ channels: [{ ...item, automaticPreview: true }] }));
-    expect(screen.getByLabelText("Studio preview: Waiting for input").textContent).toContain("Waiting for input");
+    const inputs: Array<[Channel["input"], string]> = [
+      [{ mode: "srt-push", srt: { port: 12000, hasPassphrase: true } }, "Port 12000"],
+      [{ mode: "srt-pull", srt: { host: "encoder.example", port: 9000, hasPassphrase: true } }, "encoder.example:9000"],
+      [{ mode: "srt-pull", srt: { host: "2001:db8::1", port: 9001, hasPassphrase: true } }, "[2001:db8::1]:9001"],
+      [{ mode: "rtp-unicast", rtp: { address: "192.0.2.1", port: 5004, sdp: "" } }, "192.0.2.1:5004"],
+      [{ mode: "rtp-multicast", rtp: { address: "239.1.2.3", port: 5004, sdp: "" } }, "239.1.2.3:5004"],
+    ];
+    for (const [input, endpoint] of inputs) {
+      view.rerender(overview({ channels: [{ ...item, input }] }));
+      expect(screen.getByText(endpoint)).toBeDefined();
+    }
   });
 
   it("shows nominal input resolution and frame rate in grid cards", () => {
@@ -216,8 +197,7 @@ describe("ChannelOverview", () => {
     const format = screen.getByLabelText("Video format: 3840 by 2160, 59.94 fps");
     expect(format.textContent).toBe("3840 × 2160 · 59.94 fps");
     expect(format.className).toBe("overview-card-format");
-    expect(format.closest(".overview-thumb")).toBeNull();
-    expect(overviewPlayerHarness.calls).toHaveBeenLastCalledWith(expect.not.objectContaining({ collectStats: true }));
+    expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
   });
 
   it("labels control groups and exposes selected controls", () => {
@@ -231,18 +211,17 @@ describe("ChannelOverview", () => {
     expect(within(layouts).getByRole("button", { name: "Grid view" }).getAttribute("aria-pressed")).toBe("false");
   });
 
-  it("keeps an established preview enabled while stale and disables every card mutation", () => {
+  it("marks retained status stale and disables card mutations", () => {
     const item = { ...channel("one", "Studio", "live"), automaticPreview: true };
     renderOverview({ channels: [item], error: "disconnected", mutationsDisabled: true });
 
-    expect(overviewPlayerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: item.whepPath, enabled: true }));
+    expect(screen.getByLabelText("Status stale")).toBeDefined();
     expect(screen.getByRole("button", { name: "Add channel" }).hasAttribute("disabled")).toBe(true);
     expect(screen.getByRole("button", { name: "Configure Studio" }).hasAttribute("disabled")).toBe(true);
-    expect(screen.getByRole("button", { name: "Disable preview for Studio" }).hasAttribute("disabled")).toBe(true);
     expect(document.querySelectorAll(".overview-card [aria-live]")).toHaveLength(0);
   });
 
-  it("does not rerender unchanged cards or players when polling returns equivalent objects", () => {
+  it("does not rerender unchanged cards when polling returns equivalent objects", () => {
     const first = { ...channel("one", "Studio", "live"), automaticPreview: true };
     const second = { ...channel("two", "Control", "live"), automaticPreview: true };
     const rates = {
@@ -250,7 +229,7 @@ describe("ChannelOverview", () => {
       two: { inputBitrateBps: 2_000_000, outputBitrateBps: 1_800_000, deliveryBitrateBps: 1_800_000 },
     };
     const view = renderOverview({ channels: [first, second], rates });
-    expect(overviewPlayerHarness.calls).toHaveBeenCalledTimes(2);
+    expect(overviewPlayerHarness.cardRenders).toHaveBeenCalledTimes(2);
 
     overviewPlayerHarness.calls.mockClear();
     overviewPlayerHarness.cardRenders.mockClear();
@@ -263,7 +242,7 @@ describe("ChannelOverview", () => {
     expect(overviewPlayerHarness.calls).not.toHaveBeenCalled();
   });
 
-  it("updates changed card metrics without rerendering or reconfiguring its player", () => {
+  it("rerenders only cards with changed metrics", () => {
     const first = { ...channel("one", "Studio", "live"), automaticPreview: true };
     const second = { ...channel("two", "Control", "live"), automaticPreview: true };
     const rates = {
@@ -320,8 +299,6 @@ type Overrides = Partial<{
   onLayoutChange: (layout: OverviewLayout) => void;
   onSelect: (id: string) => void;
   onEdit: (item: Channel) => void;
-  previewSavingIDs: ReadonlySet<string>;
-  onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
   onCreate: () => void;
   onRetry: () => void;
   mutationsDisabled: boolean;
@@ -346,8 +323,6 @@ function overview(overrides: Overrides = {}) {
       onLayoutChange={() => undefined}
       onSelect={() => undefined}
       onEdit={() => undefined}
-      previewSavingIDs={new Set()}
-      onAutomaticPreviewChange={() => undefined}
       onCreate={() => undefined}
       onShowLinks={() => undefined}
       onRetry={() => undefined}

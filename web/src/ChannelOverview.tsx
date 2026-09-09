@@ -1,8 +1,7 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode, type RefObject } from "react";
-import { channelPlaybackReady, channelStateLabel, channelTone, primaryChannelIssue, trackKind, type Channel, type ChannelStreamRates, type ChannelTone, type Track } from "./channel";
+import { channelStateLabel, channelTone, primaryChannelIssue, trackKind, type Channel, type ChannelStreamRates, type ChannelTone, type Track } from "./channel";
 import { CopyIcon, GridIcon, ListIcon, PlusIcon, SettingsIcon } from "./Icons";
 import { formatBitrate, inputModeLabel } from "./presentation";
-import { useWHEPPlayer } from "./useWHEPPlayer";
 
 export type OverviewFilter = "all" | "live" | "starting" | "fault" | "idle";
 export type OverviewLayout = "grid" | "list";
@@ -20,8 +19,6 @@ type Props = {
   onLayoutChange: (layout: OverviewLayout) => void;
   onSelect: (id: string) => void;
   onEdit: (item: Channel) => void;
-  previewSavingIDs: ReadonlySet<string>;
-  onAutomaticPreviewChange: (item: Channel, enabled: boolean) => void;
   onCreate: () => void;
   onShowLinks: () => void;
   onRetry: () => void;
@@ -45,26 +42,20 @@ export function ChannelOverview({
   onLayoutChange,
   onSelect,
   onEdit,
-  previewSavingIDs,
-  onAutomaticPreviewChange,
   onCreate,
   onShowLinks,
   onRetry,
   mutationsDisabled = false,
   headingRef,
 }: Props) {
-  const cardActionsRef = useRef({ channels, onSelect, onEdit, onAutomaticPreviewChange });
+  const cardActionsRef = useRef({ channels, onSelect, onEdit });
   useLayoutEffect(() => {
-    cardActionsRef.current = { channels, onSelect, onEdit, onAutomaticPreviewChange };
-  }, [channels, onAutomaticPreviewChange, onEdit, onSelect]);
+    cardActionsRef.current = { channels, onSelect, onEdit };
+  }, [channels, onEdit, onSelect]);
   const selectCard = useCallback((id: string) => cardActionsRef.current.onSelect(id), []);
   const editCard = useCallback((id: string) => {
     const item = cardActionsRef.current.channels.find((channel) => channel.id === id);
     if (item) cardActionsRef.current.onEdit(item);
-  }, []);
-  const changeCardPreview = useCallback((id: string, enabled: boolean) => {
-    const item = cardActionsRef.current.channels.find((channel) => channel.id === id);
-    if (item) cardActionsRef.current.onAutomaticPreviewChange(item, enabled);
   }, []);
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -118,7 +109,7 @@ export function ChannelOverview({
     <section className="overview" aria-labelledby="channel-overview-title">
       <h1 id="channel-overview-title" className="visually-hidden" ref={headingRef} tabIndex={-1}>Channels</h1>
       <div className="overview-intro">
-        <p className="overview-subtitle">Live status, rates and viewers for every configured input.</p>
+        <p className="overview-subtitle">Input configuration, status and stream activity at a glance.</p>
         <div className="overview-actions">
           <a className="button secondary" href="/view"><GridIcon /> Open multiviewer</a>
           <button className="button secondary" type="button" onClick={onShowLinks} aria-haspopup="dialog"><CopyIcon /> Links &amp; embeds</button>
@@ -180,13 +171,10 @@ export function ChannelOverview({
               item={item}
               tone={tone}
               rate={rates[item.id]}
-              layout={layout}
               stale={Boolean(error)}
               mutationsDisabled={mutationsDisabled}
-              previewSaving={previewSavingIDs.has(item.id)}
               onSelect={selectCard}
               onEdit={editCard}
-              onAutomaticPreviewChange={changeCardPreview}
             />;
           })}
         </div>
@@ -199,21 +187,18 @@ type OverviewCardProps = {
   item: Channel;
   tone: ChannelTone;
   rate?: ChannelStreamRates;
-  layout: OverviewLayout;
   stale: boolean;
   mutationsDisabled: boolean;
-  previewSaving: boolean;
   onSelect: (id: string) => void;
   onEdit: (id: string) => void;
-  onAutomaticPreviewChange: (id: string, enabled: boolean) => void;
 };
 
-const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stale, mutationsDisabled, previewSaving, onSelect, onEdit, onAutomaticPreviewChange }: OverviewCardProps) {
-  const showPreview = layout === "grid";
+const OverviewCard = memo(function OverviewCard({ item, tone, rate, stale, mutationsDisabled, onSelect, onEdit }: OverviewCardProps) {
   const transcoding = item.compatibility.mode === "transcoded";
   const routeLabel = transcoding ? "Transcoding" : "Passthrough";
   const routeActive = item.compatibility.state === "ready" && item.outputReady && (!transcoding || item.compatibility.worker.running);
-  const format = showPreview ? overviewVideoFormat(item) : null;
+  const format = overviewVideoFormat(item);
+  const endpoint = overviewInputEndpoint(item);
 
   return (
     <article className={`overview-card tone-${tone}`}>
@@ -237,7 +222,10 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stal
           <SettingsIcon aria-hidden="true" />
         </button>
       </div>
-      <OverviewPreview item={item} stale={stale} showPreview={showPreview} />
+      <div className="overview-card-input">
+        <span>{item.input.mode === "srt-push" ? "Listen on" : item.input.mode === "srt-pull" ? "Source" : "Receive on"}</span>
+        <strong title={endpoint}>{endpoint}</strong>
+      </div>
       <div className="overview-card-stats">
         {format && <div className="overview-card-format" aria-label={format.label}>{format.display}</div>}
         <div><span>Input</span><strong>{item.available && item.online ? formatBitrate(rate?.inputBitrateBps) : "—"}</strong></div>
@@ -252,18 +240,6 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, layout, stal
         >
           {stale ? "Status stale" : overviewStateLabel(item)}
         </span>
-        {showPreview && <div className="overview-preview-control">
-          <span>Preview</span>
-          <button
-            className={item.automaticPreview ? "toggle active overview-preview-toggle" : "toggle overview-preview-toggle"}
-            type="button"
-            disabled={previewSaving || item.applyState === "deleting" || stale || mutationsDisabled}
-            aria-label={`${item.automaticPreview ? "Disable" : "Enable"} preview for ${item.name}`}
-            aria-pressed={item.automaticPreview}
-            title="Show a muted live preview for this channel"
-            onClick={() => onAutomaticPreviewChange(item.id, !item.automaticPreview)}
-          ><span /></button>
-        </div>}
       </div>
     </article>
   );
@@ -274,24 +250,20 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
   const previousItem = previous.item;
   const nextItem = next.item;
   return previous.tone === next.tone &&
-    previous.layout === next.layout &&
     previous.stale === next.stale &&
     previous.mutationsDisabled === next.mutationsDisabled &&
-    previous.previewSaving === next.previewSaving &&
     previous.onSelect === next.onSelect &&
     previous.onEdit === next.onEdit &&
-    previous.onAutomaticPreviewChange === next.onAutomaticPreviewChange &&
     previous.rate?.inputBitrateBps === next.rate?.inputBitrateBps &&
     previous.rate?.outputBitrateBps === next.rate?.outputBitrateBps &&
     previousItem.id === nextItem.id &&
     previousItem.name === nextItem.name &&
     previousItem.enabled === nextItem.enabled &&
-    previousItem.automaticPreview === nextItem.automaticPreview &&
     previousItem.input.mode === nextItem.input.mode &&
+    overviewInputEndpoint(previousItem) === overviewInputEndpoint(nextItem) &&
     previousItem.applyState === nextItem.applyState &&
     previousItem.available === nextItem.available &&
     previousItem.online === nextItem.online &&
-    previousItem.whepPath === nextItem.whepPath &&
     previousItem.outputReady === nextItem.outputReady &&
     previousItem.readerCount === nextItem.readerCount &&
     previousItem.relay?.state === nextItem.relay?.state &&
@@ -303,48 +275,16 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
     previousItem.compatibility.worker.queued === nextItem.compatibility.worker.queued;
 }
 
-type OverviewPreviewProps = {
-  item: Channel;
-  stale: boolean;
-  showPreview: boolean;
-};
-
-const OverviewPreview = memo(function OverviewPreview({ item, stale, showPreview }: OverviewPreviewProps) {
-  const previewEnabled = showPreview && item.automaticPreview && channelPlaybackReady(item);
-  const preview = useWHEPPlayer({ whepPath: item.whepPath, enabled: previewEnabled, retry: true });
-  if (!showPreview) return null;
-
-  const previewStatus = overviewPreviewStatus(item, stale, preview.state, preview.hasVideo, preview.hasAudio);
-  return (
-    <div className={`overview-thumb preview-${preview.state}`} role="group" aria-label={`${item.name} preview: ${previewStatus}`}>
-      <video
-        ref={preview.videoRef}
-        autoPlay
-        playsInline
-        muted
-        aria-label={`${item.name} muted preview`}
-      />
-      {!(preview.state === "playing" && preview.hasVideo) && (
-        <span className={preview.state === "error" ? "overview-preview-message error" : "overview-preview-message"}>{previewStatus}</span>
-      )}
-    </div>
-  );
-}, sameOverviewPreviewProps);
-
-function sameOverviewPreviewProps(previous: OverviewPreviewProps, next: OverviewPreviewProps) {
-  const previousItem = previous.item;
-  const nextItem = next.item;
-  return previous.stale === next.stale &&
-    previous.showPreview === next.showPreview &&
-    previousItem.name === nextItem.name &&
-    previousItem.enabled === nextItem.enabled &&
-    previousItem.automaticPreview === nextItem.automaticPreview &&
-    previousItem.applyState === nextItem.applyState &&
-    previousItem.available === nextItem.available &&
-    previousItem.online === nextItem.online &&
-    previousItem.outputReady === nextItem.outputReady &&
-    previousItem.whepPath === nextItem.whepPath &&
-    sameIssues(previousItem, nextItem);
+function overviewInputEndpoint(item: Channel) {
+  if (item.input.mode === "srt-push") {
+    return item.input.srt?.port
+      ? item.relay?.listenerAddress || `Port ${item.input.srt.port}`
+      : `Shared SRT listener · ${item.path}`;
+  }
+  const host = item.input.mode === "srt-pull" ? item.input.srt?.host : item.input.rtp?.address;
+  const port = item.input.mode === "srt-pull" ? item.input.srt?.port : item.input.rtp?.port;
+  if (!host || !port) return item.input.rtp?.sdp ? "SDP-defined input" : "Not configured";
+  return `${host.includes(":") && !host.startsWith("[") ? `[${host}]` : host}:${port}`;
 }
 
 function overviewVideoFormat(item: Channel) {
@@ -352,6 +292,7 @@ function overviewVideoFormat(item: Channel) {
   const width = item.inputVideo?.width || numberTrackProperty(track, "width");
   const height = item.inputVideo?.height || numberTrackProperty(track, "height");
   const fps = frameRateValue(item.inputVideo?.frameRate) || numberTrackProperty(track, "frameRate") || numberTrackProperty(track, "fps");
+  if (!width && !height && !fps) return null;
   const resolution = width && height ? `${width} × ${height}` : "Resolution —";
   const frameRate = fps ? `${formatFrameRate(fps)} fps` : "FPS —";
   return {
@@ -391,19 +332,6 @@ function frameRateValue(value?: string) {
 
 function formatFrameRate(value: number) {
   return Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
-}
-
-function overviewPreviewStatus(item: Channel, stale: boolean, state: ReturnType<typeof useWHEPPlayer>["state"], hasVideo: boolean, hasAudio: boolean) {
-  if (!item.automaticPreview) return "Preview off";
-  if (stale) return "Status stale";
-  if (!item.enabled) return "Channel disabled";
-  if (item.applyState === "deleting") return "Deletion pending";
-  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.summary ?? "Input rejected";
-  if (!item.outputReady) return item.available && item.online ? "Preparing output" : "Waiting for input";
-  if (state === "connecting") return "Connecting";
-  if (state === "error") return "Preview unavailable";
-  if (state === "playing" && !hasVideo) return hasAudio ? "Audio only" : "Connected";
-  return "Muted live preview";
 }
 
 function overviewStateLabel(item: Channel) {

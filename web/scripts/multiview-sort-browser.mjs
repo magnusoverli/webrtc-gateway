@@ -164,21 +164,24 @@ try {
       const r = title.getBoundingClientRect();
       return document.elementFromPoint(r.left + Math.min(3, r.width / 2), r.top + r.height / 2)?.classList.contains("multiview-titlebar-drag");
     }), true, "Channel title must hit the title-bar drag surface");
+    const outsideEdge = Math.min(3, await page.locator(".multiview-grid").evaluate(grid => parseFloat(getComputedStyle(grid).gap) / 2 - 1));
     for (const [edge, cursor] of [["left", "ew-resize"], ["right", "ew-resize"], ["top", "ns-resize"], ["bottom", "ns-resize"]]) {
       for (const fraction of [0.25, 0.75]) {
-        const hit = await tile("channel-1").evaluate((tile, { edge, fraction }) => {
-          const r = tile.getBoundingClientRect();
-          const x = edge === "left" ? r.left + 3 : edge === "right" ? r.right - 3 : r.left + r.width * fraction;
-          const y = edge === "top" ? r.top + 3 : edge === "bottom" ? r.bottom - 3 : r.top + r.height * fraction;
-          const node = document.elementFromPoint(x, y);
-          return { label: node?.closest('[role="button"]')?.getAttribute("aria-label"), cursor: node && getComputedStyle(node).cursor };
-        }, { edge, fraction });
-        assert.deepEqual(hit, { label: `Resize Channel 1 ${edge} edge`, cursor }, `${name}: resize target at ${fraction} of ${edge} edge`);
+        for (const inset of [3, -outsideEdge]) {
+          const hit = await tile("channel-1").evaluate((tile, { edge, fraction, inset }) => {
+            const r = tile.getBoundingClientRect();
+            const x = edge === "left" ? r.left + inset : edge === "right" ? r.right - inset : r.left + r.width * fraction;
+            const y = edge === "top" ? r.top + inset : edge === "bottom" ? r.bottom - inset : r.top + r.height * fraction;
+            const node = document.elementFromPoint(x, y);
+            return { label: node?.closest('[role="button"]')?.getAttribute("aria-label"), cursor: node && getComputedStyle(node).cursor };
+          }, { edge, fraction, inset });
+          assert.deepEqual(hit, { label: `Resize Channel 1 ${edge} edge`, cursor }, `${name}: resize target at ${fraction} of ${edge} edge, inset ${inset}`);
+        }
       }
     }
     // Resize from well away from the stock centre grip, with native mouse/touch.
     const initialTile = await tile("channel-1").boundingBox();
-    const away = { x: initialTile.x + initialTile.width - 3, y: initialTile.y + initialTile.height / 4 };
+    const away = { x: initialTile.x + initialTile.width + outsideEdge, y: initialTile.y + initialTile.height / 4 };
     if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...away, id: 1 }] });
     else { await page.mouse.move(away.x, away.y); await page.mouse.down(); }
     await rawMove({ x: away.x + initialTile.width * 0.15, y: away.y });

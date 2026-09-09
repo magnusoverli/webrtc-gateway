@@ -18,7 +18,7 @@ Build a Linux application deployable with Docker Compose that accepts independen
 - The web UI, application API, WHEP signaling proxy, and live statistics use one HTTP port.
 - Management and media listeners can bind to all interfaces, a fixed IP, or the current IPv4/IPv6 address of a persisted host interface selection.
 - RTP, SRT, and WebRTC media continue to use their own UDP ports.
-- Preview creates a real WebRTC reader and starts muted. Each eligible visible overview grid card can open one preview, list mode opens none, and channel detail can open its own preview.
+- Preview creates a real WebRTC reader and starts muted. Channel detail can open its own preview; overview grid and list cards show configuration/status without creating readers.
 - Always-on statistics come from MediaMTX. Browser `getStats()` augments them while preview is active.
 - Gateway-container and whole-host CPU/RAM are sampled in the background from cgroup v2 and `/proc`; MediaMTX process resources remain explicitly excluded because its container is isolated.
 - Dashboard status uses bounded serial HTTP polling with failure backoff and a hidden-page pause. Preview sessions close after 30 seconds hidden.
@@ -191,7 +191,7 @@ Preview traffic is included in aggregate viewer and output statistics. MediaMTX 
 - [x] The UI and all management functions are available on one HTTP port.
 - [x] All accepted input modes can be configured from the UI.
 - [x] Supported streams reach WebRTC without a Gateway transcoder running.
-- [x] Preview connects only on eligible visible overview grid cards or channel detail when the persisted automatic-preview preference is enabled; list mode creates no preview readers.
+- [x] Preview connects in channel detail when the persisted automatic-preview preference is enabled; overview grid and list layouts create no preview readers.
 - [x] Multiple channels and viewers operate independently.
 - [ ] Editing one channel does not interrupt unrelated channels.
 - [x] Configuration survives restarts and reconciles into MediaMTX.
