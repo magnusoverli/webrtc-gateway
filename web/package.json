@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "react-resizable": "4.0.2"
   },
   "devDependencies": {
     "@testing-library/react": "16.3.0",

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+- Restored full-edge resize targets and two-way cursors while retaining the library's default grip visuals.
+- Fixed displaced tiles flickering during continuous resizing by animating only grid-space changes and keeping transitions intact until layout commits.
+- Switched tile resize handles to the unmodified react-resizable stylesheet, removing custom corner marks, full-edge hotspots, and resize highlights.
+- Simplified multiview title bars by removing status text and the fullscreen entry button; double-click video or press Enter on a focused video to expand it.
+- Made the full multiview title bar draggable and removed the separate move-grip icon, while keeping title-bar action buttons independently clickable.
+- Replaced custom tile resize dragging with react-resizable, adding visible corner grips for resizing both dimensions together.
+- Made multiview tile resizing continuous between grid sizes, with immediate neighbour displacement and saved intermediate dimensions.
+- Added browser-saved multiview tile resizing on the 4×3 grid with automatic page reflow, one-click size reset, and double-click fullscreen.
 - Made multiview drag placeholders invisible and previews level at actual tile size, displacing neighbors only when more than half the preview overlaps them.
 - Fixed the move-position dialog sometimes failing to open on a mobile tap immediately after a cross-page drag.
 - Fixed short multiview drops snapping neighboring tiles instantly by letting their in-flight sorting animation finish after pointer release.

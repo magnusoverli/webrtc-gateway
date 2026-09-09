@@ -1,10 +1,31 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { multiviewOrderKey, overviewLayoutKey, readMultiviewOrder, readOverviewLayout, writeMultiviewOrder, writeOverviewLayout } from "./uiPreferences";
+import { multiviewOrderKey, overviewLayoutKey, readMultiviewOrder, readOverviewLayout, writeMultiviewOrder, writeOverviewLayout, multiviewSizesKey, readMultiviewSizes, writeMultiviewSizes } from "./uiPreferences";
 
 beforeEach(() => { localStorage.clear(); });
 afterEach(() => { vi.restoreAllMocks(); });
+
+describe("multiview size preferences", () => {
+  it("round-trips sizes independently of saved order", () => {
+    writeMultiviewOrder(["north", "south"]);
+    writeMultiviewSizes({ north: { columns: 1.375, rows: 2.125 } });
+    expect(readMultiviewSizes()).toEqual({ north: { columns: 1.375, rows: 2.125 } });
+    expect(readMultiviewOrder()).toEqual(["north", "south"]);
+  });
+
+  it.each(["null", "[]", "broken", "42", '{"north":null}', '{"north":{"columns":5,"rows":1}}', '{"north":{"columns":1,"rows":0}}', '{"north":{"columns":"1.5","rows":1}}'])
+    ("ignores invalid size data %s", (value) => {
+      localStorage.setItem(multiviewSizesKey, value);
+      expect(readMultiviewSizes()).toEqual({});
+    });
+
+  it("works with blocked storage", () => {
+    vi.spyOn(window, "localStorage", "get").mockImplementation(() => { throw new Error("blocked"); });
+    expect(readMultiviewSizes()).toEqual({});
+    expect(() => writeMultiviewSizes({ north: { columns: 2, rows: 2 } })).not.toThrow();
+  });
+});
 
 describe("overview layout preference", () => {
   it("loads and writes the versioned layout value", () => {

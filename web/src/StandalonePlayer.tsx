@@ -16,10 +16,12 @@ import {
 import { startSerialPolling } from "./polling";
 import { requestJSON } from "./request";
 import { useWHEPPlayer } from "./useWHEPPlayer";
-import { ArrowLeftIcon, GripIcon } from "./Icons";
+import { ArrowLeftIcon } from "./Icons";
 import { ModalShell } from "./Modal";
 import { HelpTip } from "./Tooltip";
-import { readMultiviewOrder, writeMultiviewOrder } from "./uiPreferences";
+import { readMultiviewOrder, writeMultiviewOrder, readMultiviewSizes, writeMultiviewSizes } from "./uiPreferences";
+import { TileResizer } from "./TileResizer";
+import { clampTileSize, defaultTileSize, packMultiview, sameTileFootprint, type TileSize, type TilePlacement } from "./multiviewLayout";
 import { AudioMeter, useAudioMeterContext } from "./AudioMeter";
 
 export type StandaloneRoute =
@@ -120,6 +122,10 @@ export function ChannelViewer() {
 export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel[]; loaded: boolean; summary?: string }) {
   const audioMeters = useAudioMeterContext();
   const [order, setOrder] = useState(readMultiviewOrder);
+  const [sizes, setSizes] = useState(readMultiviewSizes);
+  const [resize, setResize] = useState<{ id: string; size: TileSize } | null>(null);
+  const resizeRef = useRef<{ id: string; page: number; size: TileSize } | null>(null);
+  const [fullscreenID, setFullscreenID] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [drag, setDrag] = useState<{ id: string; target: string | null; dropTarget: string | null; pageIDs: string[]; snapshot: DragSnapshot; left: number; top: number } | null>(null);
   const [moveID, setMoveID] = useState<string | null>(null);
@@ -134,21 +140,31 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
   const focusIDRef = useRef<string | null>(null);
   const byID = new Map(channels.map((channel) => [channel.id, channel]));
   const ids = [...new Set([...order, ...byID.keys()])].filter((id) => byID.has(id));
-  const pageCount = Math.max(1, Math.ceil(ids.length / 12));
-  const currentPage = Math.min(page, pageCount - 1);
+  const effectiveSizes = resize ? { ...sizes, [resize.id]: resize.size } : sizes;
+  const placements = packMultiview(ids, effectiveSizes);
+  const pageCount = Math.max(1, (placements.at(-1)?.page ?? 0) + 1);
+  const currentPage = resize ? placements.find((tile) => tile.id === resize.id)?.page ?? 0 : Math.min(page, pageCount - 1);
+  const pageIDs = (number: number) => placements.filter((tile) => tile.page === number).map((tile) => tile.id);
   // Keep this page's DOM membership/order fixed throughout capture, including polling updates.
-  const visibleIDs = drag ? drag.pageIDs.filter((id) => byID.has(id)) : ids.slice(currentPage * 12, (currentPage + 1) * 12);
+  const visibleIDs = drag ? drag.pageIDs.filter((id) => byID.has(id)) : pageIDs(currentPage);
   // Even keyed DOM moves can empty a native video and tear down its WHEP session.
   // Keep retained nodes in DOM order after drop too; CSS order owns their positions.
-  const renderedIDs = [...tileIDsRef.current.filter((id) => visibleIDs.includes(id)), ...visibleIDs.filter((id) => !tileIDsRef.current.includes(id))];
+  const retainedIDs = resize ? [...new Set([...tileIDsRef.current.filter((id) => byID.has(id)), ...visibleIDs])] : visibleIDs;
+  const renderedIDs = [...tileIDsRef.current.filter((id) => retainedIDs.includes(id)), ...retainedIDs.filter((id) => !tileIDsRef.current.includes(id))];
   const previewIDs = [...visibleIDs];
   if (drag?.target && previewIDs.includes(drag.id) && previewIDs.includes(drag.target)) {
     const to = previewIDs.indexOf(drag.target);
     previewIDs.splice(previewIDs.indexOf(drag.id), 1);
     previewIDs.splice(to, 0, drag.id);
   }
+  const previewOrder = [...ids];
+  if (drag) {
+    const start = ids.indexOf(visibleIDs[0]);
+    previewOrder.splice(start, visibleIDs.length, ...previewIDs);
+  }
+  const previewPlacements = new Map(packMultiview(previewOrder, effectiveSizes).map((tile) => [tile.id, tile]));
   const movingChannel = moveID ? byID.get(moveID) : undefined;
-  const reorderHelp = "Drag until more than half the preview overlaps another tile to displace it. Drop with the preview center inside a tile, or point at a page button to move pages. Click the handle to choose a position. Order is saved in this browser. Only the visible page plays.";
+  const reorderHelp = "Drag a tile by its title bar until more than half the preview overlaps another tile to displace it. Drop with the preview center inside a tile, or point at a page button to move pages. Click the title bar to choose a position. The reset button works independently of dragging. Drag an edge to resize smoothly, or a visible corner grip to resize width and height together. The 4-column, 3-row grid reserves space for each tile; overflow moves to the next page. Focus an edge or corner and use arrow keys for small size adjustments, or Shift+arrow for a whole cell. Reset size restores 1 × 1. Double-click the video or press Enter on a focused video for fullscreen; Escape exits. Order and sizes are saved in this browser. Only the visible page plays.";
 
   useEffect(() => {
     // Reconcile only definitive snapshots, never the initial empty loading state.
@@ -156,8 +172,10 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
       setOrder(ids);
       writeMultiviewOrder(ids);
     }
-    if (page !== currentPage) setPage(currentPage);
+    if (!resize && page !== currentPage) setPage(currentPage);
     if (moveID && !byID.has(moveID)) setMoveID(null);
+    if (fullscreenID && !byID.has(fullscreenID)) setFullscreenID(null);
+    if (resizeRef.current && !byID.has(resizeRef.current.id)) cancelResize();
     const pointer = pointerRef.current;
     if (pointer && (!byID.has(pointer.id) || (pointer.target && !byID.has(pointer.target)) || (drag?.dropTarget && !byID.has(drag.dropTarget)))) {
       cancelPointer();
@@ -166,8 +184,13 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
 
   useLayoutEffect(() => {
     tileIDsRef.current = renderedIDs;
+    // Remove old transforms only inside the layout commit, immediately before
+    // installing replacements. Native resize callbacks can precede React's
+    // commit by a paint; cancelling there exposes the destination, then jumps
+    // backwards when the next FLIP starts from the captured visual position.
+    if (layoutRef.current.size) stopAnimations();
     for (const [tile, before] of layoutRef.current) {
-      if (!tile.isConnected || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || !tile.animate) continue;
+      if (!tile.isConnected || tile.hidden || (!before.width && !before.height) || tile.matches(".is-resizing, .is-fullscreen") || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || !tile.animate) continue;
       const after = tile.getBoundingClientRect();
       const x = before.left - after.left, y = before.top - after.top;
       if (!x && !y) continue;
@@ -187,10 +210,9 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
   };
 
   const captureLayout = () => {
-    // Capture visual positions before cancelling, including an interrupted glide.
+    // Keep running animations visible until React commits the next layout.
     layoutRef.current = new Map([...rootRef.current!.querySelectorAll<HTMLElement>(".multiview-grid article")]
       .map((tile) => [tile, tile.getBoundingClientRect()]));
-    stopAnimations();
   };
 
   const cancelPointer = (keepAnimations = false) => {
@@ -247,7 +269,7 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
     if (!focusIDRef.current) return;
     const tile = Array.from(rootRef.current?.querySelectorAll<HTMLElement>("[data-move-target]") ?? [])
       .find((element) => element.dataset.moveTarget === focusIDRef.current && element.matches("article"));
-    tile?.querySelector<HTMLButtonElement>(".multiview-drag-handle")?.focus();
+    tile?.querySelector<HTMLButtonElement>(".multiview-titlebar-drag")?.focus();
     focusIDRef.current = null;
   });
 
@@ -260,14 +282,32 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
     next.splice(to, 0, id);
     setOrder(next);
     writeMultiviewOrder(next);
-    setPage(Math.floor(to / 12));
+    const placement = packMultiview(next, sizes).find((tile) => tile.id === id)!;
+    setPage(placement.page);
     setMoveID(null);
     focusIDRef.current = id;
-    setAnnouncement(`${byID.get(id)?.name} moved to page ${Math.floor(to / 12) + 1}, position ${to % 12 + 1}.`);
+    setAnnouncement(`${byID.get(id)?.name} moved to page ${placement.page + 1}, position ${placement.row * 4 + placement.column + 1}.`);
+  };
+
+  const saveSize = (id: string, size: TileSize) => {
+    const next = { ...sizes, [id]: clampTileSize(size) };
+    if (size.columns === 1 && size.rows === 1) delete next[id];
+    setSizes(next);
+    writeMultiviewSizes(next);
+    setPage(packMultiview(ids, next).find((tile) => tile.id === id)?.page ?? currentPage);
+    setAnnouncement(`${byID.get(id)?.name} resized to ${size.columns} columns by ${size.rows} rows.`);
+  };
+
+  const cancelResize = (commit = false) => {
+    const pointer = resizeRef.current;
+    if (pointer && !commit) captureLayout();
+    resizeRef.current = null;
+    if (pointer && !commit) setPage(pointer.page);
+    setResize(null);
   };
 
   const startPointer = (event: ReactPointerEvent<HTMLButtonElement>, id: string) => {
-    if (pointerRef.current || event.button !== 0 || event.isPrimary === false || ids.length < 2) return;
+    if (pointerRef.current || resizeRef.current || fullscreenID || event.button !== 0 || event.isPrimary === false || ids.length < 2) return;
     suppressClickRef.current = false;
     const rect = event.currentTarget.closest("article")!.getBoundingClientRect();
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape") cancelPointer(); };
@@ -295,20 +335,21 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
     // Offset geometry ignores FLIP transforms but follows the current CSS ordering.
     // Exclude the moving placeholder: holding its new slot must not undo the preview.
     const slots = [...grid.querySelectorAll<HTMLElement>("article")]
+      .filter((tile) => !tile.hidden)
       .map((tile) => ({ id: tile.dataset.moveTarget, left: origin.left + tile.offsetLeft, top: origin.top + tile.offsetTop, width: tile.offsetWidth, height: tile.offsetHeight }))
       .sort((a, b) => a.top - b.top || a.left - b.left);
     const { width, height } = pointer.snapshot;
     const left = x - pointer.offsetX, top = y - pointer.offsetY;
-    let bestArea = width * height / 2;
+    let bestArea = 0;
     const pageIDs = pointer.pageIDs.filter((id) => byID.has(id));
-    slots.forEach((slot, index) => {
+    slots.forEach((slot) => {
       if (slot.id === pointer.id) return;
       const area = Math.max(0, Math.min(left + width, slot.left + slot.width) - Math.max(left, slot.left))
         * Math.max(0, Math.min(top + height, slot.top + slot.height) - Math.max(top, slot.top));
-      if (area > bestArea) {
+      if (area > Math.min(width * height, slot.width * slot.height) / 2 && area > bestArea) {
         bestArea = area;
         // target is the original-page insertion anchor, not the displaced tile's ID.
-        target = pageIDs[index];
+        target = pageIDs[previewIDs.indexOf(slot.id ?? "")];
       }
     });
     // Keep the proposed order across gaps and partial overlaps. Drop validity is
@@ -365,7 +406,7 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
         onPointerMove={updatePointer} onPointerUp={finishPointer}
         onPointerCancel={(event) => { if (event.pointerId === pointerRef.current?.pointerID) cancelPointer(); }}
         onLostPointerCapture={(event) => { if (event.pointerId === pointerRef.current?.pointerID) cancelPointer(); }}>
-        <div className="multiview-toolbar">
+        <div className="multiview-toolbar" inert={fullscreenID ? true : undefined}>
           <nav className="detail-breadcrumb multiview-breadcrumb" aria-label="Breadcrumb">
             <a className="crumb-back" href="/"><ArrowLeftIcon /> Overview</a>
             <span className="crumb-divider" aria-hidden="true">/</span>
@@ -377,13 +418,13 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
             {(audioMeters.state === "unsupported" || audioMeters.state === "closed") && <span className="multiview-summary" title="This browser cannot run audio analysis. Video playback is unaffected.">Meters unavailable</span>}
             <HelpTip label="Reorder channels" content={reorderHelp} placement="bottom" />
             <nav className="multiview-pagination" aria-label="Multiview pages">
-              <button className={`button secondary${drag && drag.dropTarget === ids[(currentPage - 1) * 12] ? " is-drop-target" : ""}`} type="button"
-                disabled={currentPage === 0} data-move-target={currentPage > 0 ? ids[(currentPage - 1) * 12] : undefined}
-                onClick={() => { if (!drag) setPage(currentPage - 1); }}>Previous page</button>
+              <button className={`button secondary${drag && drag.dropTarget === pageIDs(currentPage - 1)[0] ? " is-drop-target" : ""}`} type="button"
+                disabled={currentPage === 0 || Boolean(resize)} data-move-target={currentPage > 0 ? pageIDs(currentPage - 1)[0] : undefined}
+                onClick={() => { if (!drag && !resizeRef.current) setPage(currentPage - 1); }}>Previous page</button>
               <span aria-live="polite">Page {currentPage + 1} of {pageCount}</span>
-              <button className={`button secondary${drag && drag.dropTarget === ids[(currentPage + 1) * 12] ? " is-drop-target" : ""}`} type="button"
-                disabled={currentPage === pageCount - 1} data-move-target={ids[(currentPage + 1) * 12]}
-                onClick={() => { if (!drag) setPage(currentPage + 1); }}>Next page</button>
+              <button className={`button secondary${drag && drag.dropTarget === pageIDs(currentPage + 1)[0] ? " is-drop-target" : ""}`} type="button"
+                disabled={currentPage === pageCount - 1 || Boolean(resize)} data-move-target={pageIDs(currentPage + 1)[0]}
+                onClick={() => { if (!drag && !resizeRef.current) setPage(currentPage + 1); }}>Next page</button>
             </nav>
           </div>
         </div>
@@ -391,14 +432,43 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
         <section className="multiview-grid" aria-label={`Channels on page ${currentPage + 1}`} hidden={ids.length === 0}>
           {renderedIDs.map((id) => {
             const channel = byID.get(id)!;
-            return <MultiviewTile key={id} channel={channel} audioContext={audioMeters.context} position={previewIDs.indexOf(id)} dragging={drag?.id === id} dropTarget={drag?.id === id && visibleIDs.includes(drag.target ?? "")} moveHandle={
-              <button className="multiview-drag-handle" type="button" aria-label={`Move ${channel.name}`} aria-describedby="multiview-help"
-                title="Drag to reorder or click to choose a position" disabled={ids.length < 2} onPointerDown={(event) => startPointer(event, id)}
+            const placement = previewPlacements.get(id)!;
+            return <MultiviewTile key={id} channel={channel} audioContext={audioMeters.context} position={previewIDs.indexOf(id)} placement={placement}
+              hidden={placement.page !== currentPage} resizing={resize?.id === id} fullscreen={fullscreenID === id} inert={Boolean(fullscreenID && fullscreenID !== id)}
+              onFullscreen={(open) => setFullscreenID(open ? id : null)}
+              onResetSize={() => { captureLayout(); saveSize(id, defaultTileSize); }}
+              resizeDisabled={Boolean(drag || fullscreenID || (resize && resize.id !== id))}
+              onResizeStart={() => {
+                if (pointerRef.current || resizeRef.current || fullscreenID) return false;
+                resizeRef.current = { id, page: currentPage, size: { columns: placement.columns, rows: placement.rows } };
+                setResize({ id, size: { columns: placement.columns, rows: placement.rows } });
+                return true;
+              }}
+              onResizeChange={(size) => {
+                const current = resizeRef.current;
+                if (!current || current.id !== id || (current.size.columns === size.columns && current.size.rows === size.rows)) return;
+                // Fractional pixel changes within the same reserved cells do
+                // not move any neighbour: let its existing glide finish.
+                if (!sameTileFootprint(current.size, size)) captureLayout();
+                current.size = size;
+                setResize({ id, size });
+              }}
+              onResizeCommit={(size) => { saveSize(id, size); cancelResize(true); }}
+              onResizeCancel={() => cancelResize()}
+              onKeyboardResize={(size) => {
+                if (!pointerRef.current && !resizeRef.current) {
+                  if (!sameTileFootprint(placement, size)) captureLayout();
+                  saveSize(id, size);
+                }
+              }}
+              dragging={drag?.id === id} dropTarget={drag?.id === id && visibleIDs.includes(drag.target ?? "")} moveHandle={
+              <button className="multiview-titlebar-drag" type="button" aria-label={`Move ${channel.name}`} aria-describedby="multiview-help"
+                title="Drag the title bar to reorder or click to choose a position" disabled={ids.length < 2} onPointerDown={(event) => startPointer(event, id)}
                 onClick={() => {
                   if (drag) return;
                   setMoveID(id);
                   setDestination(id);
-                }}><GripIcon /></button>
+                }} />
             } />;
           })}
         </section>
@@ -410,7 +480,7 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
         <header className="editor-header"><h2 id="move-channel-title">Move {movingChannel.name}</h2></header>
         <div className="editor-body"><label className="field">Destination position
           <select value={destination} onChange={(event) => setDestination(event.target.value)}>
-            {ids.map((id, index) => <option key={id} value={id}>Page {Math.floor(index / 12) + 1}, position {index % 12 + 1} - {byID.get(id)?.name}</option>)}
+             {placements.map((tile) => <option key={tile.id} value={tile.id}>Page {tile.page + 1}, position {tile.row * 4 + tile.column + 1} - {byID.get(tile.id)?.name}</option>)}
           </select>
         </label></div>
         <footer className="editor-footer"><button className="button secondary" type="button" onClick={() => setMoveID(null)}>Cancel</button>
@@ -481,7 +551,7 @@ export function StandalonePlayer({ channelID }: { channelID: string }) {
 }
 
 type DragSnapshot = {
-  width: number; height: number; name: string; status: string; signal: string;
+  width: number; height: number; headerHeight: number; name: string; signal: string;
   frame: HTMLCanvasElement | null; message: string;
 };
 
@@ -500,8 +570,8 @@ function captureDragSnapshot(tile: HTMLElement): DragSnapshot {
     } catch { /* A missing/protected frame still has a useful header and status preview. */ }
   }
   return { width, height, frame,
+    headerHeight: tile.querySelector("header")?.getBoundingClientRect().height ?? 0,
     name: tile.querySelector("h2")?.textContent ?? "",
-    status: tile.querySelector("header small")?.textContent ?? "",
     signal: tile.querySelector(".signal")?.className ?? "signal",
     message: [...tile.querySelectorAll(".preview-message > *")].map((element) => element.textContent).join(" ") || "Video frame unavailable",
   };
@@ -517,9 +587,8 @@ function DragOverlay({ snapshot, left, top }: { snapshot: DragSnapshot; left: nu
   return <div className="multiview-drag-overlay" aria-hidden="true" inert
     style={{ width: snapshot.width, height: snapshot.height, transform: `translate3d(${left}px, ${top}px, 0)` }}>
     <div className="multiview-tile">
-      <header className="multiview-tile-header">
+      <header className="multiview-tile-header" style={{ height: snapshot.headerHeight || undefined }}>
         <div><span className={snapshot.signal} /><h2>{snapshot.name}</h2></div>
-        <small>{snapshot.status}</small><span className="multiview-drag-handle"><GripIcon /></span>
       </header>
       <section className="standalone-stage"><div className="multiview-picture" ref={pictureRef}>
         {!snapshot.frame && <div className="preview-message">{snapshot.message}</div>}
@@ -528,7 +597,17 @@ function DragOverlay({ snapshot, left, top }: { snapshot: DragSnapshot; left: nu
   </div>;
 }
 
-function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, dropTarget }: { channel: Channel; audioContext: AudioContext | null; moveHandle: ReactNode; position: number; dragging: boolean; dropTarget: boolean }) {
+function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, dropTarget, placement, hidden, resizing, resizeDisabled, onResizeStart, onResizeChange, onResizeCommit, onResizeCancel, onKeyboardResize, onResetSize, fullscreen, inert, onFullscreen }: {
+  channel: Channel; audioContext: AudioContext | null; moveHandle: ReactNode; position: number; dragging: boolean; dropTarget: boolean;
+  placement: TilePlacement; hidden: boolean; resizing: boolean; resizeDisabled: boolean; onResetSize: () => void;
+  onResizeStart: () => boolean; onResizeChange: (size: TileSize) => void; onResizeCommit: (size: TileSize) => void; onResizeCancel: () => void; onKeyboardResize: (size: TileSize) => void;
+  fullscreen: boolean; inert: boolean; onFullscreen: (open: boolean) => void;
+}) {
+  const tileRef = useRef<HTMLElement>(null);
+  const fullscreenButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const nativeFullscreenRef = useRef(false);
+  const fullscreenGeneration = useRef(0);
   const playable = channelPlaybackReady(channel);
   const player = useWHEPPlayer({
     whepPath: channel?.whepPath ?? "",
@@ -537,17 +616,72 @@ function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, 
   });
   const stateLabel = channelStateLabel(channel);
   const showAudioOnly = Boolean(playable && player.state === "playing" && player.hasAudio && !player.hasVideo);
+  const widthRatio = placement.columns / Math.ceil(placement.columns);
+  const heightRatio = placement.rows / Math.ceil(placement.rows);
+
+  const exitFullscreen = () => {
+    fullscreenGeneration.current++;
+    if (document.fullscreenElement === tileRef.current) void document.exitFullscreen?.().catch(() => {});
+    nativeFullscreenRef.current = false;
+    onFullscreen(false);
+    (returnFocusRef.current?.isConnected && returnFocusRef.current !== document.body ? returnFocusRef.current : tileRef.current?.querySelector("video"))?.focus({ preventScroll: true });
+  };
+
+  const toggleFullscreen = () => {
+    if (dragging || resizing) return;
+    if (fullscreen) { exitFullscreen(); return; }
+    returnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const generation = ++fullscreenGeneration.current;
+    onFullscreen(true);
+    // Same DOM/video node in native fullscreen, with an in-page fallback for
+    // browsers or embedding policies that disallow the Fullscreen API.
+    try {
+      void tileRef.current?.requestFullscreen?.().then(() => {
+        if (generation !== fullscreenGeneration.current) {
+          if (document.fullscreenElement === tileRef.current) void document.exitFullscreen?.();
+        } else nativeFullscreenRef.current = true;
+      }).catch(() => {});
+    } catch { /* The in-page fullscreen view is already active. */ }
+  };
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    fullscreenButtonRef.current?.focus({ preventScroll: true });
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); exitFullscreen(); }
+      if (event.key === "Tab") { event.preventDefault(); fullscreenButtonRef.current?.focus(); }
+    };
+    const changed = () => {
+      if (document.fullscreenElement === tileRef.current) nativeFullscreenRef.current = true;
+      else if (nativeFullscreenRef.current) exitFullscreen();
+    };
+    document.addEventListener("keydown", escape);
+    document.addEventListener("fullscreenchange", changed);
+    return () => { document.removeEventListener("keydown", escape); document.removeEventListener("fullscreenchange", changed); };
+  }, [fullscreen]);
 
   return (
-    <article data-move-target={channel.id} style={{ order: position }} className={`multiview-tile${playable ? " live" : ""}${dragging ? " is-dragging" : ""}${dropTarget ? " is-drop-target" : ""}`}>
+    <TileResizer nodeRef={tileRef} name={channel.name} size={placement} disabled={resizeDisabled || fullscreen}
+      onStart={onResizeStart} onChange={onResizeChange} onCommit={onResizeCommit} onCancel={onResizeCancel} onKeyboardResize={onKeyboardResize}>
+    <article ref={tileRef} data-move-target={channel.id} hidden={hidden} inert={inert ? true : undefined}
+      style={{ order: position, gridColumn: `${placement.column + 1} / span ${Math.ceil(placement.columns)}`, gridRow: `${placement.row + 1} / span ${Math.ceil(placement.rows)}`,
+        // The grid reserves whole cells, while these dimensions preserve the
+        // exact pointer-selected size, including the gaps between grid cells.
+        width: !fullscreen && widthRatio !== 1 ? `calc(${widthRatio * 100}% - ${1 - widthRatio} * var(--multiview-gap))` : undefined,
+        height: !fullscreen && heightRatio !== 1 ? `calc(${heightRatio * 100}% - ${1 - heightRatio} * var(--multiview-gap))` : undefined,
+      }}
+      className={`multiview-tile${playable ? " live" : ""}${dragging ? " is-dragging" : ""}${dropTarget ? " is-drop-target" : ""}${resizing ? " is-resizing" : ""}${fullscreen ? " is-fullscreen" : ""}`}
+      onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button, [role=button], a, input, select")) toggleFullscreen(); }}>
       <header className="multiview-tile-header">
         <div><span className={channelHasFault(channel) ? "signal fault" : playable ? "signal online" : "signal"} /><h2>{channel.name}</h2></div>
-        <small>{stateLabel}</small>
-        {moveHandle}
+        {!fullscreen && (placement.columns !== 1 || placement.rows !== 1) && <button type="button" className="multiview-tile-action" aria-label={`Reset ${channel.name} size`} title="Reset size to 1 × 1" onClick={onResetSize}>1×1</button>}
+        {fullscreen && <button ref={fullscreenButtonRef} type="button" className="multiview-tile-action" aria-label={`Exit fullscreen for ${channel.name}`} title="Exit fullscreen (Escape)" onClick={toggleFullscreen}>⛶</button>}
+        {!fullscreen && moveHandle}
       </header>
       <section className="standalone-stage" aria-label={`${channel.name} player`}>
         <div className="multiview-picture">
-        <video ref={player.videoRef} autoPlay playsInline muted aria-label={`${channel.name} video`} />
+        <video ref={player.videoRef} autoPlay playsInline muted aria-label={`${channel.name} video`} tabIndex={0} aria-keyshortcuts="Enter"
+          onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); toggleFullscreen(); } }} />
         {showAudioOnly && <PlayerMessage code="AUD" title="Audio-only stream" detail="Monitoring muted. Audio levels are overlaid on the player." />}
         {!playable && <PlayerMessage code={stateCode(channel)} title={stateLabel} detail={offlineDetail(channel)} error={channelHasFault(channel)} />}
         {playable && player.state === "connecting" && <PlayerMessage code="ICE" title="Connecting" detail="Establishing a WebRTC media session." pulse />}
@@ -557,6 +691,7 @@ function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, 
         </div>
       </section>
     </article>
+    </TileResizer>
   );
 }
 

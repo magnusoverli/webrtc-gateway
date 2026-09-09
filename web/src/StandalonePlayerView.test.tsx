@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Channel, ChannelRuntime } from "./channel";
 
@@ -34,7 +34,7 @@ vi.mock("./useWHEPPlayer", async () => {
 });
 
 import { ChannelViewer, initializeStandaloneRoute, MultiviewGrid, StandalonePlayer } from "./StandalonePlayer";
-import { multiviewOrderKey, readMultiviewOrder } from "./uiPreferences";
+import { multiviewOrderKey, readMultiviewOrder, multiviewSizesKey, readMultiviewSizes } from "./uiPreferences";
 
 describe("ChannelViewer", () => {
   beforeEach(() => {
@@ -158,6 +158,203 @@ describe("ChannelViewer", () => {
 
     view.rerender(<MultiviewGrid channels={[{ ...south, outputReady: false }]} loaded />);
     expect(playerHarness.stopped).toEqual([north.whepPath, south.whepPath]);
+  });
+
+  describe("resizable multiview", () => {
+    beforeEach(() => {
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        return this.classList.contains("multiview-grid") ? new DOMRect(0, 0, 400, 300) : new DOMRect();
+      });
+    });
+
+    function resizeHandle(edge = "right", name = "Channel 1") {
+      const handle = screen.getByRole("button", { name: `Resize ${name} ${edge} edge` });
+      return handle;
+    }
+
+    it.each(["left", "right", "top", "bottom"])("resizes the %s edge, previews displacement, and persists only on release", (edge) => {
+      render(<MultiviewGrid channels={fixtureChannels(4)} loaded />);
+      const videos = [...document.querySelectorAll("video")];
+      const handle = resizeHandle(edge);
+      const point = { clientX: edge === "left" ? -100 : edge === "right" ? 100 : 0, clientY: edge === "top" ? -100 : edge === "bottom" ? 100 : 0 };
+      fireEvent.mouseDown(handle, { button: 0 });
+      fireEvent.mouseMove(document, point);
+      const tile = handle.closest("article")!;
+      expect(edge === "left" || edge === "right" ? tile.style.gridColumn : tile.style.gridRow).toBe("1 / span 2");
+      expect(readMultiviewSizes()).toEqual({});
+      fireEvent.mouseUp(document, point);
+      expect(readMultiviewSizes()["channel-1"]).toEqual(edge === "left" || edge === "right" ? { columns: 2, rows: 1 } : { columns: 1, rows: 2 });
+      expect([...document.querySelectorAll("video")]).toEqual(videos);
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it.each(["left", "right", "top", "bottom"])("keeps intermediate %s edge sizes and displaces neighbors before reaching half a cell", (edge) => {
+      render(<MultiviewGrid channels={fixtureChannels(4)} loaded />);
+      const handle = resizeHandle(edge);
+      const horizontal = edge === "left" || edge === "right";
+      const point = { clientX: edge === "left" ? -15 : edge === "right" ? 15 : 0, clientY: edge === "top" ? -15 : edge === "bottom" ? 15 : 0 };
+      fireEvent.mouseDown(handle, { button: 0 });
+      fireEvent.mouseMove(document, point);
+      const tile = handle.closest("article")!;
+      expect(horizontal ? tile.style.gridColumn : tile.style.gridRow).toBe("1 / span 2");
+      expect(parseFloat((horizontal ? tile.style.width : tile.style.height).slice(5))).toBeCloseTo(57.5);
+      if (horizontal) expect(screen.getByLabelText("Channel 2 video").closest("article")!.style.gridColumn).toBe("3 / span 1");
+      expect(readMultiviewSizes()).toEqual({});
+      fireEvent.mouseUp(document, point);
+      expect(readMultiviewSizes()["channel-1"]).toEqual(horizontal ? { columns: 1.15, rows: 1 } : { columns: 1, rows: 1.15 });
+      fireEvent.doubleClick(tile.querySelector("video")!);
+      expect(tile.style.width).toBe("");
+      expect(tile.style.height).toBe("");
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(parseFloat((horizontal ? tile.style.width : tile.style.height).slice(5))).toBeCloseTo(57.5);
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it.each(["top-left", "top-right", "bottom-left", "bottom-right"])("uses the library's %s corner to resize both dimensions without remounting video", (corner) => {
+      render(<MultiviewGrid channels={fixtureChannels(4)} loaded />);
+      const video = screen.getByLabelText("Channel 1 video");
+      const handle = screen.getByRole("button", { name: `Resize Channel 1 ${corner} corner` });
+      expect(handle.classList.contains("react-resizable-handle")).toBe(true);
+      expect(handle.tagName).toBe("SPAN");
+      expect(handle.classList.length).toBe(2);
+      expect(handle.getAttribute("style")).toBeNull();
+      fireEvent.doubleClick(handle);
+      expect(video.closest("article")!.classList.contains("is-fullscreen")).toBe(false);
+      const point = { clientX: corner.endsWith("left") ? -25 : 25, clientY: corner.startsWith("top") ? -35 : 35 };
+      fireEvent.mouseDown(handle, { button: 0 });
+      fireEvent.mouseMove(document, point);
+      expect(readMultiviewSizes()).toEqual({});
+      fireEvent.mouseUp(document, point);
+      expect(readMultiviewSizes()["channel-1"]).toEqual({ columns: 1.25, rows: 1.35 });
+      expect(screen.getByLabelText("Channel 1 video")).toBe(video);
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it("supports library touch resizing and releases its listeners after touch cancellation", () => {
+      render(<MultiviewGrid channels={fixtureChannels(4)} loaded />);
+      const start = { identifier: 42, clientX: 0, clientY: 0 };
+      const move = { ...start, clientX: 25, clientY: 35 };
+      const handle = screen.getByRole("button", { name: "Resize Channel 1 bottom-right corner" });
+      fireEvent.touchStart(handle, { targetTouches: [start], touches: [start] });
+      fireEvent.touchMove(document, { touches: [move], changedTouches: [move] });
+      fireEvent.touchEnd(document, { changedTouches: [move] });
+      expect(readMultiviewSizes()["channel-1"]).toEqual({ columns: 1.25, rows: 1.35 });
+      fireEvent.touchStart(handle, { targetTouches: [start], touches: [start] });
+      fireEvent.touchMove(document, { touches: [move], changedTouches: [move] });
+      fireEvent.touchCancel(document, { changedTouches: [move] });
+      fireEvent.touchEnd(document, { changedTouches: [move] });
+      expect(readMultiviewSizes()["channel-1"]).toEqual({ columns: 1.25, rows: 1.35 });
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it("offers fine keyboard adjustments and whole-cell adjustments with Shift", () => {
+      render(<MultiviewGrid channels={fixtureChannels(1)} loaded />);
+      const handle = resizeHandle();
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      expect(readMultiviewSizes()["channel-1"].columns).toBe(1.1);
+      fireEvent.keyDown(handle, { key: "ArrowRight", shiftKey: true });
+      expect(readMultiviewSizes()["channel-1"].columns).toBe(2.1);
+      fireEvent.click(screen.getByRole("button", { name: "Reset Channel 1 size" }));
+      expect(handle.closest("article")!.style.width).toBe("");
+      expect(readMultiviewSizes()).toEqual({});
+    });
+
+    it.each(["Escape", "blur", "touchcancel"])("rolls back resize on %s without saving or restarting retained players", async (action) => {
+      render(<MultiviewGrid channels={fixtureChannels(12)} loaded />);
+      const handle = resizeHandle();
+      fireEvent.mouseDown(handle, { button: 0 });
+      fireEvent.mouseMove(document, { clientX: 100 });
+      if (action === "Escape") fireEvent.keyDown(handle, { key: "Escape" });
+      else fireEvent(action === "blur" ? window : document, new Event(action, { bubbles: true }));
+      fireEvent.mouseUp(document, { clientX: 100 });
+      expect(readMultiviewSizes()).toEqual({});
+      expect(screen.getByText("Page 1 of 1")).toBeDefined();
+      expect(resizeHandle().closest("article")!.style.gridColumn).toBe("1 / span 1");
+      await waitFor(() => expect(document.body.classList.contains("react-draggable-transparent-selection")).toBe(false));
+      expect(playerHarness.stopped).toEqual([]);
+      fireEvent.mouseDown(resizeHandle(), { button: 0 });
+      fireEvent.mouseMove(document, { clientX: 15 });
+      fireEvent.mouseUp(document, { clientX: 15 });
+      expect(readMultiviewSizes()["channel-1"].columns).toBe(1.15);
+    });
+
+    it("moves overflow to another page and resets to the default twelve slots", () => {
+      const channels = fixtureChannels(12);
+      const view = render(<MultiviewGrid channels={channels} loaded />);
+      const retainedVideo = screen.getByLabelText("Channel 1 video");
+      fireEvent.keyDown(resizeHandle(), { key: "ArrowRight" });
+      expect(screen.getByText("Page 1 of 2")).toBeDefined();
+      expect(document.querySelectorAll(".multiview-grid video")).toHaveLength(11);
+      expect(playerHarness.stopped).toEqual([channels[11].whepPath]);
+      expect(screen.getByLabelText("Channel 1 video")).toBe(retainedVideo);
+      view.unmount();
+      render(<MultiviewGrid channels={channels} loaded />);
+      expect(screen.getByText("Page 1 of 2")).toBeDefined();
+      fireEvent.click(screen.getByRole("button", { name: "Reset Channel 1 size" }));
+      expect(readMultiviewSizes()).toEqual({});
+      expect(screen.getByText("Page 1 of 1")).toBeDefined();
+      expect(document.querySelectorAll(".multiview-grid video")).toHaveLength(12);
+    });
+
+    it("follows a resized last tile to its new page and can cancel back to the original page", () => {
+      render(<MultiviewGrid channels={fixtureChannels(12)} loaded />);
+      const handle = resizeHandle("right", "Channel 12");
+      fireEvent.mouseDown(handle, { button: 0 });
+      fireEvent.mouseMove(document, { clientX: 100 });
+      expect(screen.getByText("Page 2 of 2")).toBeDefined();
+      fireEvent.keyDown(handle, { key: "Escape" });
+      expect(screen.getByText("Page 1 of 1")).toBeDefined();
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it("uses actual packed pages in the move dialog", () => {
+      localStorage.setItem(multiviewSizesKey, JSON.stringify({ "channel-1": { columns: 4, rows: 3 } }));
+      render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+      fireEvent.click(screen.getByRole("button", { name: "Move Channel 1" }));
+      expect(screen.getByRole("option", { name: "Page 2, position 1 - Channel 2" })).toBeDefined();
+      fireEvent.change(screen.getByLabelText("Destination position"), { target: { value: "channel-3" } });
+      fireEvent.click(screen.getByRole("button", { name: "Move channel" }));
+      expect(screen.getByText("Page 2 of 2")).toBeDefined();
+      expect(screen.getByLabelText("Channel 1 video")).toBeDefined();
+    });
+
+    it("expands the same player on double-click and restores its saved size and focus on Escape", () => {
+      render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+      fireEvent.keyDown(resizeHandle(), { key: "ArrowRight" });
+      const video = screen.getByLabelText("Channel 1 video");
+      const tile = video.closest("article")!;
+      expect(screen.queryByRole("button", { name: "Fullscreen Channel 1" })).toBeNull();
+      expect(tile.querySelector("header small")).toBeNull();
+      video.focus();
+      fireEvent.doubleClick(video);
+      expect(tile.classList.contains("is-fullscreen")).toBe(true);
+      expect(screen.getByLabelText("Channel 2 video").closest("article")!.hasAttribute("inert")).toBe(true);
+      expect(screen.getByLabelText("Channel 1 video")).toBe(video);
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(tile.classList.contains("is-fullscreen")).toBe(false);
+      expect(tile.style.gridColumn).toBe("1 / span 2");
+      expect(document.activeElement).toBe(video);
+      expect(playerHarness.stopped).toEqual([]);
+    });
+
+    it("handles native fullscreen exit and rejected fullscreen requests", async () => {
+      render(<MultiviewGrid channels={fixtureChannels(1)} loaded />);
+      const tile = screen.getByLabelText("Channel 1 video").closest("article")!;
+      const request = vi.fn().mockRejectedValueOnce(new Error("Not allowed"));
+      Object.defineProperty(tile, "requestFullscreen", { configurable: true, value: request });
+      await act(async () => { fireEvent.keyDown(screen.getByLabelText("Channel 1 video"), { key: "Enter" }); });
+      expect(tile.classList.contains("is-fullscreen")).toBe(true);
+      fireEvent.click(screen.getByRole("button", { name: "Exit fullscreen for Channel 1" }));
+      request.mockImplementationOnce(async () => {
+        Object.defineProperty(document, "fullscreenElement", { configurable: true, value: tile });
+        fireEvent(document, new Event("fullscreenchange"));
+      });
+      await act(async () => { fireEvent.doubleClick(tile); });
+      Object.defineProperty(document, "fullscreenElement", { configurable: true, value: null });
+      fireEvent(document, new Event("fullscreenchange"));
+      expect(tile.classList.contains("is-fullscreen")).toBe(false);
+      expect(playerHarness.started).toHaveLength(1);
+    });
   });
 
   describe("paged multiview", () => {

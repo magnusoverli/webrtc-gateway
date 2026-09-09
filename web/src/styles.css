@@ -1895,6 +1895,7 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-grid {
+  --multiview-gap: 10px;
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -1902,7 +1903,7 @@ button.state-pill { cursor: pointer; }
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   grid-template-rows: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  gap: var(--multiview-gap);
 }
 
 .multiview-grid[hidden] {
@@ -1923,6 +1924,48 @@ button.state-pill { cursor: pointer; }
 .multiview-tile.live {
   border-color: var(--line-emphasis);
 }
+
+.multiview-tile[hidden] { display: none; }
+
+/* Invisible input geometry only; visible grips use react-resizable's stock CSS. */
+.multiview-edge-hitarea { position: absolute; }
+.multiview-edge-hitarea-e,
+.multiview-edge-hitarea-w { top: 20px; bottom: 20px; width: 8px; cursor: ew-resize; }
+.multiview-edge-hitarea-e { right: 0; }
+.multiview-edge-hitarea-w { left: 0; }
+.multiview-edge-hitarea-n,
+.multiview-edge-hitarea-s { left: 20px; right: 20px; height: 8px; cursor: ns-resize; }
+.multiview-edge-hitarea-n { top: 0; }
+.multiview-edge-hitarea-s { bottom: 0; }
+
+:root:has(.multiview-tile.is-fullscreen) { scrollbar-gutter: auto; overflow: hidden; }
+
+.multiview-tile.is-fullscreen,
+.multiview-tile:fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1100;
+  transform: none !important;
+  border: 0;
+}
+
+.multiview-tile-action {
+  flex: none;
+  min-width: 28px;
+  height: 32px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.multiview-tile-action:hover,
+.multiview-tile-action:focus-visible { color: var(--ink-accent); border-color: var(--accent); }
 
 .multiview-tile.is-dragging {
   opacity: 0;
@@ -1970,6 +2013,9 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-tile-header {
+  position: relative;
+  isolation: isolate;
+  min-height: 36px;
   min-width: 0;
   display: flex;
   gap: 8px;
@@ -2013,15 +2059,15 @@ button.state-pill { cursor: pointer; }
   flex: none;
 }
 
-.multiview-drag-handle {
-  width: 32px;
-  height: 32px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
+.multiview-titlebar-drag {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
   background: transparent;
   color: var(--muted);
   cursor: grab;
@@ -2029,23 +2075,20 @@ button.state-pill { cursor: pointer; }
   user-select: none;
 }
 
-.multiview-drag-handle svg {
-  width: 16px;
-  height: 16px;
+.multiview-tile-header .multiview-tile-action {
+  position: relative;
+  z-index: 2;
 }
 
-.multiview-drag-handle:hover {
-  border-color: var(--accent);
-  background: var(--accent-weak);
-  color: var(--ink-accent);
-}
+.multiview-titlebar-drag:disabled { cursor: default; }
 
-.multiview-drag-handle:active,
-.multiview-tile.is-dragging .multiview-drag-handle {
+.multiview-titlebar-drag:active,
+.multiview-tile.is-dragging .multiview-titlebar-drag {
   cursor: grabbing;
 }
 
-.multiview-drag-handle:focus-visible,
+.multiview-titlebar-drag:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
 .multiview-pagination .button:focus-visible,
 .multiview-move-dialog select:focus-visible {
   outline: 2px solid var(--accent);
@@ -2053,6 +2096,7 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-tile .standalone-stage {
+  isolation: isolate;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -2255,7 +2299,7 @@ button.state-pill { cursor: pointer; }
   }
 
   .multiview-tile-header > div {
-    grid-column: 1 / -1;
+    grid-column: 1;
   }
 
   .multiview-tile-header small {
@@ -2393,7 +2437,7 @@ button.state-pill { cursor: pointer; }
   }
 
   .multiview-grid {
-    gap: 4px;
+    --multiview-gap: 4px;
   }
 
   .multiview-pagination {

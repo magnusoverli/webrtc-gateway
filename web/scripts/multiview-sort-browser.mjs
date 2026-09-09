@@ -106,7 +106,7 @@ try {
     });
     const tiles = page.locator("article[data-move-target]");
     const tile = (id) => page.locator(`article[data-move-target="${id}"]`);
-    const handle = (id) => tile(id).locator(".multiview-drag-handle");
+    const handle = (id) => tile(id).locator(".multiview-titlebar-drag");
     const point = async (locator) => { const b = await locator.boundingBox(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; };
     const domIDs = () => tiles.evaluateAll((tiles) => tiles.map((tile) => tile.dataset.moveTarget));
     const ids = () => proposed();
@@ -126,7 +126,9 @@ try {
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     };
     const start = async (id) => {
-      const p = await point(handle(id));
+      const title = await handle(id).boundingBox();
+      // The stock north resize handle occupies the title bar's top centre.
+      const p = { x: title.x + title.width / 4, y: title.y + title.height / 2 };
       const center = await point(tile(id));
       gripOffset = { x: p.x - center.x, y: p.y - center.y };
       if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...p, id: 1 }] });
@@ -154,6 +156,38 @@ try {
       const r = tile.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height };
     }));
     const sixPosts = posts.length, sixDeletes = deletes.length;
+    const titleBar = await handle("channel-1").boundingBox();
+    const headerBox = await tile("channel-1").locator("header").boundingBox();
+    assert.ok(Math.abs(titleBar.width - headerBox.width) < 1 && Math.abs(titleBar.height - headerBox.height) < 2);
+    assert.equal(await handle("channel-1").locator("svg").count(), 0);
+    assert.equal(await tile("channel-1").locator("h2").evaluate(title => {
+      const r = title.getBoundingClientRect();
+      return document.elementFromPoint(r.left + Math.min(3, r.width / 2), r.top + r.height / 2)?.classList.contains("multiview-titlebar-drag");
+    }), true, "Channel title must hit the title-bar drag surface");
+    for (const [edge, cursor] of [["left", "ew-resize"], ["right", "ew-resize"], ["top", "ns-resize"], ["bottom", "ns-resize"]]) {
+      for (const fraction of [0.25, 0.75]) {
+        const hit = await tile("channel-1").evaluate((tile, { edge, fraction }) => {
+          const r = tile.getBoundingClientRect();
+          const x = edge === "left" ? r.left + 3 : edge === "right" ? r.right - 3 : r.left + r.width * fraction;
+          const y = edge === "top" ? r.top + 3 : edge === "bottom" ? r.bottom - 3 : r.top + r.height * fraction;
+          const node = document.elementFromPoint(x, y);
+          return { label: node?.closest('[role="button"]')?.getAttribute("aria-label"), cursor: node && getComputedStyle(node).cursor };
+        }, { edge, fraction });
+        assert.deepEqual(hit, { label: `Resize Channel 1 ${edge} edge`, cursor }, `${name}: resize target at ${fraction} of ${edge} edge`);
+      }
+    }
+    // Resize from well away from the stock centre grip, with native mouse/touch.
+    const initialTile = await tile("channel-1").boundingBox();
+    const away = { x: initialTile.x + initialTile.width - 3, y: initialTile.y + initialTile.height / 4 };
+    if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...away, id: 1 }] });
+    else { await page.mouse.move(away.x, away.y); await page.mouse.down(); }
+    await rawMove({ x: away.x + initialTile.width * 0.15, y: away.y });
+    await end();
+    assert.ok((await tile("channel-1").boundingBox()).width > initialTile.width + 5);
+    const awaySize = await page.evaluate(() => JSON.parse(localStorage.getItem("signal-desk.multiview-sizes.v1"))["channel-1"]);
+    assert.ok(awaySize.columns > 1.1 && awaySize.columns < 1.2);
+    await tile("channel-1").getByRole("button", { name: "Reset Channel 1 size" }).click();
+    await page.waitForFunction(() => [...document.querySelectorAll("article")].every(tile => tile.getAnimations().length === 0));
     await page.evaluate(() => { window.sixVideos = [...document.querySelectorAll("article video")]; });
     // Complete one real glide to warm native video compositing before the strict
     // 50/100ms probe. Cold compositor startup can skip rAF callbacks on Windows.
@@ -242,6 +276,82 @@ try {
     await page.keyboard.press("Escape"); await end(); await clean();
     await page.emulateMedia({ reducedMotion: "no-preference" });
     console.log(JSON.stringify({ name, automationReducedMotion, nativeReducedMotion, continuous, runtimePollsDuringDrag: runtimePolls - pollsBeforeDrag, samePageExtraSessions: 0 }));
+    // Real captured edge resizing must retain the original decoded video nodes.
+    // Channel 2 is first after the completed reorder. Reserve 2×2 cells while
+    // retaining an intermediate 1.45×1.35 visual size, with linear edge motion.
+    const resizeTile = tile("channel-2");
+    for (const edge of ["right", "bottom"]) {
+      // Finish the previous reflow before selecting a different handle: a
+      // neighbouring tile in transit can temporarily cross that hit location.
+      await page.waitForFunction(() => [...document.querySelectorAll("article")].every(tile => tile.getAnimations().length === 0));
+      const p = await point(resizeTile.locator(`.react-resizable-handle-${edge === "right" ? "e" : "s"}`));
+      const grid = await page.locator(".multiview-grid").boundingBox();
+      const gap = await page.locator(".multiview-grid").evaluate(grid => parseFloat(getComputedStyle(grid).gap));
+      const step = edge === "right" ? (grid.width + gap) / 4 : (grid.height + gap) / 3;
+      const beforeSize = await resizeTile.boundingBox();
+      if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...p, id: 1 }] });
+      else { await page.mouse.move(p.x, p.y); await page.mouse.down(); }
+      for (const fraction of [0.05, 0.15, edge === "right" ? 0.45 : 0.35]) {
+        await rawMove({ x: p.x + (edge === "right" ? step * fraction : 0), y: p.y + (edge === "bottom" ? step * fraction : 0) });
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        const afterSize = await resizeTile.boundingBox();
+        const growth = edge === "right" ? afterSize.width - beforeSize.width : afterSize.height - beforeSize.height;
+        assert.ok(Math.abs(growth - step * fraction) < 1, `${name}: ${edge} edge should follow pointer at ${fraction} cells, got ${growth}px`);
+      }
+      await end();
+      await page.waitForFunction(() => document.querySelector('article[data-move-target="channel-2"]').style.gridColumn.includes("span 2"));
+    }
+    assert.equal(await resizeTile.evaluate(tile => tile.style.gridRow), "1 / span 2");
+    const savedSize = await page.evaluate(() => JSON.parse(localStorage.getItem("signal-desk.multiview-sizes.v1"))["channel-2"]);
+    assert.ok(Math.abs(savedSize.columns - 1.45) < 0.01 && Math.abs(savedSize.rows - 1.35) < 0.01);
+    await page.waitForFunction(() => [...document.querySelectorAll("article")].every(tile => tile.getAnimations().length === 0));
+    const boxes = await tiles.evaluateAll(tiles => tiles.map(tile => tile.getBoundingClientRect().toJSON()));
+    for (let a = 0; a < boxes.length; a++) for (let b = a + 1; b < boxes.length; b++) {
+      const overlap = Math.max(0, Math.min(boxes[a].right, boxes[b].right) - Math.max(boxes[a].left, boxes[b].left)) *
+        Math.max(0, Math.min(boxes[a].bottom, boxes[b].bottom) - Math.max(boxes[a].top, boxes[b].top));
+      assert.equal(overlap, 0, "Resized tiles must not overlap");
+    }
+    await shot("resized");
+    assert.equal(posts.length, sixPosts); assert.equal(deletes.length, sixDeletes);
+    await resizeTile.locator("video").dblclick();
+    await page.waitForFunction(() => Boolean(document.querySelector("article.is-fullscreen")));
+    await page.waitForFunction(() => {
+      const r = document.querySelector("article.is-fullscreen").getBoundingClientRect();
+      return r.width >= innerWidth - 1 && r.height >= innerHeight - 1;
+    });
+    await shot("fullscreen");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector("article.is-fullscreen"));
+    assert.equal(await page.evaluate(() => window.sixVideos.every(video => video.isConnected && (!video.videoWidth || video.readyState >= 2))), true);
+    await resizeTile.getByRole("button", { name: "Reset Channel 2 size" }).click();
+    assert.equal(await resizeTile.evaluate(tile => tile.style.gridColumn), "1 / span 1");
+    assert.equal(await resizeTile.getByRole("button", { name: "Fullscreen Channel 2", exact: true }).count(), 0);
+    assert.equal(await resizeTile.locator("header small").count(), 0);
+    await resizeTile.locator("video").focus();
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => Boolean(document.querySelector("article.is-fullscreen")));
+    await resizeTile.getByRole("button", { name: "Exit fullscreen for Channel 2" }).click();
+    await page.waitForFunction(() => !document.querySelector("article.is-fullscreen"));
+    assert.equal(posts.length, sixPosts); assert.equal(deletes.length, sixDeletes);
+    // The standard diagonal corner handle adjusts width and height together.
+    const corner = resizeTile.getByRole("button", { name: "Resize Channel 2 bottom-right corner" });
+    await page.waitForFunction(() => [...document.querySelectorAll("article")].every(tile => tile.getAnimations().length === 0));
+    assert.match(await corner.evaluate(handle => getComputedStyle(handle).cursor), /se-resize|nwse-resize/);
+    assert.equal(await corner.evaluate(handle => getComputedStyle(handle).width), "20px");
+    assert.match(await corner.evaluate(handle => getComputedStyle(handle).backgroundImage), /data:image\/svg\+xml;base64/);
+    assert.equal(await corner.evaluate(handle => getComputedStyle(handle, "::after").content), "none");
+    const cornerPoint = await point(corner);
+    const cornerGrid = await page.locator(".multiview-grid").boundingBox();
+    const cornerGap = await page.locator(".multiview-grid").evaluate(grid => parseFloat(getComputedStyle(grid).gap));
+    if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...cornerPoint, id: 1 }] });
+    else { await page.mouse.move(cornerPoint.x, cornerPoint.y); await page.mouse.down(); }
+    await rawMove({ x: cornerPoint.x + (cornerGrid.width + cornerGap) / 4 * 0.1, y: cornerPoint.y + (cornerGrid.height + cornerGap) / 3 * 0.1 });
+    await end();
+    const cornerSize = await page.evaluate(() => JSON.parse(localStorage.getItem("signal-desk.multiview-sizes.v1"))["channel-2"]);
+    assert.ok(Math.abs(cornerSize.columns - 1.1) < 0.015 && Math.abs(cornerSize.rows - 1.1) < 0.015, JSON.stringify(cornerSize));
+    await resizeTile.getByRole("button", { name: "Reset Channel 2 size" }).click();
+    assert.equal(posts.length, sixPosts); assert.equal(deletes.length, sixDeletes);
+    console.log(JSON.stringify({ name, edgeResize: savedSize, cornerResize: cornerSize, fullscreen: true, reset: true, retainedVideoNodes: true }));
     await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
     await page.waitForFunction(() => window.senders.size === 0);
     if (process.env.SORT_SIX_ONLY === "1") {
