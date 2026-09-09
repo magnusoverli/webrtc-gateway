@@ -228,7 +228,7 @@ The integration matrix has been verified through a real headless Chromium WHEP s
 
 The same matrix covers raw MPEG-TS, Matroska, RTP/MP2T, and SDP-described elementary RTP through per-channel SRT push and pull, plus direct MPEG-TS stream-ID publishing, SRT passphrase acceptance and rejection, video-only and audio-only inputs, interlaced inputs, and the supplied MOV source. Gateway-managed MPEG-TS is stream-copy remuxed before MediaMTX so codec headers and PES framing are normalized without changing the encoded media. The resilience suite additionally covers encrypted SRT pull, codec changes across reconnects, worker restart, channel isolation, concurrent viewers, and reader cleanup.
 
-The remux stage emits bounded PES payloads and repeated MPEG-TS headers. This allows MediaMTX `1.20.1` to ingest the verified 192 kb/s AC-3 fixture whose source groups three AC-3 frames into one PES packet. Direct stream-ID publishers bypass Gateway and therefore do not receive this normalization.
+The remux stage emits bounded PES payloads and repeated MPEG-TS headers. This allows MediaMTX `1.21.0` to ingest the verified 192 kb/s AC-3 fixture whose source groups three AC-3 frames into one PES packet. Direct stream-ID publishers bypass Gateway and therefore do not receive this normalization.
 
 ### Integration Checks
 
@@ -334,6 +334,8 @@ sysctl net.core.rmem_max
 If it is lower than `4194304`, raise it according to the host operating system's persistent sysctl configuration. The application will later report this condition in the UI.
 
 ## Local Checks
+
+Use Linux, Go `1.27.1` or newer, and Node.js `26` to match the CI and image-build toolchains.
 
 ```sh
 go test -race ./...

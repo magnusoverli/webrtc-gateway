@@ -141,10 +141,10 @@ export function useWHEPPlayer({
         void start();
       }, jitteredDelay(base));
     };
-    const fail = (current: WHEPSession, message: string) => {
+    const fail = (current: WHEPSession | null, message: string) => {
       if (disposed || session !== current) return;
       session = null;
-      trackCleanup(closeWHEPSession(current, { keepalive: false, retryDelete: true }));
+      if (current) trackCleanup(closeWHEPSession(current, { keepalive: false, retryDelete: true }));
       clearMedia();
       setState("error");
       setError(message);
@@ -227,54 +227,55 @@ export function useWHEPPlayer({
       }
       if (disposed || version !== startVersion || isPaused()) return;
 
-      const peer = new RTCPeerConnection();
-      const current: WHEPSession = {
-        peer,
-        abort: new AbortController(),
-        location: "",
-        closed: false,
-        statsRunning: false,
-        statsPending: false,
-      };
-      const stream = new MediaStream();
-      session = current;
-
-      preferLowDelay(peer.addTransceiver("video", { direction: "recvonly" }).receiver);
-      preferLowDelay(peer.addTransceiver("audio", { direction: "recvonly" }).receiver);
-      peer.ontrack = (event) => {
-        if (disposed || session !== current) return;
-        stream.addTrack(event.track);
-        if (event.track.kind === "video") setHasVideo(true);
-        if (event.track.kind === "audio") {
-          setHasAudio(true);
-          setAudioTrack(event.track);
-        }
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.muted = true;
-          void videoRef.current.play().catch(() => undefined);
-        }
-      };
-      peer.onconnectionstatechange = () => {
-        if (disposed || session !== current) return;
-        if (peer.connectionState === "connected") {
-          markConnected(current);
-        } else if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-          fail(current, "The WebRTC peer connection failed.");
-        } else if (peer.connectionState === "disconnected") {
-          setState("connecting");
-          if (current.stableTimer !== undefined) {
-            window.clearTimeout(current.stableTimer);
-            current.stableTimer = undefined;
-          }
-          if (current.connectionTimer !== undefined) window.clearTimeout(current.connectionTimer);
-          current.connectionTimer = window.setTimeout(() => {
-            fail(current, "The media session disconnected. Verify the browser network path and configured WebRTC UDP or TCP listener.");
-          }, DISCONNECTED_TIMEOUT_MS);
-        }
-      };
-
+      let starting: WHEPSession | null = null;
       try {
+        const peer = new RTCPeerConnection();
+        const current: WHEPSession = {
+          peer,
+          abort: new AbortController(),
+          location: "",
+          closed: false,
+          statsRunning: false,
+          statsPending: false,
+        };
+        session = starting = current;
+        const stream = new MediaStream();
+
+        preferLowDelay(peer.addTransceiver("video", { direction: "recvonly" }).receiver);
+        preferLowDelay(peer.addTransceiver("audio", { direction: "recvonly" }).receiver);
+        peer.ontrack = (event) => {
+          if (disposed || session !== current) return;
+          stream.addTrack(event.track);
+          if (event.track.kind === "video") setHasVideo(true);
+          if (event.track.kind === "audio") {
+            setHasAudio(true);
+            setAudioTrack(event.track);
+          }
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            videoRef.current.muted = true;
+            void videoRef.current.play().catch(() => undefined);
+          }
+        };
+        peer.onconnectionstatechange = () => {
+          if (disposed || session !== current) return;
+          if (peer.connectionState === "connected") {
+            markConnected(current);
+          } else if (peer.connectionState === "failed" || peer.connectionState === "closed") {
+            fail(current, "The WebRTC peer connection failed.");
+          } else if (peer.connectionState === "disconnected") {
+            setState("connecting");
+            if (current.stableTimer !== undefined) {
+              window.clearTimeout(current.stableTimer);
+              current.stableTimer = undefined;
+            }
+            if (current.connectionTimer !== undefined) window.clearTimeout(current.connectionTimer);
+            current.connectionTimer = window.setTimeout(() => {
+              fail(current, "The media session disconnected. Verify the browser network path and configured WebRTC UDP or TCP listener.");
+            }, DISCONNECTED_TIMEOUT_MS);
+          }
+        };
+
         const offer = await peer.createOffer();
         if (disposed || session !== current) return;
         await peer.setLocalDescription({ ...offer, sdp: offer.sdp ? preferOpusStereo(offer.sdp) : offer.sdp });
@@ -322,11 +323,11 @@ export function useWHEPPlayer({
         }
         if (collectStats) runStats(current);
       } catch (caught) {
-        if (current.abort.signal.aborted || disposed || session !== current) return;
+        if (starting?.abort.signal.aborted || disposed || session !== starting) return;
         const message = isRequestTimeoutError(caught)
           ? "WHEP signaling timed out before an SDP answer was received."
           : caught instanceof Error ? caught.message : "Unable to start WebRTC preview.";
-        fail(current, message);
+        fail(starting, message);
       }
     };
 

@@ -68,6 +68,27 @@ func TestValidatePreservesLegacyCustomMediaAddresses(t *testing.T) {
 	}
 }
 
+func TestValidateNormalizesWhitespace(t *testing.T) {
+	want := Defaults(time.Now())
+	want.MediaBindAddress = "custom"
+	want.WebRTCLocalTCPAddress = ""
+	value := want
+	value.ReadTimeout = " 5s "
+	value.WriteTimeout = " 5s "
+	value.WebRTCHandshakeTimeout = " 10s "
+	value.WebRTCTrackGatherTimeout = " 2s "
+	value.SRTAddress = " :8890 "
+	value.WebRTCLocalUDPAddress = " :8189 "
+	value.WebRTCLocalTCPAddress = " \t "
+	got, err := Validate(value, want.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equalGlobal(globalConfig(got), globalConfig(want)) {
+		t.Fatalf("validated settings retain whitespace: %#v", got)
+	}
+}
+
 func TestValidateRejectsUnsafeSettings(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -30,6 +30,28 @@ afterEach(async () => {
 });
 
 describe("useWHEPPlayer", () => {
+  it.each(["peer", "transceiver"])("handles synchronous %s setup failure and retries cleanly", async (stage) => {
+    let broken = true;
+    class FailingPeer extends MockPeer {
+      constructor() {
+        if (broken && stage === "peer") throw new Error("Peer unavailable");
+        super();
+        if (broken) this.addTransceiver.mockImplementationOnce(() => { throw new Error("Transceiver unavailable"); });
+      }
+    }
+    vi.stubGlobal("RTCPeerConnection", FailingPeer);
+    const view = renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true, random: middleRandom }));
+    await settle();
+    expect(view.result.current.state).toBe("error");
+    expect(view.result.current.error).toContain("unavailable");
+    expect(postCalls()).toHaveLength(0);
+    if (stage === "transceiver") expect(MockPeer.instances[0].close).toHaveBeenCalledOnce();
+    broken = false;
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(view.result.current.state).toBe("playing");
+    expect(postCalls()).toHaveLength(1);
+  });
+
   it("never renders the previous channel's failure on navigation, including while hidden", async () => {
     const renders: Array<{ path: string; state: string; error: string }> = [];
     fetchMock.mockResolvedValue(response(503, "old channel failure"));

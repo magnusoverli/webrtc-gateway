@@ -11,7 +11,7 @@ permissions:
 
 env:
   GATEWAY_IMAGE: webrtc-gateway
-  MEDIAMTX_IMAGE: bluenviron/mediamtx:1.20.1
+  MEDIAMTX_IMAGE: bluenviron/mediamtx:1.21.0
   IMAGE_ARCHIVE: images-linux-amd64.tar.gz
   RELEASE_TAG: main-latest
   RELEASE_ARCHIVE: webrtc-gateway-offline-linux-amd64.tar
@@ -25,18 +25,18 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -56,10 +56,10 @@ jobs:
         run: npm --prefix web run lint
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Gateway image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -105,7 +105,7 @@ jobs:
           sha256sum --check SHA256SUMS
 
       - name: Upload offline bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: webrtc-gateway-offline-linux-amd64-${{ github.sha }}
           path: offline-bundle/
@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: Download offline bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: webrtc-gateway-offline-linux-amd64-${{ github.sha }}
           path: offline-bundle

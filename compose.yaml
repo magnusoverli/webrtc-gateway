@@ -2,7 +2,7 @@ name: webrtc-gateway
 
 services:
   mediamtx:
-    image: bluenviron/mediamtx:1.20.1
+    image: bluenviron/mediamtx:1.21.0
     network_mode: host
     restart: unless-stopped
     volumes:

@@ -418,7 +418,7 @@ func (m *Manager) Close() {
 	}
 	m.notify()
 	m.reconcileMu.Lock()
-	m.reconcileMu.Unlock()
+	defer m.reconcileMu.Unlock()
 	m.workers.Wait()
 }
 

@@ -313,9 +313,9 @@ func TestClientCachesDecodedResponse(t *testing.T) {
 	requestURL := client.endpointURL("/decoded")
 	clone := func(value decodeCountingResponse) decodeCountingResponse { return value }
 	for range 2 {
-		value, callErr := getURLCached(context.Background(), client, "/decoded", requestURL, staticCacheTTL, clone)
-		if callErr != nil || value != "decoded" {
-			t.Fatalf("getURLCached() = %q, %v", value, callErr)
+		result, callErr := getURLCachedResult(context.Background(), client, "/decoded", requestURL, staticCacheTTL, clone)
+		if callErr != nil || result.value != "decoded" {
+			t.Fatalf("getURLCachedResult() = %q, %v", result.value, callErr)
 		}
 	}
 	if reads.Load() != 1 || responseDecodeCount.Load() != 1 {

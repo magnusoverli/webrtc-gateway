@@ -12,7 +12,8 @@ import (
 
 	"webrtc-gateway/internal/channel"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type Repository interface {
@@ -144,8 +145,14 @@ func (s *SQLiteStore) ReplaceLive(ctx context.Context, configuration Configurati
 	if err := tx.QueryRowContext(ctx, `SELECT revision FROM global_settings WHERE id = 1`).Scan(&settingsRevision); err != nil {
 		return fmt.Errorf("read live settings revision: %w", err)
 	}
+	var channelRevision int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision), 0) FROM channels`).Scan(&channelRevision); err != nil {
+		return fmt.Errorf("read live channel generation: %w", err)
+	}
+	// Keep the cutover's high-water mark in settings, even for an empty project.
+	generation := max(settingsRevision, channelRevision) + 1
 	settingsValue := configuration.Settings.Live(now)
-	settingsValue.Revision = settingsRevision + 1
+	settingsValue.Revision = generation
 	settingsJSON, err := json.Marshal(settingsValue)
 	if err != nil {
 		return fmt.Errorf("encode live settings: %w", err)
@@ -155,14 +162,6 @@ func (s *SQLiteStore) ReplaceLive(ctx context.Context, configuration Configurati
 		return fmt.Errorf("replace live settings: %w", err)
 	}
 
-	maxRevision := settingsRevision
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision), 0) FROM channels`).Scan(&maxRevision); err != nil {
-		return fmt.Errorf("read live channel generation: %w", err)
-	}
-	if maxRevision < settingsRevision {
-		maxRevision = settingsRevision
-	}
-	generation := maxRevision + 1
 	if _, err := tx.ExecContext(ctx, `DELETE FROM channels`); err != nil {
 		return fmt.Errorf("clear live channels: %w", err)
 	}
@@ -229,16 +228,8 @@ func (s *SQLiteStore) requireProjectCAS(ctx context.Context, result sql.Result, 
 }
 
 func isUniqueError(err error) bool {
-	return err != nil && (contains(err.Error(), "UNIQUE constraint failed") || contains(err.Error(), "constraint failed"))
-}
-
-func contains(value, substring string) bool {
-	for index := 0; index+len(substring) <= len(value); index++ {
-		if value[index:index+len(substring)] == substring {
-			return true
-		}
-	}
-	return false
+	var sqliteErr *sqlite.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE
 }
 
 func newID() (string, error) {

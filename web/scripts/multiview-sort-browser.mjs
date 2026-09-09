@@ -127,8 +127,8 @@ try {
     };
     const start = async (id) => {
       const title = await handle(id).boundingBox();
-      // The stock north resize handle occupies the title bar's top centre.
-      const p = { x: title.x + title.width / 4, y: title.y + title.height / 2 };
+      // Press off-centre on the right, as the pointer-versus-overlap checks require.
+      const p = { x: title.x + title.width * 3 / 4, y: title.y + title.height / 2 };
       const center = await point(tile(id));
       gripOffset = { x: p.x - center.x, y: p.y - center.y };
       if (touch) await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ ...p, id: 1 }] });
@@ -555,7 +555,10 @@ try {
         window.fallbackEvents.push(entry); queueMicrotask(() => { entry.prevented = event.defaultPrevented; });
       }, true);
     });
-    if (touch) await handle(baseline[0]).tap(); else await handle(baseline[0]).click();
+    const title = await handle(baseline[0]).boundingBox();
+    // Click the title surface clear of the stock north resize grip.
+    const position = { x: title.width / 4, y: title.height * 3 / 4 };
+    if (touch) await handle(baseline[0]).tap({ position }); else await handle(baseline[0]).click({ position });
     await page.getByRole("dialog").waitFor({ timeout: 2000 }).catch(async error => {
       console.error({ name, phase: "fallback click", events: await page.evaluate(() => window.fallbackEvents), state: await handle(baseline[0]).evaluate(element => ({ active: element === document.activeElement, capture: [...Array(50).keys()].filter(id => element.hasPointerCapture(id)), dragging: document.querySelectorAll('.is-dragging').length })) });
       throw error;

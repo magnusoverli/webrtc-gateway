@@ -841,36 +841,40 @@ func TestRequestLogSuppressesSuccessfulPollsButRetainsErrors(t *testing.T) {
 }
 
 func TestWHEPProxyRewritesSessionLocation(t *testing.T) {
-	var receivedPath string
-	var receivedContentType string
-	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedPath = r.URL.Path
-		receivedContentType = r.Header.Get("Content-Type")
-		w.Header().Set("Location", "/demo/whep/session-1")
-		w.Header().Set("Content-Type", "application/sdp")
-		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, "answer-sdp")
-	}))
-	defer mediaServer.Close()
+	for _, location := range []string{"/demo/whep/session-1", "whep/session-1", "http://internal/demo/whep/session-1"} {
+		t.Run(location, func(t *testing.T) {
+			var receivedPath string
+			var receivedContentType string
+			mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				receivedPath = r.URL.Path
+				receivedContentType = r.Header.Get("Content-Type")
+				w.Header().Set("Location", location)
+				w.Header().Set("Content-Type", "application/sdp")
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprint(w, "answer-sdp")
+			}))
+			defer mediaServer.Close()
 
-	channels := fakeChannels{items: []channel.Channel{{ID: "channel-1", Path: "demo", Enabled: true, ApplyState: channel.ApplyApplied}}}
-	handler := newTestHandler(t, fakeMediaMTX{status: mediamtx.Status{Channels: []mediamtx.Channel{{Name: "demo", Available: true, Online: true}}}}, channels, mediaServer.URL)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/channel-1/whep", strings.NewReader("offer"))
-	req.Header.Set("Content-Type", "application/sdp")
-	res := httptest.NewRecorder()
-	handler.ServeHTTP(res, req)
+			channels := fakeChannels{items: []channel.Channel{{ID: "channel-1", Path: "demo", Enabled: true, ApplyState: channel.ApplyApplied}}}
+			handler := newTestHandler(t, fakeMediaMTX{status: mediamtx.Status{Channels: []mediamtx.Channel{{Name: "demo", Available: true, Online: true}}}}, channels, mediaServer.URL)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/channels/channel-1/whep", strings.NewReader("offer"))
+			req.Header.Set("Content-Type", "application/sdp")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
 
-	if res.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", res.Code)
-	}
-	if receivedPath != "/demo/whep" {
-		t.Fatalf("proxied path = %q, want /demo/whep", receivedPath)
-	}
-	if location := res.Header().Get("Location"); location != "/api/v1/channels/channel-1/whep/session-1" {
-		t.Fatalf("Location = %q", location)
-	}
-	if receivedContentType != "application/sdp" || res.Body.String() != "answer-sdp" {
-		t.Fatalf("proxy content = %q, %q", receivedContentType, res.Body.String())
+			if res.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201", res.Code)
+			}
+			if receivedPath != "/demo/whep" {
+				t.Fatalf("proxied path = %q, want /demo/whep", receivedPath)
+			}
+			if location := res.Header().Get("Location"); location != "/api/v1/channels/channel-1/whep/session-1" {
+				t.Fatalf("Location = %q", location)
+			}
+			if receivedContentType != "application/sdp" || res.Body.String() != "answer-sdp" {
+				t.Fatalf("proxy content = %q, %q", receivedContentType, res.Body.String())
+			}
+		})
 	}
 }
 
@@ -1394,9 +1398,10 @@ func TestDiagnosticsIsAllowlistedAndRedactsSensitiveState(t *testing.T) {
 				{
 					Name: "demo", ConfiguredSource: "srt://source?passphrase=raw-secret", Available: true, Online: true,
 					AvailableTime: &available, OnlineTime: &available, Source: &mediamtx.PathSource{Type: "srtConn", ID: "source-1"},
-					Readers: []mediamtx.PathReader{{Type: "webRTCSession", ID: "reader-1"}},
+					Readers: []mediamtx.PathReader{{Type: "rtspSession", ID: "internal-worker"}},
 				},
-				{Name: "hidden-secret-output", Available: true, Online: true, AvailableTime: &outputAvailable},
+				{Name: "hidden-secret-output", Available: true, Online: true, AvailableTime: &outputAvailable,
+					Readers: []mediamtx.PathReader{{Type: "webRTCSession", ID: "reader-1"}}},
 			}},
 		},
 		Channels: fakeChannels{items: []channel.Channel{{
@@ -1427,7 +1432,7 @@ func TestDiagnosticsIsAllowlistedAndRedactsSensitiveState(t *testing.T) {
 			t.Fatalf("diagnostics missing %s: %s", expected, body)
 		}
 	}
-	for _, sensitive := range []string{"raw-secret", "stored-secret", "apply-secret-error", "hidden-secret-output", "passphrase="} {
+	for _, sensitive := range []string{"raw-secret", "stored-secret", "apply-secret-error", "hidden-secret-output", "passphrase=", "internal-worker"} {
 		if strings.Contains(body, sensitive) {
 			t.Fatalf("diagnostics leaked %q: %s", sensitive, body)
 		}

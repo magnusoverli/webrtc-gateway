@@ -79,6 +79,13 @@ func Defaults(now time.Time) Settings {
 }
 
 func Validate(value Settings, now time.Time) (Settings, error) {
+	value.ReadTimeout = strings.TrimSpace(value.ReadTimeout)
+	value.WriteTimeout = strings.TrimSpace(value.WriteTimeout)
+	value.WebRTCHandshakeTimeout = strings.TrimSpace(value.WebRTCHandshakeTimeout)
+	value.WebRTCTrackGatherTimeout = strings.TrimSpace(value.WebRTCTrackGatherTimeout)
+	value.SRTAddress = strings.TrimSpace(value.SRTAddress)
+	value.WebRTCLocalUDPAddress = strings.TrimSpace(value.WebRTCLocalUDPAddress)
+	value.WebRTCLocalTCPAddress = strings.TrimSpace(value.WebRTCLocalTCPAddress)
 	managementBind, err := networkbind.Normalize(value.ManagementBindAddress, false)
 	if err != nil {
 		return Settings{}, invalid("managementBindAddress " + err.Error())

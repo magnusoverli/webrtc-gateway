@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Updated React, frontend test tooling, Go/SQLite, Node, Alpine/FFmpeg, SRT, MediaMTX, and CI actions to current stable releases.
+- Fixed project cutovers reusing old revisions, whitespace in saved settings, WebRTC setup retries, relative WHEP session URLs, and converted-output reader diagnostics.
 - Restored full-edge resize targets and two-way cursors while retaining the library's default grip visuals.
 - Fixed displaced tiles flickering during continuous resizing by animating only grid-space changes and keeping transitions intact until layout commits.
 - Switched tile resize handles to the unmodified react-resizable stylesheet, removing custom corner marks, full-edge hotspots, and resize highlights.

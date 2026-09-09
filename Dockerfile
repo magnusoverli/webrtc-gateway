@@ -1,4 +1,4 @@
-FROM node:24-alpine AS web-build
+FROM node:26-alpine AS web-build
 
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -6,7 +6,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.26-alpine AS go-build
+FROM golang:1.27-alpine AS go-build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -16,11 +16,11 @@ COPY internal/ ./internal/
 COPY --from=web-build /src/web/dist/ ./internal/webui/dist/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
 
-FROM alpine:3.23 AS srt-build
+FROM alpine:3.24 AS srt-build
 
-ARG SRT_VERSION=1.5.6
-ARG SRT_COMMIT=c63c311e88aa55e430e3b7d94b89d790994f88c4
-ARG SRT_SHA256=49db3bf47c55037bee2b749ba977c3002873f42afcacba5577a318b3cd6f09c4
+ARG SRT_VERSION=1.5.7
+ARG SRT_COMMIT=899348d8318eb9a3c5a5b6ec43c4a1114288773a
+ARG SRT_SHA256=82050d96a1a55d54b423fed4ad80ddb6f30b31bf33e317ffd6726c91ee9a6170
 
 RUN apk add --no-cache build-base cmake linux-headers openssl-dev \
     && wget -qO /tmp/srt.tar.gz \
@@ -63,7 +63,7 @@ RUN apk add --no-cache build-base cmake linux-headers openssl-dev \
         --info "depends:musl libcrypto3 libgcc libstdc++" \
         --info "provides:so:libsrt.so.1.5 cmd:srt-live-transmit"
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 COPY --from=srt-build /out/libsrt.apk /tmp/libsrt.apk
 RUN apk add --no-cache --allow-untrusted /tmp/libsrt.apk ffmpeg \

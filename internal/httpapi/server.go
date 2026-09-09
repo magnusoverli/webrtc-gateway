@@ -649,7 +649,7 @@ func (s *server) diagnostics(w http.ResponseWriter, r *http.Request) {
 		}
 		view := channelRuntimeView(item, raw, output, state)
 		s.attachRelayStatus(item, &view)
-		readers := append([]mediamtx.PathReader(nil), raw.Readers...)
+		readers := append([]mediamtx.PathReader(nil), output.Readers...)
 		if readers == nil {
 			readers = []mediamtx.PathReader{}
 		}
@@ -1429,14 +1429,13 @@ type whepRoutingContextKey struct{}
 
 func newWHEPProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
 	targetCopy := *target
-	proxy := httputil.NewSingleHostReverseProxy(&targetCopy)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		routing := req.Context().Value(whepRoutingContextKey{}).(whepRouting)
-		req.URL.Path = strings.TrimSuffix(targetCopy.Path, "/") + "/" + url.PathEscape(routing.mediaPath) + "/whep" + routing.suffix
-		req.Host = targetCopy.Host
-	}
+	proxy := &httputil.ReverseProxy{Rewrite: func(req *httputil.ProxyRequest) {
+		req.SetURL(&targetCopy)
+		req.SetXForwarded()
+		routing := req.Out.Context().Value(whepRoutingContextKey{}).(whepRouting)
+		req.Out.URL.Path = strings.TrimSuffix(targetCopy.Path, "/") + "/" + routing.mediaPath + "/whep" + routing.suffix
+		req.Out.URL.RawPath = ""
+	}}
 	proxy.ModifyResponse = func(res *http.Response) error {
 		routing := res.Request.Context().Value(whepRoutingContextKey{}).(whepRouting)
 		if res.Request.Method == http.MethodDelete && (res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusGone) {
@@ -1457,10 +1456,13 @@ func newWHEPProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
 		if err != nil {
 			return nil
 		}
-		mediaPrefix := strings.TrimSuffix(targetCopy.Path, "/") + "/" + url.PathEscape(routing.mediaPath) + "/whep"
-		if strings.HasPrefix(parsed.Path, mediaPrefix) {
+		parsed = res.Request.URL.ResolveReference(parsed)
+		mediaPrefix := strings.TrimSuffix(targetCopy.Path, "/") + "/" + routing.mediaPath + "/whep"
+		if parsed.Path == mediaPrefix || strings.HasPrefix(parsed.Path, mediaPrefix+"/") {
 			parsed.Scheme = ""
 			parsed.Host = ""
+			parsed.User = nil
+			parsed.RawPath = ""
 			publicPrefix := "/api/v1/channels/" + url.PathEscape(routing.channelID) + "/whep"
 			if routing.route != "" {
 				publicPrefix += "/" + routing.route

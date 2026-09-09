@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -56,6 +57,28 @@ func TestSQLiteStoreCreatesAndReplacesLiveConfiguration(t *testing.T) {
 	}
 	if liveSettings.ApplyState != settings.ApplyPending || liveSettings.Revision < 2 {
 		t.Fatalf("live settings = %+v", liveSettings)
+	}
+
+	// Loading an empty project must not discard the highest channel revision.
+	old := liveChannels[0]
+	old.Revision = 40
+	if err := channelStore.Update(t.Context(), old, liveChannels[0].Revision); err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range []Configuration{{Settings: configuration.Settings}, configuration} {
+		if err := store.ReplaceLive(t.Context(), snapshot, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restored, err := channelStore.Get(t.Context(), old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Revision <= old.Revision {
+		t.Fatalf("project load reused an old revision: got %d, previous %d", restored.Revision, old.Revision)
+	}
+	if err := channelStore.UpdateAutomaticPreview(t.Context(), old.ID, false, now, old.Revision); !errors.Is(err, channel.ErrRevisionConflict) {
+		t.Fatalf("stale update after project load = %v", err)
 	}
 }
 

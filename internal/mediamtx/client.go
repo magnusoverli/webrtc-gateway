@@ -359,11 +359,6 @@ func getCachedResult[T any](ctx context.Context, c *Client, endpoint string, ttl
 	return getURLCachedResult(ctx, c, endpoint, requestURL, ttl, clone)
 }
 
-func getPage[T any](ctx context.Context, c *Client, endpoint string, pageNumber int, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (pageResponse[T], error) {
-	result, err := getPageResult(ctx, c, endpoint, pageNumber, ttl, clone)
-	return result.value, err
-}
-
 func getPageResult[T any](ctx context.Context, c *Client, endpoint string, pageNumber int, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (cachedResult[pageResponse[T]], error) {
 	requestURL := c.endpointURL(endpoint)
 	query := requestURL.Query()
@@ -376,11 +371,6 @@ func (c *Client) endpointURL(endpoint string) url.URL {
 	requestURL := *c.baseURL
 	requestURL.Path = path.Join(c.baseURL.Path, endpoint)
 	return requestURL
-}
-
-func getURLCached[T any](ctx context.Context, c *Client, endpoint string, requestURL url.URL, ttl time.Duration, clone func(T) T) (T, error) {
-	result, err := getURLCachedResult(ctx, c, endpoint, requestURL, ttl, clone)
-	return result.value, err
 }
 
 func getURLCachedResult[T any](ctx context.Context, c *Client, endpoint string, requestURL url.URL, ttl time.Duration, clone func(T) T) (cachedResult[T], error) {
@@ -478,11 +468,6 @@ type pageResponse[T any] struct {
 	ItemCount int `json:"itemCount"`
 	PageCount int `json:"pageCount"`
 	Items     []T `json:"items"`
-}
-
-func getAllPages[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) ([]T, error) {
-	result, err := getAllPagesResult(ctx, c, endpoint, ttl, clone)
-	return result.value, err
 }
 
 func getAllPagesResult[T any](ctx context.Context, c *Client, endpoint string, ttl time.Duration, clone func(pageResponse[T]) pageResponse[T]) (cachedResult[[]T], error) {

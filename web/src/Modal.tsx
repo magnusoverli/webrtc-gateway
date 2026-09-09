@@ -1,5 +1,5 @@
 import {
-  forwardRef,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   type KeyboardEvent,
@@ -10,6 +10,7 @@ import {
 import { CloseIcon } from "./Icons";
 
 export type ModalShellProps = {
+  ref?: Ref<HTMLElement>;
   labelledBy: string;
   children: ReactNode;
   onClose: () => void;
@@ -40,21 +41,18 @@ function focusableElements(dialog: HTMLElement) {
   });
 }
 
-function setRef<T>(ref: Ref<T> | undefined, value: T | null) {
-  if (typeof ref === "function") ref(value);
-  else if (ref) ref.current = value;
-}
-
-export const ModalShell = forwardRef<HTMLElement, ModalShellProps>(function ModalShell({
+export function ModalShell({
+  ref,
   labelledBy,
   children,
   onClose,
   dismissDisabled = false,
   className,
   closeLabel,
-}, forwardedRef) {
+}: ModalShellProps) {
   const dialogRef = useRef<HTMLElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  useImperativeHandle(ref, () => dialogRef.current!, []);
 
   useLayoutEffect(() => {
     previousFocusRef.current ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -106,10 +104,7 @@ export const ModalShell = forwardRef<HTMLElement, ModalShellProps>(function Moda
   return (
     <div className="editor-backdrop" role="presentation" onClick={handleBackdropClick}>
       <section
-        ref={(node) => {
-          dialogRef.current = node;
-          setRef(forwardedRef, node);
-        }}
+        ref={dialogRef}
         className={["editor", className].filter(Boolean).join(" ")}
         role="dialog"
         aria-modal="true"
@@ -132,4 +127,4 @@ export const ModalShell = forwardRef<HTMLElement, ModalShellProps>(function Moda
       </section>
     </div>
   );
-});
+}

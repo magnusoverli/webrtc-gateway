@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 export type ToastKind = "success" | "info" | "error";
 
@@ -20,9 +20,10 @@ export function ToastProvider({ children, timeout = 2_500 }: {
   const nextId = useRef(0);
   const [toast, setToast] = useState<ToastState | null>(null);
 
-  const showToast = (nextToast: ToastOptions) => {
+  const showToast = useCallback((nextToast: ToastOptions) => {
     setToast({ ...nextToast, id: ++nextId.current });
-  };
+  }, []);
+  const context = useMemo(() => ({ showToast }), [showToast]);
 
   useEffect(() => {
     if (!toast) return;
@@ -33,7 +34,7 @@ export function ToastProvider({ children, timeout = 2_500 }: {
   }, [toast, timeout]);
 
   return (
-    <ToastContext.Provider value={{ showToast }}>
+    <ToastContext value={context}>
       {children}
       <div
         className="toast-viewport"
@@ -57,7 +58,7 @@ export function ToastProvider({ children, timeout = 2_500 }: {
           </div>
         )}
       </div>
-    </ToastContext.Provider>
+    </ToastContext>
   );
 }
 
