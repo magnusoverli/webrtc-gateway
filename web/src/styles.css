@@ -1895,6 +1895,7 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-grid {
+  position: relative;
   min-width: 0;
   min-height: 0;
   flex: 1;
@@ -1924,8 +1925,37 @@ button.state-pill { cursor: pointer; }
 }
 
 .multiview-tile.is-dragging {
-  opacity: 0.5;
+  opacity: 0;
+  pointer-events: none;
   cursor: grabbing;
+}
+
+.multiview-drag-overlay {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 1000;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0.78;
+}
+
+.multiview-drag-overlay > .multiview-tile {
+  width: 100%;
+  height: 100%;
+  border-color: var(--accent);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 40%);
+}
+
+.multiview-drag-overlay canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .multiview-drag-overlay > .multiview-tile { box-shadow: none; }
 }
 
 /* Keep the drop ring above the video without changing tile geometry. */
@@ -2030,7 +2060,7 @@ button.state-pill { cursor: pointer; }
   align-self: stretch;
   border: 0;
   border-radius: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   place-items: stretch;
 }
 
@@ -2045,19 +2075,21 @@ button.state-pill { cursor: pointer; }
 
 .multiview-enable-meters { min-height: 32px; padding: 6px 10px; font-size: 0.6rem; }
 .audio-meter {
-  position: relative;
+  position: absolute;
+  inset: 0 0 0 auto;
+  z-index: 2;
+  pointer-events: none;
   min-height: 0;
   display: flex;
-  gap: 3px;
-  padding: 16px 5px 17px 3px;
-  border-left: 1px solid var(--line);
-  background: var(--page-deep);
-  color: var(--muted);
+  gap: 2px;
+  padding: 8px 2px 11px 1px;
+  background: rgb(0 0 0 / 35%);
+  color: #f4f7f5;
   font: 500 0.48rem/1 Inter, sans-serif;
 }
-.audio-meter-axis { position: relative; width: 18px; }
+.audio-meter-axis { position: relative; width: 16px; }
 .audio-meter-axis > span { position: absolute; right: 2px; transform: translateY(50%); }
-.audio-meter-axis > .audio-meter-unit { bottom: -10px; right: 0; font-size: 0.4rem; }
+.audio-meter-axis > .audio-meter-unit { bottom: -10px; right: 0; transform: none; font-size: 0.4rem; }
 .audio-meter-channel { position: relative; width: 5px; background: #17271f; }
 .audio-meter-fill {
   position: absolute;
@@ -2068,14 +2100,13 @@ button.state-pill { cursor: pointer; }
 }
 .audio-meter-channel[data-level="amber"] .audio-meter-fill { background-color: #edbc52; }
 .audio-meter-channel[data-level="red"] .audio-meter-fill { background-color: #f56b6b; }
-.audio-meter-peak { position: absolute; left: -1px; right: -1px; height: 2px; background: var(--ink); }
+.audio-meter-peak { position: absolute; left: -1px; right: -1px; height: 2px; background: #fff; }
 .audio-meter-peak[hidden] { display: none; }
-.audio-meter-clip { position: absolute; top: -8px; width: 100%; height: 4px; background: var(--line); }
+.audio-meter-clip { position: absolute; top: -6px; width: 100%; height: 3px; background: var(--line); }
 .audio-meter-channel.is-clipping .audio-meter-clip { background: #f56b6b; box-shadow: 0 0 4px #f56b6b; }
-.audio-meter-label { position: absolute; bottom: -12px; width: 100%; text-align: center; font-size: 0.42rem; }
-.audio-meter.unavailable .audio-meter-channel { background: var(--line); }
+.audio-meter-label { position: absolute; bottom: -10px; width: 100%; text-align: center; font-size: 0.42rem; }
+.audio-meter.unavailable .audio-meter-channel { background: #52605a; }
 .audio-meter.unavailable .audio-meter-axis { opacity: 0.5; }
-.audio-meter-status { position: absolute; top: 2px; left: 3px; right: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 0.4rem; }
 
 .multiview-tile .preview-message {
   min-width: 0;
@@ -2383,10 +2414,8 @@ button.state-pill { cursor: pointer; }
     font-size: 0.62rem;
   }
 
-  .audio-meter { gap: 2px; padding-inline: 3px; }
-  .audio-meter-axis, .audio-meter-status { display: none; }
+  .audio-meter { font-size: 0.45rem; }
   .audio-meter-channel { width: 4px; }
-  .audio-meter.unavailable::after { content: "--"; position: absolute; top: 2px; left: 0; right: 0; text-align: center; }
 
   .multiview-tile .preview-message {
     padding: 4px;

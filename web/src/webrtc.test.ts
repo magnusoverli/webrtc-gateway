@@ -1,9 +1,25 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { codecWarnings, summarizeRTCStats, waitForICEGathering } from "./webrtc";
+import { codecWarnings, preferOpusStereo, summarizeRTCStats, waitForICEGathering } from "./webrtc";
 
 afterEach(() => vi.useRealTimers());
+
+describe("preferOpusStereo", () => {
+  it.each(["\r\n", "\n"])("requests receive stereo without changing sender declarations or other codecs (%j)", (nl) => {
+    const video = ["v=0", "m=video 9 UDP/TLS/RTP/SAVPF 111", "a=rtpmap:111 H264/90000", "a=fmtp:111 profile-level-id=42e01f"].join(nl) + nl;
+    const audio = ["m=audio 9 UDP/TLS/RTP/SAVPF 109 0", "a=recvonly", "a=rtpmap:109 opus/48000/2", "a=fmtp:109 minptime=10;stereo=0;useinbandfec=1;sprop-stereo=0", "a=rtpmap:0 PCMU/8000", ""].join(nl);
+    const result = preferOpusStereo(video + audio);
+    expect(result).toBe(video + audio.replace("stereo=0;", "").replace("sprop-stereo=0", "sprop-stereo=0;stereo=1"));
+    expect(preferOpusStereo(result)).toBe(result);
+    expect(preferOpusStereo(video)).toBe(video);
+  });
+
+  it("adds missing fmtp only to Opus audio and preserves section boundaries", () => {
+    const sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 112\r\na=rtpmap:112 opus/48000/2\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+    expect(preferOpusStereo(sdp)).toBe(sdp.replace("opus/48000/2\r\n", "opus/48000/2\r\na=fmtp:112 stereo=1\r\n"));
+  });
+});
 
 function report(entries: Array<Record<string, unknown>>) {
   return {

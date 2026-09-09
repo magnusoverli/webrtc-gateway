@@ -215,6 +215,7 @@ type Supervisor struct {
 	logger     *slog.Logger
 	executable string
 	ffmpeg     string
+	ffprobe    string
 	rtmpURL    *url.URL
 
 	mu               sync.Mutex
@@ -259,7 +260,7 @@ func New(logger *slog.Logger, executable, ffmpeg, mediaRTMPURL string) (*Supervi
 		}
 	}
 	supervisor := &Supervisor{
-		logger: logger, executable: executable, ffmpeg: ffmpeg, rtmpURL: rtmpURL,
+		logger: logger, executable: executable, ffmpeg: ffmpeg, ffprobe: "ffprobe", rtmpURL: rtmpURL,
 		listeners:  make(map[string]*listenerProcess),
 		prepared:   make(map[string]channel.SRTIngestPlan),
 		operations: make(map[string]*channelOperation),
@@ -692,6 +693,8 @@ func (s *Supervisor) startInput(ctx context.Context, inputEndpoint string) (inpu
 }
 
 func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngestPlan, input inputSession, attempt uint64) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	reader := newPacketReader(ctx, input.packets)
 	defer reader.close()
 
@@ -757,11 +760,32 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 	stderr := newBoundedWriter(8192)
 	remuxName := "MPEG-TS"
 	redactionPassphrase := plan.PublishPassphrase
-	args := remuxArgs(plan.OutputAddress, plan.PublishPassphrase)
+	var args []string
+	var tsInput *io.PipeReader
 	if mode == payloadMatroska {
 		remuxName = "Matroska"
 		redactionPassphrase = plan.Listener.Passphrase
 		args = matroskaRemuxArgs(s.mediaPathURL(plan.Listener.Path))
+	} else {
+		buffer, pipe, done := startTSDiscovery(reader, initial, mode)
+		tsInput = pipe
+		defer func() {
+			cancel()
+			_ = pipe.Close()
+			<-done
+		}()
+		var streams []tsStream
+		streams, initial, err = s.discoverTS(ctx, buffer, done)
+		if err != nil {
+			terminateInput(input)
+			return mode.String(), bridgeFailed(err.Error())
+		}
+		args = remuxArgs(plan.OutputAddress, plan.PublishPassphrase, streams)
+		for _, stream := range streams {
+			if stream.CodecName == "s302m" {
+				s.logger.Info("converting SMPTE 302M monitor pair to Opus", "channel", plan.Listener.ChannelID, "pid", stream.ID, "inputChannels", stream.Channels)
+			}
+		}
 	}
 	output := exec.CommandContext(ctx, s.ffmpeg, args...)
 	output.Stdout = io.Discard
@@ -790,7 +814,11 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		var streamErr error
 		if firstErr == nil {
 			s.notifyInputStarted(plan.Listener.ChannelID, attempt)
-			streamErr = streamNormalized(reader, sink, mode)
+			if tsInput != nil {
+				_, streamErr = io.Copy(sink, tsInput)
+			} else {
+				streamErr = streamNormalized(reader, sink, mode)
+			}
 		}
 		closeErr := sink.Close()
 		copyDone <- errors.Join(firstErr, streamErr, closeErr)
@@ -798,6 +826,9 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 
 	select {
 	case inputErr := <-input.wait:
+		if tsInput != nil {
+			_ = tsInput.Close()
+		}
 		_ = terminate(output, outputWait)
 		copyErr := <-copyDone
 		return mode.String(), errors.Join(inputErr, copyErr)
@@ -818,6 +849,9 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		}
 		return mode.String(), errors.Join(bridgeFailed(errorMessage(detailErr, copyErr)), inputErr, detailErr)
 	case outputErr := <-outputWait:
+		if tsInput != nil {
+			_ = tsInput.Close()
+		}
 		inputErr, inputEnded := inputEndWithin(input, startupGrace)
 		if !inputEnded {
 			_ = input.cmd.Process.Kill()
@@ -830,6 +864,9 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 		}
 		return mode.String(), errors.Join(bridgeFailed(remuxErr.Error()), remuxErr, inputErr, copyErr)
 	case <-ctx.Done():
+		if tsInput != nil {
+			_ = tsInput.Close()
+		}
 		_ = input.cmd.Process.Kill()
 		_ = output.Process.Kill()
 		<-input.wait
@@ -941,14 +978,29 @@ func streamNormalized(reader *packetReader, sink io.Writer, mode payloadMode) er
 	}
 }
 
-func remuxArgs(outputAddress, passphrase string) []string {
+func remuxArgs(outputAddress, passphrase string, streams []tsStream) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin",
-		"-copyts", "-f", "mpegts", "-probesize", "131072", "-analyzeduration", "1000000", "-i", "pipe:0",
-		"-map", "0:v?", "-map", "0:a?", "-c", "copy",
+		"-copyts", "-f", "mpegts", "-probesize", strconv.Itoa(tsProbeBytes), "-analyzeduration", "1000000", "-threads", "1", "-i", "pipe:0",
+	}
+	for _, stream := range streams {
+		// PID mapping cannot select a different track if FFmpeg discovers streams
+		// in a different order. Required maps fail instead of dropping missing audio.
+		args = append(args, "-map", "0:i:"+stream.ID)
+	}
+	args = append(args, "-c", "copy")
+	for index, stream := range streams {
+		if stream.CodecName != "s302m" {
+			continue
+		}
+		spec := ":" + strconv.Itoa(index)
+		args = append(args, "-c"+spec, "libopus", "-b"+spec, "128k",
+			"-filter"+spec, "pan=stereo|c0=c0|c1=c1", "-ar"+spec, "48000", "-ac"+spec, "2", "-threads"+spec, "1")
+	}
+	args = append(args,
 		"-mpegts_flags", "+resend_headers", "-pes_payload_size", "0", "-muxdelay", "0",
 		"-mpegts_copyts", "1", "-f", "mpegts",
-	}
+	)
 	if passphrase != "" {
 		args = append(args, "-passphrase", passphrase)
 	}

@@ -1,3 +1,24 @@
+/** Opus /2 in rtpmap is mandatory even for mono; stereo reception is opt-in (RFC 7587). */
+export function preferOpusStereo(sdp: string): string {
+  return sdp.split(/(?=^m=)/m).map((section) => {
+    if (!section.startsWith("m=audio ")) return section;
+    const newline = section.includes("\r\n") ? "\r\n" : "\n";
+    const lines = section.split(newline);
+    for (const match of section.matchAll(/^a=rtpmap:(\d+) opus\/48000\/2\r?$/gim)) {
+      const prefix = `a=fmtp:${match[1]} `;
+      const index = lines.findIndex((line) => line.startsWith(prefix));
+      if (index < 0) {
+        const rtpmap = lines.indexOf(match[0].trimEnd());
+        lines.splice(rtpmap + 1, 0, `${prefix}stereo=1`);
+      } else {
+        const params = lines[index].slice(prefix.length).split(";").filter((param) => !/^stereo\s*=/i.test(param.trim()));
+        lines[index] = `${prefix}${[...params, "stereo=1"].join(";")}`;
+      }
+    }
+    return lines.join(newline);
+  }).join("");
+}
+
 export type StatsSample = {
   timestamp: number;
   bytesReceived: number;

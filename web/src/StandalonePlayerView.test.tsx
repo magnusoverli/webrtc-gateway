@@ -67,6 +67,9 @@ describe("ChannelViewer", () => {
     expect(videos.every((video) => !video.hasAttribute("controls") && (video as HTMLVideoElement).muted)).toBe(true);
     expect(screen.getByRole("group", { name: "Studio A audio meters" })).toBeDefined();
     expect(screen.getByRole("group", { name: "Studio B audio meters" })).toBeDefined();
+    expect(videos.every((video) => video.parentElement?.querySelector(".audio-meter"))).toBe(true);
+    expect(screen.getAllByRole("meter")).toHaveLength(4);
+    expect(document.querySelector(".audio-meter-status")).toBeNull();
     expect(playerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: "/api/v1/channels/studio-a/whep", enabled: true }));
     expect(playerHarness.calls).toHaveBeenCalledWith(expect.objectContaining({ whepPath: "/api/v1/channels/studio-b/whep", enabled: false }));
     expect(fetch).toHaveBeenCalledWith("/api/v1/channels", expect.objectContaining({ cache: "no-store" }));
@@ -357,32 +360,39 @@ describe("ChannelViewer", () => {
         });
       });
 
-      afterEach(() => {
-        Reflect.deleteProperty(document, "elementFromPoint");
-      });
-
       it.each(["mouse", "touch"])("reorders with a captured %s pointer at six pixels, without restarting sessions or opening a dialog", (pointerType) => {
         const channels = fixtureChannels(3);
         render(<MultiviewGrid channels={channels} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
-        const { hit, capture } = mockPointer(handle, screen.getByRole("heading", { name: "Channel 3" }));
+        const { capture } = mockPointer(handle);
+        const videos = [...document.querySelectorAll("video")];
+        const write = vi.spyOn(Storage.prototype, "setItem");
         fireEvent.pointerDown(handle, { pointerId: 7, pointerType, button: 0, clientX: 10, clientY: 10 });
         expect(capture).toHaveBeenCalledWith(7);
         fireEvent.pointerMove(handle, { pointerId: 8, clientX: 30, clientY: 10 });
         fireEvent.pointerMove(handle, { pointerId: 7, clientX: 15, clientY: 10 });
-        expect(hit).not.toHaveBeenCalled();
         expect(document.querySelector(".is-dragging")).toBeNull();
         fireEvent.pointerMove(handle, { pointerId: 7, clientX: 16, clientY: 10 });
-        expect(hit).toHaveBeenCalledWith(16, 10);
         expect(handle.closest("article")?.classList.contains("is-dragging")).toBe(true);
-        expect(document.querySelector("article.is-drop-target")?.getAttribute("data-move-target")).toBe(channels[2].id);
+        fireEvent.pointerMove(handle, { pointerId: 7, clientX: 210, clientY: 10 });
+        expect(proposedChannelIDs()).toEqual([channels[1].id, channels[2].id, channels[0].id]);
+        expect(document.querySelector("article.is-drop-target")?.getAttribute("data-move-target")).toBe(channels[0].id);
+        expect(write).not.toHaveBeenCalled();
+        expect(readMultiviewOrder()).toEqual(channels.map((channel) => channel.id));
+        expect(document.querySelector(".multiview-drag-overlay")?.getAttribute("aria-hidden")).toBe("true");
+        expect(document.querySelector(".multiview-drag-overlay video, .multiview-drag-overlay button")).toBeNull();
+        expect([...document.querySelectorAll("video")]).toEqual(videos);
         fireEvent.pointerUp(handle, { pointerId: 8 });
-        expect(visibleChannelIDs()).toEqual(channels.map((channel) => channel.id));
-        fireEvent.pointerUp(handle, { pointerId: 7 });
+        expect(proposedChannelIDs()).toEqual([channels[1].id, channels[2].id, channels[0].id]);
+        fireEvent.pointerUp(handle, { pointerId: 7, clientX: 210, clientY: 10 });
         fireEvent.click(handle, { detail: 1 });
         expect(screen.queryByRole("dialog")).toBeNull();
         expect(visibleChannelIDs()).toEqual([channels[1].id, channels[2].id, channels[0].id]);
         expect(readMultiviewOrder()).toEqual(visibleChannelIDs());
+        expect(write).toHaveBeenCalledTimes(1);
+        expect(document.querySelector(".multiview-drag-overlay")).toBeNull();
+        expect(document.activeElement).toBe(handle);
+        expect([...document.querySelectorAll("video")]).toEqual(videos);
         expect(document.querySelector("article.is-dragging, article.is-drop-target")).toBeNull();
         expect(playerHarness.started).toHaveLength(3);
         expect(playerHarness.stopped).toEqual([]);
@@ -391,28 +401,75 @@ describe("ChannelViewer", () => {
       it("opens the move dialog for a handle click below the drag threshold", () => {
         render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
-        const { hit } = mockPointer(handle, screen.getByRole("heading", { name: "Channel 2" }));
+        mockPointer(handle);
         fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0 });
         fireEvent.pointerMove(handle, { clientX: 3, clientY: 4 });
         fireEvent.pointerUp(handle);
         fireEvent.click(handle, { detail: 1 });
-        expect(hit).not.toHaveBeenCalled();
         expect(screen.getByRole("dialog", { name: "Move Channel 1" })).toBeDefined();
+      });
+
+      it("ignores a secondary touch without clearing capture or post-drag click suppression", () => {
+        render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { pointerId: 1, button: 0, pointerType: "touch" });
+        fireEvent.pointerMove(handle, { pointerId: 1, clientX: 210, clientY: 10 });
+        fireEvent.pointerDown(handle, { pointerId: 2, button: 0, isPrimary: false, pointerType: "touch" });
+        fireEvent.pointerCancel(handle, { pointerId: 2 });
+        expect(document.querySelector(".multiview-drag-overlay")).not.toBeNull();
+        fireEvent.pointerUp(handle, { pointerId: 1, clientX: 210, clientY: 10 });
+        fireEvent.click(handle, { detail: 1 });
+        expect(screen.queryByRole("dialog")).toBeNull();
+        expect(readMultiviewOrder()).toEqual(["channel-2", "channel-3", "channel-1"]);
+      });
+
+      it.each(["handle", "backdrop"])("opens a stationary touch release without a compatibility click, and ignores a duplicate on the %s", async (target) => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { pointerType: "touch", button: 0, clientX: 85, clientY: 10 });
+        fireEvent.pointerUp(handle, { pointerType: "touch", clientX: 85, clientY: 10 });
+        expect(screen.getAllByRole("dialog")).toHaveLength(1);
+        expect(fireEvent.mouseDown(target === "handle" ? handle : document.querySelector(".editor-backdrop")!, { detail: 1 })).toBe(false);
+        fireEvent.click(target === "handle" ? handle : document.querySelector(".editor-backdrop")!, { detail: 1 });
+        expect(screen.getAllByRole("dialog")).toHaveLength(1);
+        await act(async () => { fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" }); });
+        expect(document.activeElement).toBe(handle);
+        expect(screen.queryByRole("dialog")).toBeNull();
+        fireEvent.click(handle, { detail: 0 });
+        expect(screen.getAllByRole("dialog")).toHaveLength(1);
+        expect(playerHarness.stopped).toEqual([]);
+      });
+
+      it("does not treat a cancelled or distant touch release as a tap", () => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { pointerType: "touch", button: 0 });
+        fireEvent.pointerUp(handle, { pointerType: "touch", clientX: 110 });
+        expect(screen.queryByRole("dialog")).toBeNull();
+        fireEvent.pointerDown(handle, { pointerType: "touch", button: 0 });
+        fireEvent.pointerCancel(handle);
+        fireEvent.pointerUp(handle, { pointerType: "touch" });
+        expect(screen.queryByRole("dialog")).toBeNull();
       });
 
       it.each(["pointercancel", "lostpointercapture", "Escape"])("cancels a drag with %s and ignores subsequent pointer up", (action) => {
         const channels = fixtureChannels(3);
         render(<MultiviewGrid channels={channels} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
-        mockPointer(handle, screen.getByRole("heading", { name: "Channel 3" }));
+        mockPointer(handle);
         const write = vi.spyOn(Storage.prototype, "setItem");
         fireEvent.pointerDown(handle, { button: 0 });
-        fireEvent.pointerMove(handle, { clientX: 10 });
+        fireEvent.pointerMove(handle, { clientX: 210, clientY: 10 });
         expect(document.querySelector(".is-dragging")).not.toBeNull();
+        expect(proposedChannelIDs()).toEqual([channels[1].id, channels[2].id, channels[0].id]);
         if (action === "Escape") fireEvent.keyDown(handle, { key: "Escape" });
         else fireEvent(handle, new PointerEvent(action, { bubbles: true }));
         fireEvent.pointerUp(handle);
         expect(document.querySelector("article.is-dragging, article.is-drop-target")).toBeNull();
+        expect(document.querySelector(".multiview-drag-overlay")).toBeNull();
         expect(visibleChannelIDs()).toEqual(channels.map((channel) => channel.id));
         expect(write).not.toHaveBeenCalled();
         expect(playerHarness.stopped).toEqual([]);
@@ -423,15 +480,16 @@ describe("ChannelViewer", () => {
         const view = render(<MultiviewGrid channels={channels} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
         const browser = document.querySelector(".multiview-browser")!;
-        mockPointer(handle, screen.getByRole("heading", { name: "Channel 3" }));
+        mockPointer(handle);
         fireEvent.pointerDown(handle, { button: 0 });
-        fireEvent.pointerMove(handle, { clientX: 10 });
+        fireEvent.pointerMove(handle, { clientX: 210, clientY: 10 });
         const remaining = channels.filter((_, index) => index !== (removed === "source" ? 0 : 2));
         view.rerender(<MultiviewGrid channels={remaining} loaded />);
         const write = vi.spyOn(Storage.prototype, "setItem");
         fireEvent.pointerMove(browser, { clientX: 20 });
         fireEvent.pointerUp(browser);
         expect(document.querySelector("article.is-dragging, article.is-drop-target")).toBeNull();
+        expect(document.querySelector(".multiview-drag-overlay")).toBeNull();
         expect(visibleChannelIDs()).toEqual(remaining.map((channel) => channel.id));
         expect(readMultiviewOrder()).toEqual(visibleChannelIDs());
         expect(write).not.toHaveBeenCalled();
@@ -447,10 +505,13 @@ describe("ChannelViewer", () => {
         const handle = screen.getByRole("button", { name: `Move Channel ${sourceIndex + 1}` });
         const target = screen.getByRole("button", { name: direction });
         expect(target.getAttribute("data-move-target")).toBe(channels[targetIndex].id);
-        mockPointer(handle, target);
+        mockPointer(handle);
         fireEvent.pointerDown(handle, { button: 0 });
-        fireEvent.pointerMove(handle, { clientX: 10 });
-        fireEvent.pointerUp(handle);
+        fireEvent.pointerMove(handle, { clientX: backwards ? 10 : 110, clientY: 210 });
+        expect(target.classList.contains("is-drop-target")).toBe(true);
+        expect(playerHarness.started).toHaveLength(backwards ? 24 : 12);
+        expect(visibleChannelIDs()).toEqual(channels.slice(backwards ? 12 : 0, backwards ? 24 : 12).map((channel) => channel.id));
+        fireEvent.pointerUp(handle, { clientX: backwards ? 10 : 110, clientY: 210 });
         fireEvent.click(target, { detail: 1 });
         const expected = channels.map((channel) => channel.id);
         expected.splice(sourceIndex, 1);
@@ -467,11 +528,11 @@ describe("ChannelViewer", () => {
         const channels = fixtureChannels(4);
         const view = render(<MultiviewGrid channels={channels} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 2" });
-        mockPointer(handle, screen.getByRole("heading", { name: "Channel 4" }));
-        fireEvent.pointerDown(handle, { button: 0 });
-        fireEvent.pointerMove(handle, { clientX: 10 });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { button: 0, clientX: 110, clientY: 10 });
+        fireEvent.pointerMove(handle, { clientX: 310, clientY: 10 });
         view.rerender(<MultiviewGrid channels={channels.slice(1)} loaded />);
-        fireEvent.pointerUp(handle);
+        fireEvent.pointerUp(handle, { clientX: 210, clientY: 10 });
         expect(visibleChannelIDs()).toEqual([channels[2].id, channels[3].id, channels[1].id]);
         expect(readMultiviewOrder()).toEqual(visibleChannelIDs());
         expect(playerHarness.started).toHaveLength(4);
@@ -482,33 +543,260 @@ describe("ChannelViewer", () => {
         const channels = fixtureChannels(2);
         render(<MultiviewGrid channels={channels} loaded />);
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
-        const { capture, hit } = mockPointer(handle, screen.getByRole("heading", { name: "Channel 2" }));
+        const { capture } = mockPointer(handle);
         const write = vi.spyOn(Storage.prototype, "setItem");
         fireEvent.pointerDown(handle, init);
         fireEvent.pointerMove(handle, { clientX: 10 });
         fireEvent.pointerUp(handle);
         expect(capture).not.toHaveBeenCalled();
-        expect(hit).not.toHaveBeenCalled();
         expect(write).not.toHaveBeenCalled();
         expect(visibleChannelIDs()).toEqual(channels.map((channel) => channel.id));
       });
 
-      it("does not drop onto targets outside the grid or empty hit-test results", () => {
+      it("rolls back outside the grid and in gaps, including pointerup without a last move", () => {
         const channels = fixtureChannels(2);
         render(<MultiviewGrid channels={channels} loaded />);
-        const outside = document.createElement("div");
-        outside.dataset.moveTarget = channels[1].id;
         const handle = screen.getByRole("button", { name: "Move Channel 1" });
-        const { hit } = mockPointer(handle, outside);
+        mockPointer(handle);
         const write = vi.spyOn(Storage.prototype, "setItem");
-        for (const target of [outside, null]) {
-          hit.mockReturnValue(target);
+        for (const clientX of [-60, 50, 210]) {
           fireEvent.pointerDown(handle, { button: 0 });
-          fireEvent.pointerMove(handle, { clientX: 10 });
-          fireEvent.pointerUp(handle);
+          fireEvent.pointerMove(handle, { clientX: 110, clientY: 10 });
+          expect(proposedChannelIDs()).toEqual([channels[1].id, channels[0].id]);
+          fireEvent.pointerUp(handle, { clientX, clientY: 10 });
         }
         expect(visibleChannelIDs()).toEqual(channels.map((channel) => channel.id));
         expect(write).not.toHaveBeenCalled();
+      });
+
+      it("uses current logical slots through repeated and reverse hovers and reordered server polls", () => {
+        const channels = fixtureChannels(4);
+        const view = render(<MultiviewGrid channels={channels} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const write = vi.spyOn(Storage.prototype, "setItem");
+        fireEvent.pointerDown(handle, { button: 0 });
+        for (const slot of [2, 2, 1, 3, 0, 2, 2]) {
+          fireEvent.pointerMove(handle, { clientX: slot * 100 + 10, clientY: 10 });
+          const expected = channels.map((channel) => channel.id);
+          expected.splice(0, 1);
+          expected.splice(slot, 0, channels[0].id);
+          expect(proposedChannelIDs()).toEqual(expected);
+          view.rerender(<MultiviewGrid channels={[...channels].reverse()} loaded />);
+          expect(proposedChannelIDs()).toEqual(expected);
+        }
+        expect(write).not.toHaveBeenCalled();
+        fireEvent.pointerUp(handle, { clientX: 210, clientY: 10 });
+        expect(readMultiviewOrder()).toEqual([channels[1].id, channels[2].id, channels[0].id, channels[3].id]);
+        expect(playerHarness.started).toHaveLength(4);
+        expect(playerHarness.stopped).toEqual([]);
+      });
+
+      it.each([
+        [54.9, 0, false], [55, 0, false], [55.1, 0, true],
+        [100, 49.9, true], [100, 50, false], [100, 50.1, false],
+        [77.5, 100 / 3, false], [77.6, 100 / 3, true],
+      ])("requires strictly half the full rectangular area (ghost %s,%s: %s)", (left, top, displaced) => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        // Real handle near the top-right, not the tile center.
+        fireEvent.pointerDown(handle, { button: 0, clientX: 85, clientY: 10 });
+        fireEvent.pointerMove(handle, { clientX: left + 85, clientY: top + 10 });
+        expect(proposedChannelIDs()).toEqual(displaced ? ["channel-2", "channel-1"] : ["channel-1", "channel-2"]);
+        expect(readMultiviewOrder()).toEqual(["channel-1", "channel-2"]);
+      });
+
+      it("uses the full ghost even when the handle is over a neighbor or outside it", () => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { button: 0, clientX: 85, clientY: 10 });
+        // Pointer is inside tile 2, but only 30/90 of the ghost overlaps it.
+        fireEvent.pointerMove(handle, { clientX: 125, clientY: 10 });
+        expect(proposedChannelIDs()).toEqual(["channel-1", "channel-2"]);
+        // Pointer is to its right, but 70/90 of the ghost overlaps it.
+        fireEvent.pointerMove(handle, { clientX: 205, clientY: 10 });
+        expect(proposedChannelIDs()).toEqual(["channel-2", "channel-1"]);
+        fireEvent.pointerUp(handle, { clientX: 205, clientY: 10 });
+        expect(readMultiviewOrder()).toEqual(["channel-2", "channel-1"]);
+      });
+
+      it.each([false, true])("retains the proposal across gaps, below threshold, and over its placeholder (drop: %s)", (drop) => {
+        render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { button: 0, clientX: 85, clientY: 10 });
+        fireEvent.pointerMove(handle, { clientX: 285, clientY: 10 });
+        const expected = ["channel-2", "channel-3", "channel-1"];
+        for (const left of [200, 150, 155, 160, 200, 200]) {
+          fireEvent.pointerMove(handle, { clientX: left + 85, clientY: 10 });
+          expect(proposedChannelIDs()).toEqual(expected);
+        }
+        if (!drop) fireEvent.keyDown(handle, { key: "Escape" });
+        fireEvent.pointerUp(handle, { clientX: 245, clientY: 10 });
+        expect(readMultiviewOrder()).toEqual(drop ? expected : ["channel-1", "channel-2", "channel-3"]);
+        expect(playerHarness.stopped).toEqual([]);
+      });
+
+      it("keeps the initial source slot valid before any displacement", () => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { button: 0, clientX: 85, clientY: 10 });
+        fireEvent.pointerMove(handle, { clientX: 95, clientY: 10 });
+        fireEvent.pointerUp(handle, { clientX: 95, clientY: 10 });
+        expect(readMultiviewOrder()).toEqual(["channel-1", "channel-2"]);
+        expect(screen.getByRole("status").textContent).toContain("position 1");
+      });
+
+      it("handles vertical thresholds, row edges, large jumps, and reversing through provisional slots", () => {
+        const channels = fixtureChannels(12);
+        render(<MultiviewGrid channels={channels} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 4" });
+        mockPointer(handle, 4);
+        fireEvent.pointerDown(handle, { button: 0, clientX: 385, clientY: 10 });
+        for (const top of [59.9, 60]) {
+          fireEvent.pointerMove(handle, { clientX: 385, clientY: top + 10 });
+          expect(proposedChannelIDs()).toEqual(channels.map(channel => channel.id));
+        }
+        for (const [slot, top] of [[7, 60.1], [7, 110], [4, 110], [11, 220], [0, 0], [3, 0], [3, 0]]) {
+          fireEvent.pointerMove(handle, { clientX: slot % 4 * 100 + 85, clientY: top + 10 });
+          const expected = channels.map(channel => channel.id);
+          expected.splice(3, 1); expected.splice(slot, 0, channels[3].id);
+          expect(proposedChannelIDs()).toEqual(expected);
+        }
+        fireEvent.pointerUp(handle, { clientX: 385, clientY: 10 });
+        expect(readMultiviewOrder()).toEqual(channels.map(channel => channel.id));
+        expect(playerHarness.started).toHaveLength(12);
+        expect(playerHarness.stopped).toEqual([]);
+      });
+
+      it("captures just one frame and cleans up capture, overlay, and animations on unmount", () => {
+        const view = render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const video = handle.closest("article")!.querySelector("video")!;
+        Object.defineProperties(video, { readyState: { value: 2 }, videoWidth: { value: 1920 }, videoHeight: { value: 1080 } });
+        const drawImage = vi.fn();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage } as unknown as CanvasRenderingContext2D);
+        const release = vi.fn();
+        Object.defineProperties(handle, { hasPointerCapture: { value: () => true }, releasePointerCapture: { value: release } });
+        fireEvent.pointerDown(handle, { button: 0 });
+        for (const clientX of [110, 210, 110]) fireEvent.pointerMove(handle, { clientX, clientY: 10 });
+        expect(drawImage).toHaveBeenCalledTimes(1);
+        expect(document.querySelectorAll(".multiview-drag-overlay canvas")).toHaveLength(1);
+        view.unmount();
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(document.querySelector(".multiview-drag-overlay")).toBeNull();
+      });
+
+      it.each([false, true])("animates only changed slots and releases drag resources (reduced motion: %s)", (reduced) => {
+        const motion = { matches: reduced, addEventListener: vi.fn(), removeEventListener: vi.fn() };
+        vi.stubGlobal("matchMedia", vi.fn().mockReturnValue(motion));
+        const view = render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const animations: { cancel: ReturnType<typeof vi.fn>; onfinish: (() => void) | null }[] = [];
+        const animate = vi.fn(() => {
+          const animation = { cancel: vi.fn(), onfinish: null };
+          animations.push(animation);
+          return animation;
+        });
+        document.querySelectorAll("article").forEach((tile) => Object.defineProperty(tile, "animate", { value: animate }));
+        const removeListener = vi.spyOn(window, "removeEventListener");
+        fireEvent.pointerDown(handle, { button: 0 });
+        fireEvent.pointerMove(handle, { clientX: 210, clientY: 10 });
+        expect(animate).toHaveBeenCalledTimes(reduced ? 0 : 3);
+        if (!reduced) expect(animate).toHaveBeenCalledWith(expect.any(Array), { duration: 460, easing: "cubic-bezier(.22,.68,.2,1)" });
+        fireEvent.pointerMove(handle, { clientX: 220, clientY: 10 });
+        expect(animate).toHaveBeenCalledTimes(reduced ? 0 : 3);
+        expect(document.querySelector<HTMLElement>(".multiview-drag-overlay")?.style.transform).toBe("translate3d(220px, 10px, 0)");
+        view.unmount();
+        expect(animations.every((animation) => animation.cancel.mock.calls.length === 1 && animation.onfinish === null)).toBe(true);
+        expect(removeListener).toHaveBeenCalledWith("keydown", expect.any(Function), true);
+        expect(motion.removeEventListener).toHaveBeenCalledWith("change", expect.any(Function));
+      });
+
+      it("lets a short drop finish its existing glide across polling and still honors a motion preference change", () => {
+        const motion = { matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() };
+        vi.stubGlobal("matchMedia", vi.fn().mockReturnValue(motion));
+        const channels = fixtureChannels(6);
+        const view = render(<MultiviewGrid channels={channels} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const animations: { cancel: ReturnType<typeof vi.fn>; onfinish: (() => void) | null }[] = [];
+        const animate = vi.fn(() => {
+          const animation = { cancel: vi.fn(), onfinish: null };
+          animations.push(animation);
+          return animation;
+        });
+        document.querySelectorAll("article").forEach(tile => Object.defineProperty(tile, "animate", { value: animate }));
+        fireEvent.pointerDown(handle, { button: 0 });
+        fireEvent.pointerMove(handle, { clientX: 110, clientY: 10 });
+        fireEvent.pointerUp(handle, { clientX: 110, clientY: 10 });
+        view.rerender(<MultiviewGrid channels={[...channels].reverse()} loaded />);
+        expect(document.querySelector(".multiview-drag-overlay")).toBeNull();
+        expect(animate).toHaveBeenCalledTimes(2);
+        expect(animations.every(animation => animation.cancel.mock.calls.length === 0)).toBe(true);
+        expect(readMultiviewOrder()).toEqual([channels[1].id, channels[0].id, ...channels.slice(2).map(channel => channel.id)]);
+        expect(playerHarness.started).toHaveLength(6);
+        expect(playerHarness.stopped).toEqual([]);
+        motion.matches = true;
+        act(() => motion.addEventListener.mock.calls[0][1]());
+        expect(animations.every(animation => animation.cancel.mock.calls.length === 1)).toBe(true);
+      });
+
+      it("animates a different final pointerup slot from the interrupted visual positions", () => {
+        render(<MultiviewGrid channels={fixtureChannels(3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const animations: { cancel: ReturnType<typeof vi.fn>; onfinish: (() => void) | null }[] = [];
+        const animate = vi.fn(() => {
+          const animation = { cancel: vi.fn(), onfinish: null };
+          animations.push(animation);
+          return animation;
+        });
+        const tiles = [...document.querySelectorAll("article")];
+        tiles.forEach(tile => Object.defineProperty(tile, "animate", { value: animate }));
+        fireEvent.pointerDown(handle, { button: 0 });
+        fireEvent.pointerMove(handle, { clientX: 110, clientY: 10 });
+        // The second neighbor is still 70px from its provisional destination.
+        vi.spyOn(tiles[1], "getBoundingClientRect").mockReturnValueOnce(new DOMRect(70, 0, 90, 90));
+        fireEvent.pointerUp(handle, { clientX: 210, clientY: 10 });
+        expect(animations.slice(0, 2).every(animation => animation.cancel.mock.calls.length === 1)).toBe(true);
+        expect(animate).toHaveBeenCalledWith([{ transform: "translate(70px, 0px)" }, { transform: "translate(0, 0)" }], expect.any(Object));
+        expect(animations.slice(2).every(animation => animation.cancel.mock.calls.length === 0)).toBe(true);
+      });
+
+      it("defers newly polled page members until drag ends without losing the provisional positions", () => {
+        const channels = fixtureChannels(4);
+        const view = render(<MultiviewGrid channels={channels.slice(0, 3)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        fireEvent.pointerDown(handle, { button: 0 });
+        fireEvent.pointerMove(handle, { clientX: 210, clientY: 10 });
+        view.rerender(<MultiviewGrid channels={[...channels].reverse()} loaded />);
+        expect(proposedChannelIDs()).toEqual([channels[1].id, channels[2].id, channels[0].id]);
+        expect(playerHarness.started).toHaveLength(3);
+        fireEvent.keyDown(window, { key: "Escape" });
+        expect(visibleChannelIDs()).toEqual(channels.map((channel) => channel.id));
+        expect(playerHarness.started).toHaveLength(4);
+        expect(playerHarness.stopped).toHaveLength(0);
+        expect(document.activeElement).toBe(handle);
+      });
+
+      it("falls back to text if the current video frame cannot be captured", () => {
+        render(<MultiviewGrid channels={fixtureChannels(2)} loaded />);
+        const handle = screen.getByRole("button", { name: "Move Channel 1" });
+        mockPointer(handle);
+        const video = handle.closest("article")!.querySelector("video")!;
+        Object.defineProperties(video, { readyState: { value: 2 }, videoWidth: { value: 1920 }, videoHeight: { value: 1080 } });
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => { throw new Error("protected"); });
+        fireEvent.pointerDown(handle, { button: 0 });
+        fireEvent.pointerMove(handle, { clientX: 110, clientY: 10 });
+        expect(document.querySelector(".multiview-drag-overlay")?.textContent).toContain("Video frame unavailable");
+        expect(document.querySelector(".multiview-drag-overlay canvas")).toBeNull();
       });
     });
   });
@@ -627,15 +915,30 @@ function fixtureChannels(count: number) {
 }
 
 function visibleChannelIDs() {
-  return Array.from(document.querySelectorAll("article[data-move-target]"), (tile) => tile.getAttribute("data-move-target"));
+  return proposedChannelIDs();
 }
 
-function mockPointer(handle: HTMLElement, target: Element) {
+function proposedChannelIDs() {
+  return [...document.querySelectorAll<HTMLElement>("article[data-move-target]")]
+    .sort((a, b) => Number(a.style.order) - Number(b.style.order)).map((tile) => tile.dataset.moveTarget);
+}
+
+function mockPointer(handle: HTMLElement, columns = Infinity) {
   const capture = vi.fn();
-  const hit = vi.fn<(...coordinates: number[]) => Element | null>().mockReturnValue(target);
   Object.defineProperty(handle, "setPointerCapture", { configurable: true, value: capture });
-  Object.defineProperty(document, "elementFromPoint", { configurable: true, value: hit });
-  return { capture, hit };
+  for (const tile of document.querySelectorAll<HTMLElement>("article[data-move-target]")) {
+    Object.defineProperties(tile, {
+      offsetLeft: { configurable: true, get: () => Number(tile.style.order) % columns * 100 },
+      offsetTop: { configurable: true, get: () => Math.floor(Number(tile.style.order) / columns) * 110 },
+      offsetWidth: { configurable: true, value: 90 },
+      offsetHeight: { configurable: true, value: 100 },
+    });
+    vi.spyOn(tile, "getBoundingClientRect").mockImplementation(() => new DOMRect(tile.offsetLeft, tile.offsetTop, 90, 100));
+  }
+  document.querySelectorAll(".multiview-pagination button").forEach((button, index) => {
+    vi.spyOn(button, "getBoundingClientRect").mockReturnValue(new DOMRect(index * 100, 200, 90, 30));
+  });
+  return { capture };
 }
 
 function fixtureChannel(id: string, number: number, name: string, outputReady: boolean): Channel {

@@ -299,9 +299,9 @@ func TestClassifyPayloadBoundsTinyMalformedMessages(t *testing.T) {
 
 func TestRemuxArgsCopyMPEGTSAndRepeatHeaders(t *testing.T) {
 	const passphrase = "plus+percent%secret"
-	args := remuxArgs("srt://127.0.0.1:8890?streamid=publish:test", passphrase)
+	args := remuxArgs("srt://127.0.0.1:8890?streamid=publish:test", passphrase, []tsStream{{ID: "0x100", CodecType: "video"}, {ID: "0x101", CodecType: "audio", CodecName: "ac3"}})
 	for _, pair := range [][2]string{
-		{"-f", "mpegts"}, {"-probesize", "131072"}, {"-analyzeduration", "1000000"}, {"-i", "pipe:0"}, {"-map", "0:v?"}, {"-map", "0:a?"},
+		{"-f", "mpegts"}, {"-probesize", "16777216"}, {"-analyzeduration", "1000000"}, {"-i", "pipe:0"}, {"-map", "0:i:0x100"}, {"-map", "0:i:0x101"},
 		{"-c", "copy"}, {"-mpegts_flags", "+resend_headers"}, {"-pes_payload_size", "0"}, {"-muxdelay", "0"},
 		{"-mpegts_copyts", "1"},
 	} {
@@ -422,6 +422,7 @@ func TestAutomaticRelayNotifiesAfterRemuxAcceptsInput(t *testing.T) {
 	input := runningInputSession(t, inputPackets)
 	supervisor := newTestSupervisor(t, "unused")
 	supervisor.ffmpeg = ffmpeg
+	supervisor.ffprobe = fakeTSProbe(t)
 	observer := &recordingInputObserver{started: make(chan string, 1)}
 	supervisor.SetInputObserver(observer)
 	plan := channel.SRTIngestPlan{
@@ -451,7 +452,7 @@ func TestAutomaticRelayNotifiesAfterRemuxAcceptsInput(t *testing.T) {
 		if channelID != "channel-2" {
 			t.Fatalf("notified channel = %q", channelID)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("automatic MPEG-TS relay did not notify the observer")
 	}
 	cancel()

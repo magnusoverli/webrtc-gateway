@@ -75,24 +75,17 @@ export function useAudioMeterContext(): { context: AudioContext | null; state: A
 const FLOOR = -60;
 const percent = (db: number) => `${(db - FLOOR) / -FLOOR * 100}%`;
 const dbfs = (amplitude: number) => Math.max(FLOOR, Math.min(0, 20 * Math.log10(amplitude)));
+const labels = ["L", "R"];
+const description = "First two decoded channels, not proof of a stereo source. The meter does not duplicate channels; the browser may upmix mono. Upstream or browser downmix may differ from source channels.";
 
 export function AudioMeter({ track, context, name }: { track: MediaStreamTrack | null; context: AudioContext | null; name: string }) {
   const rootRef = useRef<HTMLDivElement>(null);
-  let reported: number | undefined;
-  try { reported = track?.getSettings().channelCount; } catch { /* Some receivers omit settings. */ }
-  const known = typeof reported === "number" && Number.isFinite(reported) && reported >= 1;
-  const count = known ? Math.min(8, Math.floor(reported!)) : 2;
-  const labels = Array.from({ length: count }, (_, i) => known && reported === 1 ? "M" : known && reported === 2 ? ["L", "R"][i] : String(i + 1));
-  const description = known
-    ? `${count < reported! ? `First ${count} of ${reported}` : count} decoded channel${count === 1 ? "" : "s"}; receiver/browser downmix may differ from source channels.`
-    : "First two decoded channels (channel count unknown); these slots may include silence or a browser downmix, not all source channels.";
 
   useEffect(() => {
     const root = rootRef.current!;
     const bars = Array.from(root.querySelectorAll<HTMLElement>(".audio-meter-channel"));
     const fills = bars.map((bar) => bar.querySelector<HTMLElement>(".audio-meter-fill")!);
     const peaks = bars.map((bar) => bar.querySelector<HTMLElement>(".audio-meter-peak")!);
-    const status = root.querySelector<HTMLElement>(".audio-meter-status")!;
     const nodes: AudioNode[] = [];
     const analysers: AnalyserNode[] = [];
     const buffers: Float32Array<ArrayBuffer>[] = [];
@@ -115,7 +108,7 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
       if (pageHidden || document.visibilityState === "hidden") return ["hidden", "Meter paused while page is hidden"];
       if (!track) return ["no-track", "No audio track"];
       if (track.readyState === "ended") return ["ended", "Audio track ended"];
-      if (track.muted) return ["muted", "Audio track muted"];
+      if (track.muted) return ["muted", "No audio received (track muted); this is not measured silence"];
       if (!track.enabled) return ["disabled", "Audio track disabled"];
       if (!context) return ["unavailable", "Audio metering unavailable"];
       if (failed) return ["error", "Audio analysis unavailable"];
@@ -129,7 +122,6 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
       root.dataset.state = next;
       root.classList.toggle("unavailable", next !== "running");
       root.title = `${message}. ${description}`;
-      status.textContent = next === "running" ? "" : message;
       lastSample = lastAria = -Infinity;
       bars.forEach((bar, i) => {
         levels[i] = { rms: FLOOR, peak: FLOOR, holdUntil: 0, clipUntil: 0 };
@@ -204,9 +196,11 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
       try {
         const source = context.createMediaStreamSource(new MediaStream([track]));
         nodes.push(source);
-        const splitter = context.createChannelSplitter(count);
+        // Remote track settings can start at mono and change without a React render.
+        // Discrete splitting preserves L/R and leaves a missing second channel silent.
+        const splitter = context.createChannelSplitter(2);
         nodes.push(splitter);
-        splitter.channelCount = count;
+        splitter.channelCount = 2;
         splitter.channelCountMode = "explicit";
         splitter.channelInterpretation = "discrete";
         const silent = context.createGain();
@@ -215,7 +209,7 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
         silent.gain.value = 0;
         silent.connect(context.destination);
         source.connect(splitter);
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < 2; i++) {
           const analyser = context.createAnalyser();
           nodes.push(analyser);
           analyser.fftSize = 2048;
@@ -250,7 +244,7 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
       window.removeEventListener("pageshow", show);
       disconnect();
     };
-  }, [track, context, count, description]);
+  }, [track, context]);
 
   return (
     <div ref={rootRef} className="audio-meter unavailable" role="group" aria-label={`${name} audio meters`} data-state="unavailable" title={description}>
@@ -267,7 +261,6 @@ export function AudioMeter({ track, context, name }: { track: MediaStreamTrack |
           <span className="audio-meter-label" aria-hidden="true">{label}</span>
         </div>
       ))}
-      <span className="audio-meter-status" />
     </div>
   );
 }

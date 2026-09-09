@@ -30,6 +30,18 @@ afterEach(async () => {
 });
 
 describe("useWHEPPlayer", () => {
+  it("sets and posts the stereo-enabled local offer before applying the answer", async () => {
+    const offer = vi.spyOn(MockPeer.prototype, "createOffer").mockResolvedValue({ type: "offer", sdp: "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n" });
+    try {
+      renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true }));
+      await settle();
+      const peer = MockPeer.instances[0];
+      expect(peer.localDescription?.sdp).toContain("useinbandfec=1;stereo=1");
+      expect(postCalls()[0][1]?.body).toBe(peer.localDescription?.sdp);
+      expect(peer.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: "answer" });
+    } finally { offer.mockRestore(); }
+  });
+
   it("exposes the received audio track and clears it on session replacement, failure and disable", async () => {
     const view = renderHook(({ path, enabled }) => useWHEPPlayer({ whepPath: path, enabled }), { initialProps: { path: "/one", enabled: true } });
     await settle();
@@ -290,7 +302,7 @@ class MockPeer extends EventTarget {
   onconnectionstatechange: ((event: Event) => void) | null = null;
   receivers = [{ jitterBufferTarget: null }, { jitterBufferTarget: null }];
   addTransceiver = vi.fn(() => ({ receiver: this.receivers[this.addTransceiver.mock.calls.length - 1] }));
-  createOffer = vi.fn(async () => ({ type: "offer" as const, sdp: "offer" }));
+  async createOffer(): Promise<RTCSessionDescriptionInit> { return { type: "offer", sdp: "offer" }; }
   setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => {
     this.localDescription = description as RTCSessionDescription;
   });

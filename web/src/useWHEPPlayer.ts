@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { isRequestTimeoutError, requestText, requestWithDeadline } from "./request";
-import { summarizeRTCStats, waitForICEGathering, type PreviewStats, type StatsSample } from "./webrtc";
+import { preferOpusStereo, summarizeRTCStats, waitForICEGathering, type PreviewStats, type StatsSample } from "./webrtc";
 
 export type WHEPPlayerState = "off" | "connecting" | "playing" | "error";
 
@@ -270,7 +270,7 @@ export function useWHEPPlayer({
       try {
         const offer = await peer.createOffer();
         if (disposed || session !== current) return;
-        await peer.setLocalDescription(offer);
+        await peer.setLocalDescription({ ...offer, sdp: offer.sdp ? preferOpusStereo(offer.sdp) : offer.sdp });
         if (disposed || session !== current) return;
         const gathering = await waitForICEGathering(peer, {
           timeoutMs: ICE_GATHERING_TIMEOUT_MS,

@@ -326,20 +326,16 @@ describe("AudioMeter", () => {
     expect(analyser.buffers.every((buffer) => buffer === analyser.buffers[0])).toBe(true);
   });
 
-  it.each([
-    [1, ["M"]], [2, ["L", "R"]], [3, ["1", "2", "3"]],
-    [12, ["1", "2", "3", "4", "5", "6", "7", "8"]],
-    [undefined, ["1", "2"]], [0, ["1", "2"]], [NaN, ["1", "2"]],
-  ])("labels channel count %s accurately and clamps splitter inputs/outputs", (count, labels) => {
+  it.each([1, 2, 3, 12, undefined, 0, NaN])("keeps discrete L/R slots regardless of initial channel count %s", (count) => {
     const { bars, root, context } = mountMeter(new MockTrack(count));
-    expect(bars.map((bar) => bar.querySelector(".audio-meter-label")?.textContent)).toEqual(labels);
-    expect(context.createChannelSplitter).toHaveBeenCalledWith(labels.length);
+    expect(bars.map((bar) => bar.querySelector(".audio-meter-label")?.textContent)).toEqual(["L", "R"]);
+    expect(context.createChannelSplitter).toHaveBeenCalledWith(2);
     const splitter = context.nodes.find((node) => node.kind === "splitter")!;
-    expect(splitter.channelCount).toBe(labels.length);
+    expect(splitter.channelCount).toBe(2);
     expect(splitter.channelCountMode).toBe("explicit");
     expect(splitter.channelInterpretation).toBe("discrete");
-    if (!count) expect(root.title).toContain("First two decoded channels (channel count unknown)");
-    if (count === 12) expect(root.title).toContain("First 8 of 12 decoded channels");
+    expect(root.title).toContain("not proof of a stereo source");
+    expect(root.querySelector(".audio-meter-status")).toBeNull();
   });
 
   it("falls back to two decoded slots if track settings throw", () => {
@@ -347,7 +343,20 @@ describe("AudioMeter", () => {
     track.getSettings.mockImplementation(() => { throw new Error("settings unavailable"); });
     const { bars, root } = mountMeter(track);
     expect(bars).toHaveLength(2);
-    expect(root.title).toContain("channel count unknown");
+    expect(root.title).toContain("meter does not duplicate channels");
+  });
+
+  it("keeps both analysers alive when a remote track changes channel count without rerendering", () => {
+    const { track, context, bars } = mountMeter(new MockTrack(1));
+    context.analysers[0].amplitude = 0.5;
+    tick(0);
+    expect(value(bars[1])).toBe(-60);
+    track.getSettings.mockReturnValue({ channelCount: 2 });
+    context.analysers[1].amplitude = 0.125;
+    tick(300);
+    expect(value(bars[0])).toBeCloseTo(-6, 1);
+    expect(value(bars[1])).toBeCloseTo(-18.1, 1);
+    expect(context.streams).toHaveLength(1);
   });
 
   it("shows suspended/interrupted/closed explicitly and never samples or resumes a paused context", () => {
@@ -355,7 +364,8 @@ describe("AudioMeter", () => {
     const { context, bars, root } = mountMeter();
     tick(0);
     expect(root.dataset.state).toBe("suspended");
-    expect(root.textContent).toContain("enable meters to resume");
+    expect(root.title).toContain("enable meters to resume");
+    expect(root.textContent).not.toContain("enable meters");
     expect(bars[0].hasAttribute("aria-valuenow")).toBe(false);
     expect(context.analysers[0].getFloatTimeDomainData).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
@@ -397,7 +407,7 @@ describe("AudioMeter", () => {
     rerender(<AudioMeter track={replacement.asTrack()} context={context.asContext()} name="Replacement" />);
     expect(oldNodes.every((node) => node.disconnect.mock.calls.length === 1)).toBe(true);
     expect(track.listenerCount()).toBe(0);
-    expect(screen.getByRole("meter", { name: "Replacement channel M" })).toBeDefined();
+    expect(screen.getByRole("meter", { name: "Replacement channel L" })).toBeDefined();
     act(() => track.mute(true));
     expect(root.dataset.state).toBe("running");
     unmount();
