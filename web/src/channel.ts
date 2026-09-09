@@ -211,8 +211,8 @@ export function channelStateLabel(item: Channel) {
   if (item.applyState === "pending") return "Applying configuration";
   if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.summary ?? "Channel error";
   if (item.compatibility.state === "error") return "Output error";
-  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return "Listener error";
-  if (item.relay?.state === "starting") return "Listener restarting";
+  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return item.input.mode === "srt-pull" ? "Pull relay error" : "Listener error";
+  if (item.relay?.state === "starting") return item.input.mode === "srt-pull" ? "Pull relay restarting" : "Listener restarting";
   if (item.outputReady) return "Output ready";
   if (item.available && item.online) {
     if (item.compatibility.state === "starting") {

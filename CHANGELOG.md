@@ -10,6 +10,7 @@
 - Replaced custom tile resize dragging with react-resizable, adding visible corner grips for resizing both dimensions together.
 - Made multiview tile resizing continuous between grid sizes, with immediate neighbour displacement and saved intermediate dimensions.
 - Added browser-saved multiview tile resizing on the 4×3 grid with automatic page reflow, one-click size reset, and double-click fullscreen.
+- Added inline channel health with actionable structured issues, retry details, and separately scoped browser observations, without raw logs or extra polling.
 - Made multiview drag placeholders invisible and previews level at actual tile size, displacing neighbors only when more than half the preview overlaps them.
 - Fixed the move-position dialog sometimes failing to open on a mobile tap immediately after a cross-page drag.
 - Fixed short multiview drops snapping neighboring tiles instantly by letting their in-flight sorting animation finish after pointer release.

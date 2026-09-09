@@ -30,6 +30,22 @@ afterEach(async () => {
 });
 
 describe("useWHEPPlayer", () => {
+  it("never renders the previous channel's failure on navigation, including while hidden", async () => {
+    const renders: Array<{ path: string; state: string; error: string }> = [];
+    fetchMock.mockResolvedValue(response(503, "old channel failure"));
+    const view = renderHook(({ path }) => {
+      const player = useWHEPPlayer({ whepPath: path, enabled: true });
+      renders.push({ path, state: player.state, error: player.error });
+      return player;
+    }, { initialProps: { path: "/one" } });
+    await settle();
+    expect(view.result.current.error).toBe("old channel failure");
+    setVisibility("hidden");
+    view.rerender({ path: "/two" });
+    expect(renders.filter((entry) => entry.path === "/two").every((entry) => entry.state === "off" && entry.error === "")).toBe(true);
+    expect(view.result.current.stats).toBeNull();
+  });
+
   it("sets and posts the stereo-enabled local offer before applying the answer", async () => {
     const offer = vi.spyOn(MockPeer.prototype, "createOffer").mockResolvedValue({ type: "offer", sdp: "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n" });
     try {

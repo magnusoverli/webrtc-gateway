@@ -1711,6 +1711,31 @@ button.state-pill { cursor: pointer; }
   line-height: 1.55;
 }
 
+.channel-health { margin-bottom: 24px; padding: 20px 24px; }
+.health-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.health-heading h2 { margin: 0; font-size: 1rem; }
+.health-heading .button { margin-left: auto; }
+.health-status { color: var(--ink-accent-muted); font-size: 0.75rem; }
+.health-status.attention { color: var(--ink-fault); }
+.channel-health p { margin: 6px 0 0; font-size: 0.76rem; line-height: 1.55; overflow-wrap: anywhere; }
+.health-explanation, .health-browser p { color: var(--muted); }
+.health-items { margin: 14px 0 0; padding: 0; list-style: none; }
+.health-item { padding: 12px 0; border-top: 1px solid var(--line); }
+.health-item-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.health-stage { color: var(--ink-tertiary); font-size: 0.65rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.health-label { color: var(--muted); font-size: 0.68rem; }
+.health-item h3 { margin: 6px 0 0; font-size: 0.84rem; font-weight: 600; }
+.health-next { color: var(--ink-accent-muted); }
+.health-technical, .health-more { margin-top: 10px; color: var(--muted); font-size: 0.73rem; }
+.channel-health summary { cursor: pointer; width: fit-content; padding: 4px 0; }
+.channel-health summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.health-browser { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+@media (max-width: 600px) {
+  .channel-health { padding: 16px; }
+  .health-heading { gap: 10px; }
+  .health-heading h2 { flex-basis: 100%; }
+}
+
 .standalone-player {
   min-height: 100vh;
   color: var(--ink);

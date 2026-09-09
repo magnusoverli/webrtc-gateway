@@ -41,6 +41,7 @@ import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./Cha
 import { ArrowLeftIcon, ChevronLeftIcon, ChevronRightIcon } from "./Icons";
 import { ModalShell } from "./Modal";
 import { DiagnosticsDialog } from "./DiagnosticsDialog";
+import { ChannelHealth } from "./ChannelHealth";
 import { ProjectsDialog } from "./ProjectsDialog";
 import { formatBitrate, inputModeLabel } from "./presentation";
 import { ToastProvider, useOptionalToast, useToast } from "./Toast";
@@ -1033,16 +1034,12 @@ function Dashboard() {
         </header>
 
         <div className="channel-notices" aria-label="Channel notices">
-          {selected?.applyState === "pending" && <ScopedNotice scope={`Channel · ${selected.name}`} message="Configuration changes are pending and the channel is not ready for playback yet." />}
-          {selected?.applyState === "error" && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Configuration saved but not applied: ${selected.applyError ?? "Channel apply failed"}`} />}
           {selected?.applyState === "deleting" && <ScopedNotice
             scope={`Channel · ${selected.name}`}
-            message={selected.applyError ? `Deletion is pending after cleanup failed: ${selected.applyError}` : "Deletion is pending and will be retried automatically."}
+            message={selected.applyError ? "Deletion is pending after cleanup failed. Review channel diagnostics before retrying." : "Deletion is pending and will be retried automatically."}
             action={selected.applyError ? <button className="button secondary" type="button" disabled={deleting || statusStale} onClick={() => void deleteChannel(selected)}>{deleting ? "Retrying..." : "Retry deletion"}</button> : undefined}
           />}
           {selected && deleteError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Deletion failed: ${deleteError}`} />}
-          {selected?.enabled && selected.applyState !== "deleting" && selected.relay && (selected.relay.state === "retrying" || selected.relay.state === "stopped") && <ScopedNotice scope={`Channel · ${selected.name}`} message={`SRT listener is unavailable: ${selected.relay.lastError ?? "the relay process stopped"}. Gateway will retry automatically.`} />}
-          {selected?.issues.map((issue) => <ScopedNotice key={`${issue.source}:${issue.code}`} scope={`${issue.summary} · ${selected.name}`} message={issue.message} />)}
           {selected && previewSettingError && <ScopedNotice scope={`Channel · ${selected.name}`} message={`Preview was not updated: ${previewSettingError}`} />}
         </div>
         </>)}
@@ -1074,6 +1071,14 @@ function Dashboard() {
           </>
         ) : selected ? (
           <>
+            <ChannelHealth
+              key={selected.id}
+              channel={selected}
+              stale={statusStale}
+              mediaReachable={status?.media.reachable ?? false}
+              preview={preview}
+              onDiagnostics={() => setDiagnosticsTarget({ scope: "channel", channelID: selected.id, channelName: selected.name })}
+            />
             <section className="connection-grid" aria-label="Channel connections">
               <InputConnectionPanel
                 channel={selected}
@@ -1147,7 +1152,7 @@ function Dashboard() {
                   <p>{previewOfflineDetail(selected)}</p>
                 </div>}
                 {selected.automaticPreview && isLive && preview.state === "connecting" && <div className="preview-message overlay-message" role="status"><span className="preview-icon pulse">ICE</span><strong>Establishing WHEP session</strong><p>Gathering LAN candidates and waiting for media.</p></div>}
-                {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message" role="alert"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>{preview.error} Retrying automatically.</p></div>}
+                {selected.automaticPreview && isLive && preview.state === "error" && <div className="preview-message overlay-message error-message" role="alert"><span className="preview-icon">ERR</span><strong>Preview unavailable</strong><p>Retrying automatically. See Channel health for receiver guidance.</p></div>}
                 {selected.automaticPreview && isLive && preview.state === "playing" && preview.hasAudio && !preview.hasVideo && <div className="preview-message audio-message" role="status"><span className="preview-icon">AUD</span><strong>Audio-only stream</strong><p>Audio is playing without a video track.</p></div>}
               </div>
             </article>
@@ -1202,7 +1207,7 @@ function Dashboard() {
                   {selected.compatibility.state === "probing" && <p>Inspecting the incoming tracks and H264 frame structure.</p>}
                   {selected.compatibility.state === "starting" && selected.compatibility.worker.queued && <p>Waiting for compatibility worker capacity. Existing streams continue unaffected.</p>}
                   {selected.compatibility.state === "starting" && !selected.compatibility.worker.queued && <p>Starting an isolated H264/Opus compatibility output.</p>}
-                  {selected.compatibility.state === "error" && <p>{selected.compatibility.lastError ?? "Compatibility output is unavailable."}</p>}
+                  {selected.compatibility.state === "error" && <p>See Channel health for compatibility output guidance.</p>}
                   {selected.compatibility.state === "ready" && selected.compatibility.mode === "direct" && <p>Incoming tracks are routed directly without an FFmpeg worker.</p>}
                   {selected.compatibility.state === "ready" && selected.compatibility.mode === "transcoded" && <p>WebRTC output: {selected.outputTracks.map((track) => track.codec).join(" + ") || "H264 + Opus"}.</p>}
                   {selected.compatibility.state === "ready" && selected.compatibility.mode === "transcoded" && <p>For the lowest latency and CPU use, send progressive H264 Baseline, YUV420p, no B-frames, and Opus.</p>}
@@ -2498,10 +2503,7 @@ function previewTitle(state: WHEPPlayerState, automatic: boolean, live: boolean)
 function previewOfflineDetail(item: Channel) {
   if (item.applyState === "deleting") return "Channel cleanup is pending and will be retried automatically.";
   if (!item.enabled) return "This channel is disabled.";
-  if (item.applyState === "error") return item.applyError ?? "The channel configuration could not be applied.";
-  if (primaryChannelIssue(item)) return primaryChannelIssue(item)?.message ?? "The input was rejected.";
-  if (item.compatibility.state === "error") return item.compatibility.lastError ?? "A browser-compatible output is unavailable.";
-  if (item.relay?.state === "retrying" || item.relay?.state === "stopped") return item.relay.lastError ?? "The SRT listener process is unavailable.";
+  if (channelHasFault(item) || primaryChannelIssue(item)) return "See Channel health for the reported issue and next steps.";
   if (item.available && item.online) return "The encoder is connected and browser-compatible output is being prepared.";
   return "Preview starts automatically when output becomes ready.";
 }

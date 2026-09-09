@@ -63,8 +63,15 @@ export function useWHEPPlayer({
   const [hasVideo, setHasVideo] = useState(false);
   const [hasAudio, setHasAudio] = useState(false);
   const [audioTrack, setAudioTrack] = useState<MediaStreamTrack | null>(null);
+  const [statePath, setStatePath] = useState(whepPath);
 
   useEffect(() => {
+    setStatePath(whepPath);
+    setState("off");
+    setError("");
+    setStats(null);
+    setHasVideo(false);
+    setHasAudio(false);
     setAudioTrack(null);
     let disposed = false;
     let pageInactive = false;
@@ -405,6 +412,10 @@ export function useWHEPPlayer({
     };
   }, [collectStats, enabled, random, retry, whepPath]);
 
+  // Do not expose the previous channel's receiver evidence before effect cleanup runs.
+  if (!enabled || statePath !== whepPath) return {
+    videoRef, state: "off" as const, error: "", stats: null, hasVideo: false, hasAudio: false, audioTrack: null,
+  };
   return { videoRef, state, error, stats, hasVideo, hasAudio, audioTrack };
 }
 

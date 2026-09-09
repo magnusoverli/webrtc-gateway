@@ -263,8 +263,51 @@ describe("dashboard navigation", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(statusWith([item]))));
     render(<App />);
 
-    expect(await screen.findByText("Matroska header is invalid")).toBeDefined();
+    expect(await screen.findByText("Input format rejected")).toBeDefined();
+    expect(screen.queryByText("Matroska header is invalid")).toBeNull();
     expect(screen.getByText("Input rejected", { selector: ".state-pill" })).toBeDefined();
+  });
+
+  it("refreshes health from existing runtime polls without retaining cleared issues or leaking across navigation", async () => {
+    vi.useFakeTimers();
+    const item = channelWithMode("srt-pull");
+    item.relay = { state: "retrying", restarts: 2, lastError: "srt://user:secret@host?passphrase=hidden", listenerActive: false };
+    const other = { ...channelWithMode("srt-push"), id: "other", number: 2, name: "Other" };
+    const full = statusWith([item, other]);
+    const recovered = runtimeChannel(item, {
+      available: true, online: true, outputReady: true,
+      relay: { state: "running", restarts: 2, listenerActive: false },
+      compatibility: { state: "ready", required: false, reasons: [], worker: { running: false, restarts: 0 } },
+    });
+    let fail = false;
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/api/v1/status") return Promise.resolve(jsonResponse(full));
+      if (String(input) === "/api/v1/status/runtime") return fail
+        ? Promise.reject(new Error("offline"))
+        : Promise.resolve(jsonResponse(runtimeStatus(full, [recovered, runtimeChannel(other)])));
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    window.history.replaceState(null, "", `/?channel=${item.id}`);
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByRole("region", { name: "Channel health" }).textContent).toContain("Input relay is retrying");
+    expect(document.body.textContent).not.toContain("passphrase=hidden");
+    fireEvent.click(screen.getByRole("button", { name: "Next channel" }));
+    expect(screen.getByRole("region", { name: "Channel health" }).textContent).not.toContain("Input relay is retrying");
+    fireEvent.click(screen.getByRole("button", { name: "Previous channel" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    const health = within(screen.getByRole("region", { name: "Channel health" }));
+    expect(health.getByText("Output ready")).toBeDefined();
+    expect(health.queryByText("Input relay is retrying")).toBeNull();
+    expect(health.queryByText(/Recovered/)).toBeNull();
+    fail = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(health.getByText("Status stale")).toBeDefined();
+    expect(health.queryByText("Output ready")).toBeNull();
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "/api/v1/status", "/api/v1/status/runtime", "/api/v1/status/runtime",
+    ]);
   });
 
   it("shows nominal input frame rate when track properties omit it", async () => {
