@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   channelHasFault,
@@ -21,7 +21,7 @@ import { ModalShell } from "./Modal";
 import { HelpTip } from "./Tooltip";
 import { readMultiviewOrder, writeMultiviewOrder, readMultiviewSizes, writeMultiviewSizes } from "./uiPreferences";
 import { TileResizer } from "./TileResizer";
-import { clampTileSize, defaultTileSize, packMultiview, sameTileFootprint, type TileSize, type TilePlacement } from "./multiviewLayout";
+import { clampTileSize, defaultTileSize, packMultiview, reflowMultiview, multiviewColumnCount, sameTileFootprint, type TileSize, type TilePlacement } from "./multiviewLayout";
 import { AudioMeter, useAudioMeterContext } from "./AudioMeter";
 
 export type StandaloneRoute =
@@ -132,6 +132,8 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
   const [destination, setDestination] = useState("");
   const [announcement, setAnnouncement] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
+  const [gridMetrics, setGridMetrics] = useState({ width: 0, gap: 10 });
+  const columns = multiviewColumnCount(gridMetrics.width, gridMetrics.gap);
   const pointerRef = useRef<{ pointerID: number; id: string; x: number; y: number; offsetX: number; offsetY: number; handle: HTMLButtonElement; pageIDs: string[]; active: boolean; target: string | null; snapshot: DragSnapshot | null; cleanup: () => void } | null>(null);
   const layoutRef = useRef(new Map<HTMLElement, DOMRect>());
   const animationsRef = useRef(new Set<Animation>());
@@ -162,9 +164,32 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
     const start = ids.indexOf(visibleIDs[0]);
     previewOrder.splice(start, visibleIDs.length, ...previewIDs);
   }
-  const previewPlacements = new Map(packMultiview(previewOrder, effectiveSizes).map((tile) => [tile.id, tile]));
+  const previewPlacements = new Map(reflowMultiview(packMultiview(previewOrder, effectiveSizes), columns).map((tile) => [tile.id, tile]));
+  const visiblePlacements = [...previewPlacements.values()].filter((tile) => tile.page === currentPage);
+  const rows = Math.max(columns === 4 ? 3 : 1, ...visiblePlacements.map((tile) => tile.row + Math.ceil(tile.rows)));
   const movingChannel = moveID ? byID.get(moveID) : undefined;
-  const reorderHelp = "Drag a tile by its title bar until more than half the preview overlaps another tile to displace it. Drop with the preview center inside a tile, or point at a page button to move pages. Click the title bar to choose a position. The reset button works independently of dragging. Drag an edge to resize smoothly, or a visible corner grip to resize width and height together. The 4-column, 3-row grid reserves space for each tile; overflow moves to the next page. Focus an edge or corner and use arrow keys for small size adjustments, or Shift+arrow for a whole cell. Reset size restores 1 × 1. Double-click the video or press Enter on a focused video for fullscreen; Escape exits. Order and sizes are saved in this browser. Only the visible page plays.";
+  const reorderHelp = "Drag a tile by its title bar until more than half the preview overlaps another tile to displace it. Drop with the preview center inside a tile, or point at a page button to move pages. Click the title bar to choose a position. Drag an edge or corner to resize, or focus it and use arrow keys (Shift for whole cells). Narrow windows reflow into fewer columns with vertical scrolling, keeping the same channels on each page. Saved sizes return when space allows. Reset size restores 1 × 1. Double-click the video or press Enter for fullscreen; Escape exits. Order and sizes are saved in this browser. Only the visible page plays.";
+
+  useLayoutEffect(() => {
+    const grid = rootRef.current?.querySelector<HTMLElement>(".multiview-grid");
+    if (!grid) return;
+    const measure = () => {
+      const width = grid.clientWidth;
+      if (!width) return;
+      const gap = parseFloat(getComputedStyle(grid).columnGap) || 10;
+      setGridMetrics((previous) => previous.width === width && previous.gap === gap ? previous : { width, gap });
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(grid);
+    window.addEventListener("resize", measure);
+    return () => { observer?.disconnect(); window.removeEventListener("resize", measure); };
+  }, []);
+
+  useLayoutEffect(() => {
+    const viewport = rootRef.current?.querySelector<HTMLElement>(".multiview-scroll");
+    if (viewport) viewport.scrollTop = 0;
+  }, [currentPage]);
 
   useEffect(() => {
     // Reconcile only definitive snapshots, never the initial empty loading state.
@@ -231,8 +256,13 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
   useEffect(() => {
     const motion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
     const reduceMotion = () => { if (motion?.matches) stopAnimations(); };
+    const resized = () => {
+      if (pointerRef.current) cancelPointer();
+      else stopAnimations();
+    };
     motion?.addEventListener("change", reduceMotion);
-    return () => { motion?.removeEventListener("change", reduceMotion); };
+    window.addEventListener("resize", resized);
+    return () => { motion?.removeEventListener("change", reduceMotion); window.removeEventListener("resize", resized); };
   }, []);
 
   useEffect(() => {
@@ -428,7 +458,10 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
           </div>
         </div>
         <p id="multiview-help" className="visually-hidden">{reorderHelp}</p>
-        <section className="multiview-grid" aria-label={`Channels on page ${currentPage + 1}`} hidden={ids.length === 0}>
+        <div className="multiview-scroll" hidden={ids.length === 0}>
+        <section className="multiview-grid" data-columns={columns} aria-label={`Channels on page ${currentPage + 1}`} hidden={ids.length === 0}
+          style={{ "--multiview-columns": columns, "--multiview-rows": rows,
+            "--multiview-row-min": `${gridMetrics.width ? (gridMetrics.width - gridMetrics.gap * (columns - 1)) / columns * 9 / 16 + 46 : 0}px` } as CSSProperties}>
           {renderedIDs.map((id) => {
             const channel = byID.get(id)!;
             const placement = previewPlacements.get(id)!;
@@ -471,6 +504,7 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
             } />;
           })}
         </section>
+        </div>
         {ids.length === 0 && <div className="multiview-empty">{loaded ? "Create a channel in Signal Desk. It will appear here automatically." : "Reading live output status."}</div>}
         <div className="visually-hidden" role="status">{announcement}</div>
       </div>
@@ -479,7 +513,7 @@ export function MultiviewGrid({ channels, loaded, summary }: { channels: Channel
         <header className="editor-header"><h2 id="move-channel-title">Move {movingChannel.name}</h2></header>
         <div className="editor-body"><label className="field">Destination position
           <select value={destination} onChange={(event) => setDestination(event.target.value)}>
-             {placements.map((tile) => <option key={tile.id} value={tile.id}>Page {tile.page + 1}, position {tile.row * 4 + tile.column + 1} - {byID.get(tile.id)?.name}</option>)}
+              {reflowMultiview(placements, columns).map((tile) => <option key={tile.id} value={tile.id}>Page {tile.page + 1}, position {tile.row * columns + tile.column + 1} - {byID.get(tile.id)?.name}</option>)}
           </select>
         </label></div>
         <footer className="editor-footer"><button className="button secondary" type="button" onClick={() => setMoveID(null)}>Cancel</button>

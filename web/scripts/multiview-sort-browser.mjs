@@ -3,7 +3,9 @@
 // Run from web with PLAYWRIGHT_MODULE set if Playwright is installed elsewhere.
 // Set SORT_SCREENSHOTS to an existing directory to retain before/during/after PNGs.
 // SORT_SIX_ONLY=1 runs the five-live/one-offline motion regression only;
-// SORT_HEADED=1 and SORT_VIEWPORT=desktop|mobile|short narrow native diagnostics.
+// SORT_HEADED=1 and SORT_VIEWPORT=desktop|touch narrow native diagnostics.
+// This suite exercises full-page sorting/resizing; narrow/short reflow and touch
+// scrolling are covered separately by multiview-responsive-browser.mjs.
 import assert from "node:assert/strict";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createServer } from "vite";
@@ -30,7 +32,7 @@ const results = [];
 try {
   await server.listen();
   browser = await chromium.launch({ channel: process.env.CHROME_CHANNEL || "chrome", headless: process.env.SORT_HEADED !== "1" });
-  for (const [name, width, height, touch] of [["desktop", 1440, 900, false], ["mobile", 390, 844, true], ["short", 1280, 420, false]]) {
+  for (const [name, width, height, touch] of [["desktop", 1440, 900, false], ["touch", 1280, 900, true]]) {
     if (process.env.SORT_VIEWPORT && process.env.SORT_VIEWPORT !== name) continue;
     const context = await browser.newContext({ viewport: { width, height }, isMobile: touch, hasTouch: touch, reducedMotion: "no-preference" });
     const page = await context.newPage();

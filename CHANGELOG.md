@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Made multiview tiles reflow into fewer columns on narrow windows, preserving video proportions, page membership, and saved sizes.
 - Added per-channel On/Off switches to overview grid cards and list rows to enable or disable Gateway ingest without opening configuration.
 - Replaced overview video previews with input addresses and concise configuration/status cards; playback remains available in channel details and multiview.
 - Removed the manual Enable meters control; multiview audio analysis now starts and resumes automatically, using normal page interactions when required by the browser.

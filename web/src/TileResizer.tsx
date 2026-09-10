@@ -12,7 +12,7 @@ export function TileResizer({ children, nodeRef, name, size, disabled, onStart, 
   children: ReactElement; nodeRef: RefObject<HTMLElement | null>; name: string; size: TileSize; disabled: boolean;
   onStart: () => boolean; onChange: (size: TileSize) => void; onCommit: (size: TileSize) => void; onCancel: () => void; onKeyboardResize: (size: TileSize) => void;
 }) {
-  const [metrics, setMetrics] = useState({ stepX: 1, stepY: 1, gapX: 0, gapY: 0 });
+  const [metrics, setMetrics] = useState({ stepX: 1, stepY: 1, gapX: 0, gapY: 0, columns: 4 });
   const [handlesEnabled, setHandlesEnabled] = useState(true);
   const active = useRef(false);
   const callbacks = useRef({ onCancel });
@@ -35,7 +35,9 @@ export function TileResizer({ children, nodeRef, name, size, disabled, onStart, 
       const rect = grid.getBoundingClientRect(), style = getComputedStyle(grid);
       if (!rect.width || !rect.height) return;
       const gapX = parseFloat(style.columnGap) || 0, gapY = parseFloat(style.rowGap) || 0;
-      setMetrics({ stepX: (rect.width + gapX) / 4, stepY: (rect.height + gapY) / 3, gapX, gapY });
+      const columns = Number(grid.dataset.columns) || 4;
+      const rowHeight = parseFloat(style.gridTemplateRows);
+      setMetrics({ stepX: (rect.width + gapX) / columns, stepY: Number.isFinite(rowHeight) ? rowHeight + gapY : (rect.height + gapY) / 3, gapX, gapY, columns });
     };
     measure();
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
@@ -64,7 +66,7 @@ export function TileResizer({ children, nodeRef, name, size, disabled, onStart, 
   });
   return <Resizable width={size.columns * metrics.stepX - metrics.gapX} height={size.rows * metrics.stepY - metrics.gapY}
     minConstraints={[metrics.stepX - metrics.gapX, metrics.stepY - metrics.gapY]}
-    maxConstraints={[4 * metrics.stepX - metrics.gapX, 3 * metrics.stepY - metrics.gapY]}
+    maxConstraints={[metrics.columns * metrics.stepX - metrics.gapX, 3 * metrics.stepY - metrics.gapY]}
     resizeHandles={handlesEnabled && !disabled ? handles : []}
     draggableOpts={{ disabled }}
     onResizeStart={() => { active.current = onStart(); }}
@@ -83,6 +85,6 @@ export function TileResizer({ children, nodeRef, name, size, disabled, onStart, 
         if (!x && !y) return;
         event.preventDefault();
         const step = event.shiftKey ? 1 : 0.1;
-        onKeyboardResize(clampTileSize({ columns: size.columns + x * step * (axis.includes("w") ? -1 : 1), rows: size.rows + y * step * (axis.includes("n") ? -1 : 1) }));
+        onKeyboardResize(clampTileSize({ columns: Math.min(metrics.columns, size.columns + x * step * (axis.includes("w") ? -1 : 1)), rows: size.rows + y * step * (axis.includes("n") ? -1 : 1) }));
       }}>{axis.length === 1 && <span className={`react-resizable-handle react-resizable-handle-${axis}`} aria-hidden="true" />}</span>}>{children}</Resizable>;
 }

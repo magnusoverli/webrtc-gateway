@@ -1,8 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { clampTileSize, packMultiview } from "./multiviewLayout";
+import { clampTileSize, packMultiview, reflowMultiview, multiviewColumnCount } from "./multiviewLayout";
 
 describe("multiview cell packing", () => {
   const ids = Array.from({ length: 25 }, (_, i) => String(i));
+
+  it("uses a readable minimum width to choose one through four columns", () => {
+    expect([390, 650, 1000, 1440].map((width) => multiviewColumnCount(width))).toEqual([1, 2, 3, 4]);
+    expect(multiviewColumnCount(0)).toBe(4);
+  });
+
+  it.each([1, 2, 3])("reflows %i columns without changing pages or saved sizes", (columns) => {
+    const saved = { "0": { columns: 2.5, rows: 1.2 }, "10": { columns: 4, rows: 2 } };
+    const original = packMultiview(ids, saved);
+    const tiles = reflowMultiview(original, columns);
+    expect(tiles.map(({ id, page }) => ({ id, page }))).toEqual(original.map(({ id, page }) => ({ id, page })));
+    expect(tiles[0].columns).toBe(Math.min(columns, 2.5));
+    const cells = new Set<string>();
+    for (const tile of tiles) {
+      expect(tile.column + Math.ceil(tile.columns)).toBeLessThanOrEqual(columns);
+      for (let y = tile.row; y < tile.row + Math.ceil(tile.rows); y++) for (let x = tile.column; x < tile.column + Math.ceil(tile.columns); x++) {
+        const key = `${tile.page}:${x}:${y}`;
+        expect(cells.has(key)).toBe(false);
+        cells.add(key);
+      }
+    }
+    expect(saved["0"]).toEqual({ columns: 2.5, rows: 1.2 });
+    expect(reflowMultiview(original, 4)).toEqual(original);
+  });
 
   it("retains the original twelve-tile pages at default size", () => {
     const tiles = packMultiview(ids, {});

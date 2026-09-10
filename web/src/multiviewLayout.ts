@@ -3,6 +3,31 @@ export type TilePlacement = TileSize & { id: string; page: number; column: numbe
 export type TileSizes = Record<string, TileSize>;
 export const defaultTileSize: TileSize = { columns: 1, rows: 1 };
 
+export function multiviewColumnCount(width: number, gap = 10): number {
+  return width > 0 ? Math.max(1, Math.min(4, Math.floor((width + gap) / (280 + gap)))) : 4;
+}
+
+// Responsive presentation never changes saved sizes, ordering, or page membership.
+export function reflowMultiview(placements: TilePlacement[], columns: number): TilePlacement[] {
+  columns = Math.max(1, Math.min(4, Math.floor(columns)));
+  if (columns === 4) return placements;
+  const occupied = new Map<number, Set<number>>();
+  return placements.map((tile) => {
+    const cells = occupied.get(tile.page) ?? new Set<number>();
+    occupied.set(tile.page, cells);
+    const width = Math.min(columns, tile.columns);
+    for (let row = 0; ; row++) {
+      for (let column = 0; column <= columns - Math.ceil(width); column++) {
+        const footprint = Array.from({ length: Math.ceil(tile.rows) }, (_, y) =>
+          Array.from({ length: Math.ceil(width) }, (_, x) => (row + y) * columns + column + x)).flat();
+        if (footprint.some((cell) => cells.has(cell))) continue;
+        footprint.forEach((cell) => cells.add(cell));
+        return { ...tile, columns: width, column, row };
+      }
+    }
+  });
+}
+
 export function sameTileFootprint(a: TileSize, b: TileSize): boolean {
   return Math.ceil(a.columns) === Math.ceil(b.columns) && Math.ceil(a.rows) === Math.ceil(b.rows);
 }
