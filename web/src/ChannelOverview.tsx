@@ -19,6 +19,8 @@ type Props = {
   onLayoutChange: (layout: OverviewLayout) => void;
   onSelect: (id: string) => void;
   onEdit: (item: Channel) => void;
+  onSetEnabled: (item: Channel, enabled: boolean) => void;
+  pendingEnabled?: { id: string; enabled: boolean } | null;
   onCreate: () => void;
   onShowLinks: () => void;
   onRetry: () => void;
@@ -42,16 +44,22 @@ export function ChannelOverview({
   onLayoutChange,
   onSelect,
   onEdit,
+  onSetEnabled,
+  pendingEnabled,
   onCreate,
   onShowLinks,
   onRetry,
   mutationsDisabled = false,
   headingRef,
 }: Props) {
-  const cardActionsRef = useRef({ channels, onSelect, onEdit });
+  const cardActionsRef = useRef({ channels, onSelect, onEdit, onSetEnabled });
   useLayoutEffect(() => {
-    cardActionsRef.current = { channels, onSelect, onEdit };
-  }, [channels, onEdit, onSelect]);
+    cardActionsRef.current = { channels, onSelect, onEdit, onSetEnabled };
+  }, [channels, onEdit, onSelect, onSetEnabled]);
+  const setCardEnabled = useCallback((id: string, enabled: boolean) => {
+    const item = cardActionsRef.current.channels.find((channel) => channel.id === id);
+    if (item) cardActionsRef.current.onSetEnabled(item, enabled);
+  }, []);
   const selectCard = useCallback((id: string) => cardActionsRef.current.onSelect(id), []);
   const editCard = useCallback((id: string) => {
     const item = cardActionsRef.current.channels.find((channel) => channel.id === id);
@@ -175,6 +183,8 @@ export function ChannelOverview({
               mutationsDisabled={mutationsDisabled}
               onSelect={selectCard}
               onEdit={editCard}
+              onSetEnabled={setCardEnabled}
+              pendingEnabled={pendingEnabled?.id === item.id ? pendingEnabled.enabled : undefined}
             />;
           })}
         </div>
@@ -191,9 +201,13 @@ type OverviewCardProps = {
   mutationsDisabled: boolean;
   onSelect: (id: string) => void;
   onEdit: (id: string) => void;
+  onSetEnabled: (id: string, enabled: boolean) => void;
+  pendingEnabled?: boolean;
 };
 
-const OverviewCard = memo(function OverviewCard({ item, tone, rate, stale, mutationsDisabled, onSelect, onEdit }: OverviewCardProps) {
+const OverviewCard = memo(function OverviewCard({ item, tone, rate, stale, mutationsDisabled, onSelect, onEdit, onSetEnabled, pendingEnabled }: OverviewCardProps) {
+  const enabled = pendingEnabled ?? item.enabled;
+  const pending = pendingEnabled !== undefined;
   const transcoding = item.compatibility.mode === "transcoded";
   const routeLabel = transcoding ? "Transcoding" : "Passthrough";
   const routeActive = item.compatibility.state === "ready" && item.outputReady && (!transcoding || item.compatibility.worker.running);
@@ -206,7 +220,7 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, stale, mutat
       <div className="overview-card-head">
         <span className={tone === "idle" ? "signal" : `signal ${tone === "live" ? "online" : tone}`} />
         <div className="overview-card-title">
-          <strong>{item.name}</strong>
+          <strong title={item.name}>{item.name}</strong>
           <div className="overview-card-meta">
             <small>{inputModeLabel(item.input.mode)}</small>
             {tone !== "idle" && <span
@@ -233,6 +247,21 @@ const OverviewCard = memo(function OverviewCard({ item, tone, rate, stale, mutat
         <div><span>Viewers</span><strong>{item.outputReady ? item.readerCount : "—"}</strong></div>
       </div>
       <div className="overview-card-foot">
+        <button
+          type="button"
+          role="switch"
+          className="overview-channel-switch"
+          aria-checked={enabled}
+          aria-busy={pending}
+          aria-label={`${enabled ? "Disable" : "Enable"} ${item.name}`}
+          title="Enable or disable channel ingest on the Gateway; the upstream encoder is not controlled."
+          disabled={mutationsDisabled || stale || pending || item.applyState === "pending" || item.applyState === "deleting"}
+          onClick={(event) => { event.stopPropagation(); onSetEnabled(item.id, !enabled); }}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <span className="overview-switch-track" aria-hidden="true" />
+          <span>{pending ? enabled ? "Enabling…" : "Disabling…" : enabled ? "On" : "Off"}</span>
+        </button>
         <span
           className={`overview-state tone-${tone}`}
           aria-label={stale ? "Status stale" : channelStateLabel(item)}
@@ -254,6 +283,8 @@ function sameOverviewCardProps(previous: OverviewCardProps, next: OverviewCardPr
     previous.mutationsDisabled === next.mutationsDisabled &&
     previous.onSelect === next.onSelect &&
     previous.onEdit === next.onEdit &&
+    previous.onSetEnabled === next.onSetEnabled &&
+    previous.pendingEnabled === next.pendingEnabled &&
     previous.rate?.inputBitrateBps === next.rate?.inputBitrateBps &&
     previous.rate?.outputBitrateBps === next.rate?.outputBitrateBps &&
     previousItem.id === nextItem.id &&

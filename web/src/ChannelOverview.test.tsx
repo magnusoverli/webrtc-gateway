@@ -36,6 +36,39 @@ afterEach(() => {
 });
 
 describe("ChannelOverview", () => {
+  it.each(["grid", "list"] as const)("toggles saved configuration independently of online state in %s without navigating", async (layout) => {
+    const onSetEnabled = vi.fn();
+    const onSelect = vi.fn();
+    const onEdit = vi.fn();
+    const idle = channel("sparse-7", "Waiting", "idle");
+    const disabled = { ...channel("sparse-42", "Disabled", "idle"), enabled: false };
+    renderOverview({ layout, channels: [idle, disabled], onSetEnabled, onSelect, onEdit });
+    const user = userEvent.setup();
+    const on = screen.getByRole("switch", { name: "Disable Waiting" });
+    expect(on.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("switch", { name: "Enable Disabled" }).getAttribute("aria-checked")).toBe("false");
+    await user.click(on);
+    expect(onSetEnabled).toHaveBeenLastCalledWith(idle, false);
+    screen.getByRole("switch", { name: "Enable Disabled" }).focus();
+    await user.keyboard("{Enter}");
+    expect(onSetEnabled).toHaveBeenLastCalledWith(disabled, true);
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onEdit).not.toHaveBeenCalled();
+  });
+
+  it("locks stale, applying, deleting and pending switches, but allows configuration error recovery", () => {
+    const idle = channel("idle", "Idle", "idle");
+    const view = renderOverview({ channels: [idle], pendingEnabled: { id: idle.id, enabled: false } });
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("switch").getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(true);
+    for (const overrides of [{ error: "offline" }, { mutationsDisabled: true }, { channels: [{ ...idle, applyState: "pending" as const }] }, { channels: [{ ...idle, applyState: "deleting" as const }] }]) {
+      view.rerender(overview({ channels: [idle], ...overrides }));
+      expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(true);
+    }
+    view.rerender(overview({ channels: [{ ...idle, applyState: "error" }] }));
+    expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(false);
+  });
   it.each([0, 1])("offers same-tab multiview navigation beside links and embeds with %i channels", (count) => {
     renderOverview({ channels: count ? [channel("studio", "Studio", "idle")] : [] });
     const link = screen.getByRole("link", { name: "Open multiviewer" });
@@ -299,6 +332,8 @@ type Overrides = Partial<{
   onLayoutChange: (layout: OverviewLayout) => void;
   onSelect: (id: string) => void;
   onEdit: (item: Channel) => void;
+  onSetEnabled: (item: Channel, enabled: boolean) => void;
+  pendingEnabled: { id: string; enabled: boolean } | null;
   onCreate: () => void;
   onRetry: () => void;
   mutationsDisabled: boolean;
@@ -323,6 +358,7 @@ function overview(overrides: Overrides = {}) {
       onLayoutChange={() => undefined}
       onSelect={() => undefined}
       onEdit={() => undefined}
+      onSetEnabled={() => undefined}
       onCreate={() => undefined}
       onShowLinks={() => undefined}
       onRetry={() => undefined}

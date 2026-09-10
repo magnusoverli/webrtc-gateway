@@ -55,7 +55,7 @@ The `--no-build --pull never` options guarantee that deployment uses only the tr
 ### Operator Workflow
 
 1. Create a channel and select its input mode. **SRT push** is the simplest option for encoders that accept a destination IP and port.
-2. Open a channel from the overview. Its detail workspace shows encoder connection details, listener state, stable output links, and an optional muted WebRTC preview.
+2. Use each overview card or list row’s On/Off switch to enable or disable channel ingest on the Gateway. On means enabled even while waiting for input; switching Off stops Gateway processing, not the upstream encoder. Open a channel for its detail workspace, with encoder connection details, listener state, stable output links, and an optional muted WebRTC preview.
 3. Use the copy controls for the encoder URL, destination IP and port, passphrase, direct stream-ID URL, viewer URL, iframe snippet, or WHEP endpoint. Values that do not apply to the channel input show `-`.
 4. Send the stable multiview URL to LAN users or copy the channel's embed URL or iframe snippet into another LAN application. Embed URLs use the channel number and do not change when that channel is renamed or switches between direct and compatibility output.
 
@@ -307,7 +307,7 @@ Channel configuration and global settings are stored in the `gateway-state` Dock
 
 Open **Global settings** in the UI to configure management/media interfaces, transport ports, timeouts, UDP buffering, WebRTC host discovery, the RTP channel port range, status polling, and default viewer limits. Changes to media transport settings cause MediaMTX and per-channel inputs to restart their listeners and briefly interrupt active channels. Management interface changes require a Gateway restart. Application-only changes, including the per-channel automatic-preview preference, and Gateway restarts skip the MediaMTX patch when its effective configuration is already current.
 
-Full settings and channel replacements use their current revision with `If-Match`, so a stale editor is rejected instead of overwriting newer state. The automatic-preview toggle uses a narrow `PATCH` request rather than sending a full channel configuration.
+Full settings and channel replacements use their current revision with `If-Match`, so a stale editor is rejected instead of overwriting newer state. The automatic-preview and overview On/Off toggles use narrow `PATCH` requests (`{"automaticPreview": boolean}` or `{"enabled": boolean}`) rather than sending a full channel configuration. Overview switches also send `If-Match` and are unavailable while status is stale, an update is in flight, or the channel is applying or deleting.
 
 Fresh deployments use a cabled-LAN profile: five-second media I/O timeouts, a 512-packet writer queue, a 4 MiB UDP receive buffer, 1452-byte UDP payloads, 20 ms per-channel SRT latency, and a default maximum of 16 readers for new channels. A value of zero still explicitly selects unlimited readers. Persisted channel latency settings and existing per-channel viewer limits are not silently overwritten during upgrades.
 

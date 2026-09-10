@@ -333,6 +333,7 @@ type projectNameRequest struct {
 
 type channelPatchRequest struct {
 	AutomaticPreview *bool `json:"automaticPreview"`
+	Enabled          *bool `json:"enabled"`
 }
 
 type diagnosticsResponse struct {
@@ -1389,15 +1390,34 @@ func (s *server) patchChannel(id string, w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if request.AutomaticPreview == nil {
-		writeError(w, http.StatusBadRequest, "automaticPreview is required")
+	if (request.AutomaticPreview == nil) == (request.Enabled == nil) {
+		writeError(w, http.StatusBadRequest, "exactly one of automaticPreview or enabled is required")
 		return
 	}
 	expectedRevision, ok := optionalIfMatch(w, r)
 	if !ok {
 		return
 	}
-	item, err := s.channels.UpdateAutomaticPreview(r.Context(), id, *request.AutomaticPreview, expectedRevision)
+	var item channel.Channel
+	var err error
+	if request.Enabled != nil {
+		// Build the draft from server-owned configuration, never the redacted UI view.
+		// UpdateExpected guards the read/update gap and uses the normal media apply path.
+		item, err = s.channels.Get(r.Context(), id)
+		if err == nil {
+			revision := item.Revision
+			if expectedRevision != nil {
+				revision = *expectedRevision
+			}
+			item, err = s.channels.UpdateExpected(r.Context(), id, channel.Draft{
+				Name: item.Name, Enabled: *request.Enabled, Input: item.Input,
+				PreserveAutomaticPreview: true, PreserveUseAbsoluteTimestamp: true,
+				PassphraseIntent: channel.PassphraseKeep, MaxReaders: item.MaxReaders,
+			}, revision)
+		}
+	} else {
+		item, err = s.channels.UpdateAutomaticPreview(r.Context(), id, *request.AutomaticPreview, expectedRevision)
+	}
 	if err != nil {
 		writeServiceError(w, err)
 		return

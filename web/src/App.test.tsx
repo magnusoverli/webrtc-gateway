@@ -161,6 +161,117 @@ describe("dashboard navigation", () => {
     expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it.each(["grid", "list"])("PATCHes only enabled by ID in %s, locks duplicates and retains the saved response when polling fails", async (layout) => {
+    let item = { ...channelWithMode("srt-pull"), id: "sparse-source-42", number: 42 };
+    let finish!: (response: Response) => void;
+    let patched = false;
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        patched = true;
+        return new Promise<Response>((resolve) => { finish = resolve; });
+      }
+      return Promise.resolve(patched ? jsonResponse({ error: "poll failed" }, 503) : jsonResponse(statusWith([item])));
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    const toggle = await screen.findByRole("switch", { name: "Disable Studio" });
+    if (layout === "list") await userEvent.click(screen.getByRole("button", { name: "List view" }));
+    fireEvent.click(toggle);
+    fireEvent.click(toggle);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(1);
+    const [url, init] = fetch.mock.calls.find(([, init]) => init?.method === "PATCH")!;
+    expect(url).toBe("/api/v1/channels/sparse-source-42");
+    expect(JSON.parse(init!.body as string)).toEqual({ enabled: false });
+    expect(init!.headers).toMatchObject({ "If-Match": '"1"' });
+    expect(screen.getByRole("switch").getAttribute("aria-busy")).toBe("true");
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(window.location.search).toBe("");
+    item = { ...item, enabled: false, revision: 2 };
+    await act(async () => finish(jsonResponse(item)));
+    await screen.findByText(/Showing last known channel state/);
+    expect(screen.getByRole("switch", { name: "Enable Studio" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText("Studio: disabled.")).toBeDefined();
+  });
+
+  it.each([false, true])("restores saved enabled=%s and reports a rejected toggle", async (enabled) => {
+    const item = { ...channelWithMode("srt-push"), enabled };
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) => Promise.resolve(
+      init?.method === "PATCH" ? jsonResponse({ error: "Channel is busy" }, 409) : jsonResponse(statusWith([item])),
+    )));
+    render(<App />);
+    await userEvent.click(await screen.findByRole("switch"));
+    await screen.findByText("Channel is busy");
+    await waitFor(() => expect(screen.getByRole("switch").getAttribute("aria-busy")).toBe("false"));
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe(String(enabled));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("keeps saved configuration and reports an apply failure instead of claiming ingest started", async () => {
+    let item = { ...channelWithMode("srt-push"), enabled: false };
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        expect(JSON.parse(init.body as string)).toEqual({ enabled: true });
+        item = { ...item, enabled: true, revision: 2, applyState: "error", applyError: "Listener port unavailable" };
+        return Promise.resolve(jsonResponse(item));
+      }
+      return Promise.resolve(jsonResponse(statusWith([item])));
+    }));
+    render(<App />);
+    await userEvent.click(await screen.findByRole("switch", { name: "Enable Studio" }));
+    await screen.findByText("Channel setting saved, but configuration was not applied: Listener port unavailable");
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByLabelText("Configuration error").textContent).toBe("Config error");
+    expect(screen.queryByText("Studio: enabled.")).toBeNull();
+  });
+
+  it("blocks switches after a revision conflict until a fresh snapshot arrives", async () => {
+    const item = channelWithMode("srt-push");
+    let rejected = false;
+    let refresh!: (response: Response) => void;
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        rejected = true;
+        return Promise.resolve(jsonResponse({ error: "stale" }, 412));
+      }
+      if (rejected) return new Promise<Response>((resolve) => { refresh = resolve; });
+      return Promise.resolve(jsonResponse(statusWith([item])));
+    }));
+    render(<App />);
+    await userEvent.click(await screen.findByRole("switch"));
+    await screen.findByText("The channel changed before the update could be saved. Current status is being refreshed; try again afterward.");
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(true);
+    await act(async () => refresh(jsonResponse(statusWith([{ ...item, revision: 2, enabled: false }]))));
+    await waitFor(() => expect(screen.getByRole("switch").hasAttribute("disabled")).toBe(false));
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("ignores a pre-mutation poll that resolves after the toggle response", async () => {
+    vi.useFakeTimers();
+    const item = channelWithMode("srt-push");
+    const saved = { ...item, enabled: false, revision: 2 };
+    const full = statusWith([item]);
+    let resolvePoll!: (response: Response) => void;
+    let fullReads = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") return Promise.resolve(jsonResponse(saved));
+      if (String(input).endsWith("/runtime")) return new Promise<Response>((resolve) => { resolvePoll = resolve; });
+      if (++fullReads === 1) return Promise.resolve(jsonResponse(full));
+      // Leave the post-save refresh unresolved to expose any stale poll overwrite.
+      return new Promise<Response>(() => undefined);
+    }));
+    render(<App />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { fireEvent.click(screen.getByRole("switch")); });
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+    await act(async () => resolvePoll(jsonResponse(runtimeStatus(full, [runtimeChannel(item)]))));
+    expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("switch").getAttribute("aria-busy")).toBe("false");
+  });
+
   it("shares every channel and the multiview from the overview using the active management address", async () => {
     const user = userEvent.setup();
     const writeText = vi.fn().mockResolvedValue(undefined);

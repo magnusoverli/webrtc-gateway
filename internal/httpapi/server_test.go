@@ -1360,6 +1360,54 @@ func TestChannelAutomaticPreviewPatchPreservesConfigurationAndApplyState(t *test
 	}
 }
 
+func TestChannelEnabledPatchPreservesConfigurationAndAppliesMedia(t *testing.T) {
+	store, err := channel.OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	media := &countingPathManager{}
+	service := channel.NewService(store, media, nil, nil, nil)
+	item, err := service.Create(context.Background(), channel.Draft{
+		Name: "Toggle target", Enabled: true, AutomaticPreview: true, MaxReaders: 8,
+		Input: channel.Input{Mode: channel.InputSRTPull, SRT: &channel.SRTInput{
+			Host: "source.local", Port: 9000, StreamID: "camera", Passphrase: "0123456789", LatencyMS: 200,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, fakeMediaMTX{}, service, "http://127.0.0.1:1")
+	patch := func(body, revision string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/channels/"+item.ID, strings.NewReader(body))
+		req.Header.Set("If-Match", revision)
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+	for index, enabled := range []bool{false, true} {
+		res := patch(fmt.Sprintf(`{"enabled":%t}`, enabled), fmt.Sprintf(`"%d"`, index+1))
+		loaded, err := service.Get(context.Background(), item.ID)
+		if res.Code != http.StatusOK || err != nil || loaded.Enabled != enabled || loaded.Revision != index+2 ||
+			loaded.Name != item.Name || loaded.Path != item.Path || loaded.Number != item.Number ||
+			!loaded.AutomaticPreview || loaded.UseAbsoluteTimestamp || loaded.MaxReaders != 8 ||
+			loaded.Input.SRT.Passphrase != "0123456789" || loaded.Input.SRT.StreamID != "camera" ||
+			loaded.Input.SRT.Host != "source.local" || loaded.Input.SRT.LatencyMS != 200 {
+			t.Fatalf("toggle response %d %s, channel %#v, error %v", res.Code, res.Body.String(), loaded, err)
+		}
+	}
+	if media.deletions != 1 || media.replacements != 2 {
+		t.Fatalf("media apply: deletions %d, replacements %d", media.deletions, media.replacements)
+	}
+	if res := patch(`{"enabled":false}`, `"1"`); res.Code != http.StatusPreconditionFailed {
+		t.Fatalf("stale PATCH = %d %s", res.Code, res.Body.String())
+	}
+	if media.deletions != 1 {
+		t.Fatal("stale PATCH changed media")
+	}
+}
+
 func TestOutputReadyRequiresEnabledAppliedChannel(t *testing.T) {
 	runtime := mediamtx.Channel{Available: true, Online: true}
 	compatibilityState := compatibility.State{State: compatibility.StateReady, Reasons: []string{}}

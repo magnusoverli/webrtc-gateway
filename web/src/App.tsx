@@ -229,6 +229,8 @@ function Dashboard() {
   const [formError, setFormError] = useState("");
   const [formConflict, setFormConflict] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [pendingEnabled, setPendingEnabled] = useState<{ id: string; enabled: boolean } | null>(null);
+  const enabledMutationRef = useRef(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
   const [settingsRevision, setSettingsRevision] = useState<number | null>(null);
   const [settingsError, setSettingsError] = useState("");
@@ -374,6 +376,7 @@ function Dashboard() {
     selected.applyState === "applied" && !selected.outputReady,
   );
   const statusStale = Boolean(status && statusError);
+  const mutationsBlocked = statusStale || Boolean(pendingEnabled);
   const selectedRates = selected ? streamRates[selected.id] : undefined;
   const selectedFault = Boolean(selected && channelHasFault(selected));
   const inputLive = Boolean(selected?.available && selected.online);
@@ -529,7 +532,7 @@ function Dashboard() {
   };
 
   const openCreate = () => {
-    if (statusStale) return;
+    if (statusStale || enabledMutationRef.current) return;
     setEditingID(null);
     setEditingRevision(null);
     setForm(emptyForm(status?.settings, nextSRTListenPort(status)));
@@ -544,7 +547,7 @@ function Dashboard() {
   };
 
   const restartGateway = async () => {
-    if (!status?.gateway.restartRequired || restarting || statusStale) return;
+    if (!status?.gateway.restartRequired || restarting || statusStale || enabledMutationRef.current) return;
     const desiredAddress = status.network.management.resolvedAddress ?? resolveInterfaceBinding(status.settings.managementBindAddress, status.network.interfaces);
     if (!desiredAddress) {
       setRestartError(status.network.management.resolutionError ?? "The selected interface has no usable address");
@@ -586,7 +589,7 @@ function Dashboard() {
   };
 
   const openEdit = (item: Channel, allowStale = false) => {
-    if (statusStale && !allowStale) return;
+    if ((statusStale && !allowStale) || enabledMutationRef.current) return;
     const next = emptyForm(status?.settings, nextSRTListenPort(status));
     next.name = item.name;
     next.enabled = item.enabled;
@@ -617,7 +620,7 @@ function Dashboard() {
   };
 
   const openSettings = () => {
-    if (!status || statusStale) return;
+    if (!status || statusStale || enabledMutationRef.current) return;
     const { revision, applyState: _applyState, applyError: _applyError, updatedAt: _updatedAt, ...editable } = status.settings;
     setSettingsRevision(revision);
     setSettingsForm({ ...editable, webRTCAdditionalHosts: status.settings.webRTCAdditionalHosts.join(", ") });
@@ -631,7 +634,7 @@ function Dashboard() {
   };
 
   const saveSettings = async () => {
-    if (!settingsForm || settingsRevision === null || statusStale) return;
+    if (!settingsForm || settingsRevision === null || statusStale || enabledMutationRef.current) return;
     setSaving(true);
     setSettingsError("");
     setSettingsConflict(false);
@@ -682,8 +685,52 @@ function Dashboard() {
     }
   };
 
+  const updateChannelEnabled = async (item: Channel, enabled: boolean) => {
+    const current = statusRef.current?.channels.find((channel) => channel.id === item.id);
+    if (!current || statusStale || enabledMutationRef.current || saving || deleting || restarting || previewSavingIDs.size ||
+      current.applyState === "pending" || current.applyState === "deleting" || current.enabled === enabled) return;
+    enabledMutationRef.current = true;
+    setPendingEnabled({ id: current.id, enabled });
+    try {
+      const { response, body } = await requestAPI(`/api/v1/channels/${encodeURIComponent(current.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "If-Match": quoteRevision(current.revision) },
+        body: JSON.stringify({ enabled }),
+      });
+      if (response.status === 412) throw new APIRequestError(412, "The channel changed before the update could be saved. Current status is being refreshed; try again afterward.");
+      if (!response.ok) throw new APIRequestError(response.status, apiErrorMessage(body, response.status, "Channel update failed"));
+      const saved = readChannelSnapshot(body);
+      if (!saved || saved.id !== current.id) throw new Error("Gateway returned malformed channel data");
+      statusMutationGenerationRef.current += 1;
+      const snapshot = statusRef.current;
+      if (snapshot) {
+        const next = { ...snapshot, channels: snapshot.channels.map((channel) => channel.id === saved.id && channel.revision <= saved.revision ? saved : channel) };
+        statusRef.current = next;
+        setStatus(next);
+      }
+      showToast({
+        kind: saved.applyState === "error" ? "error" : "success",
+        message: saved.applyState === "error"
+          ? `Channel setting saved, but configuration was not applied: ${saved.applyError || "apply failed"}`
+          : `${current.name}: ${saved.enabled ? "enabled" : "disabled"}${saved.applyState === "pending" ? " (applying)" : ""}.`,
+      });
+    } catch (error) {
+      const message = isRequestTimeoutError(error)
+        ? "The channel update timed out. Its outcome is indeterminate; current status is being refreshed."
+        : error instanceof Error ? error.message : "Unable to update channel";
+      // A pre-update poll cannot establish freshness after a conflict or uncertain outcome.
+      statusMutationGenerationRef.current += 1;
+      if (!(error instanceof APIRequestError) || error.status === 412) setStatusError("Channel status must be refreshed after the update");
+      showToast({ kind: "error", message });
+    } finally {
+      enabledMutationRef.current = false;
+      setPendingEnabled(null);
+      refreshStatus();
+    }
+  };
+
   const updateAutomaticPreview = async (item: Channel, automaticPreview: boolean) => {
-    if (statusStale || previewSavingIDs.has(item.id)) return;
+    if (statusStale || enabledMutationRef.current || previewSavingIDs.has(item.id)) return;
     setPreviewSavingIDs((current) => new Set(current).add(item.id));
     setPreviewSettingError("");
     try {
@@ -761,7 +808,7 @@ function Dashboard() {
   };
 
   const saveChannel = async () => {
-    if (!form || statusStale || (editingID !== null && editingRevision === null)) return;
+    if (!form || statusStale || enabledMutationRef.current || (editingID !== null && editingRevision === null)) return;
     setSaving(true);
     setFormError("");
     setFormConflict(false);
@@ -813,7 +860,7 @@ function Dashboard() {
   };
 
   const deleteChannel = async (item: Channel) => {
-    if (statusStale || deleting) return;
+    if (statusStale || deleting || enabledMutationRef.current) return;
     setDeleteError("");
     setDeleting(true);
     try {
@@ -947,7 +994,7 @@ function Dashboard() {
             onClick={() => showOverview()}
           >Overview</button>
           <button className={projectsOpen ? "topnav-link active" : "topnav-link"} type="button" aria-current={projectsOpen ? "page" : undefined} aria-haspopup="dialog" onClick={() => setProjectsOpen(true)}>Projects</button>
-          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} aria-haspopup="dialog" onClick={openSettings} disabled={!status || statusStale} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
+          <button className={settingsForm ? "topnav-link active" : "topnav-link"} type="button" aria-current={settingsForm ? "page" : undefined} aria-haspopup="dialog" onClick={openSettings} disabled={!status || mutationsBlocked} title={`Global settings - ${gatewaySettingsState}`}>Settings</button>
         </nav>
 
         <button
@@ -981,7 +1028,7 @@ function Dashboard() {
                   </p>
                 </div>
                 {status.gateway.restartRequired && (
-                  <button className="button restart-button" type="button" disabled={restarting || statusStale || Boolean(status.network.management.resolutionError)} onClick={() => void restartGateway()}>
+                  <button className="button restart-button" type="button" disabled={restarting || mutationsBlocked || Boolean(status.network.management.resolutionError)} onClick={() => void restartGateway()}>
                     {restarting ? "Restarting..." : "Restart Gateway"}
                   </button>
                 )}
@@ -1012,11 +1059,11 @@ function Dashboard() {
           <div className="topbar-actions">
             {selected && (confirmingDelete ? <div className="inline-confirm" role="group" aria-label="Confirm channel deletion">
               <span>Disconnect viewers and delete?</span>
-              <button ref={confirmDeleteRef} className="button danger" type="button" disabled={deleting || statusStale} onClick={() => void deleteChannel(selected)}>{deleting ? "Deleting..." : "Confirm delete"}</button>
+              <button ref={confirmDeleteRef} className="button danger" type="button" disabled={deleting || mutationsBlocked} onClick={() => void deleteChannel(selected)}>{deleting ? "Deleting..." : "Confirm delete"}</button>
               <button className="button secondary" type="button" disabled={deleting} onClick={cancelDeleteConfirmation}>Cancel</button>
             </div> : <>
-              <button ref={deleteButtonRef} className="button danger ghost-danger" type="button" disabled={selected.applyState === "deleting" || statusStale} onClick={() => setConfirmingDelete(true)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete"}</button>
-              <button className="button secondary" type="button" disabled={selected.applyState === "deleting" || statusStale} onClick={() => openEdit(selected)}>Configure</button>
+              <button ref={deleteButtonRef} className="button danger ghost-danger" type="button" disabled={selected.applyState === "deleting" || mutationsBlocked} onClick={() => setConfirmingDelete(true)}>{selected.applyState === "deleting" ? "Deletion pending" : "Delete"}</button>
+              <button className="button secondary" type="button" disabled={selected.applyState === "deleting" || mutationsBlocked} onClick={() => openEdit(selected)}>Configure</button>
             </>)}
             {status && !selected && <button className="button secondary" type="button" onClick={status.channels.length ? undefined : openCreate} disabled={status.channels.length > 0 || statusStale}>Create channel</button>}
             {selected ? <button
@@ -1062,7 +1109,9 @@ function Dashboard() {
               onCreate={openCreate}
               onShowLinks={() => setLinksOpen(true)}
               onRetry={refreshStatus}
-              mutationsDisabled={statusStale}
+              mutationsDisabled={mutationsBlocked || saving || deleting || restarting || previewSavingIDs.size > 0}
+              pendingEnabled={pendingEnabled}
+              onSetEnabled={(item, enabled) => void updateChannelEnabled(item, enabled)}
               headingRef={overviewHeadingRef}
             />
             <ResourceFooter resources={status?.resources} disconnected={Boolean(statusError)} />
@@ -1130,7 +1179,7 @@ function Dashboard() {
                     {...tooltip}
                     className={selected.automaticPreview ? "toggle active" : "toggle"}
                     type="button"
-                    disabled={previewSavingIDs.has(selected.id) || selected.applyState === "deleting" || statusStale}
+                    disabled={previewSavingIDs.has(selected.id) || selected.applyState === "deleting" || mutationsBlocked}
                     aria-label={selected.automaticPreview ? "Disable preview" : "Enable preview"}
                     aria-pressed={selected.automaticPreview}
                     onClick={() => void updateAutomaticPreview(selected, !selected.automaticPreview)}
@@ -1261,7 +1310,7 @@ function Dashboard() {
           error={formError}
           conflict={formConflict}
           saving={saving}
-          mutationBlocked={statusStale}
+          mutationBlocked={mutationsBlocked}
           onChange={changeChannelForm}
           onClose={() => setForm(null)}
           onSave={() => void saveChannel()}
@@ -1278,7 +1327,7 @@ function Dashboard() {
           error={settingsError}
           conflict={settingsConflict}
           saving={saving}
-          mutationBlocked={statusStale}
+          mutationBlocked={mutationsBlocked}
           onChange={setSettingsForm}
           onClose={() => setSettingsForm(null)}
           onSave={() => void saveSettings()}
@@ -1317,7 +1366,7 @@ function Dashboard() {
       {diagnosticsTarget?.scope === "system" && <DiagnosticsDialog scope="system" onClose={() => setDiagnosticsTarget(null)} />}
       {diagnosticsTarget?.scope === "channel" && <DiagnosticsDialog scope="channel" channelID={diagnosticsTarget.channelID} channelName={diagnosticsTarget.channelName} onClose={() => setDiagnosticsTarget(null)} />}
       {projectsOpen && <ProjectsDialog
-        mutationBlocked={!status || statusStale}
+        mutationBlocked={!status || mutationsBlocked}
         onClose={() => setProjectsOpen(false)}
         onLoadIndeterminate={refreshStatus}
         onLoaded={(result) => {

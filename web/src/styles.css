@@ -2885,6 +2885,33 @@ button.state-pill { cursor: pointer; }
   pointer-events: auto;
 }
 
+.overview-channel-switch {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  min-height: 32px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.overview-channel-switch:disabled { cursor: default; opacity: .55; }
+.overview-switch-track { width: 26px; height: 16px; padding: 3px; border-radius: 9px; background: var(--muted); }
+.overview-switch-track::after { content: ""; display: block; width: 10px; height: 10px; border-radius: 50%; background: var(--page); }
+.overview-channel-switch[aria-checked="true"] .overview-switch-track { background: var(--accent); }
+.overview-channel-switch[aria-checked="true"] .overview-switch-track::after { transform: translateX(10px); }
+.overview-card-foot { gap: 8px; flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .overview-list .overview-card { grid-template-columns: minmax(0, 1fr); }
+  .overview-list .overview-card-foot { grid-row: 4; grid-column: 1; }
+}
+
 .preview-stage {
   min-height: 0;
   aspect-ratio: 21 / 9;
