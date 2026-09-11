@@ -503,9 +503,9 @@ describe("dashboard navigation", () => {
     expect(fetch.mock.calls.map(([input]) => String(input))).toEqual(["/api/v1/status", "/api/v1/status/runtime"]);
   });
 
-  it("polls compact runtime status every 500ms while an automatic detail preview waits for playback", async () => {
+  it.each([false, true])("polls detail runtime every 500ms for recovery, outputReady=%s", async (outputReady) => {
     vi.useFakeTimers();
-    const item = { ...channelWithMode("srt-push"), automaticPreview: true, outputReady: false };
+    const item = { ...channelWithMode("srt-push"), automaticPreview: true, outputReady };
     const full = statusWith([item]);
     const compact = runtimeStatus(full, [runtimeChannel(item)]);
     const fetch = vi.fn((input: RequestInfo | URL) => {
@@ -567,7 +567,6 @@ describe("dashboard navigation", () => {
 
   it.each([
     ["automatic preview is disabled", { automaticPreview: false, outputReady: false }],
-    ["playback is already ready", { automaticPreview: true, outputReady: true }],
     ["the channel is disabled", { automaticPreview: true, enabled: false, outputReady: false }],
     ["the channel failed to apply", { automaticPreview: true, applyState: "error" as const, outputReady: false }],
   ])("keeps the configured interval when %s", async (_condition, overrides) => {
@@ -745,6 +744,10 @@ describe("dashboard navigation", () => {
       if (url === "/api/v1/status") {
         statusReads += 1;
         return Promise.resolve(jsonResponse(statusWith([statusReads === 1 ? opened : latest])));
+      }
+      if (url === "/api/v1/status/runtime") {
+        const item = statusReads === 1 ? opened : latest;
+        return Promise.resolve(jsonResponse(runtimeStatus(statusWith([item]), [runtimeChannel(item)])));
       }
       if (url === `/api/v1/channels/${opened.id}` && method === "PUT") {
         return Promise.resolve(jsonResponse({ error: { code: "revision_conflict", message: "channel changed since it was read" } }, 412));

@@ -13,7 +13,7 @@ import {
   readChannelSnapshots,
   type Channel,
 } from "./channel";
-import { startSerialPolling } from "./polling";
+import { PLAYBACK_STATUS_INTERVAL_MS, startSerialPolling } from "./polling";
 import { requestJSON } from "./request";
 import { useWHEPPlayer } from "./useWHEPPlayer";
 import { ArrowLeftIcon } from "./Icons";
@@ -94,7 +94,7 @@ export function ChannelViewer() {
       }
     };
 
-    const stopPolling = startSerialPolling(load, 2_000);
+    const stopPolling = startSerialPolling(load, PLAYBACK_STATUS_INTERVAL_MS);
     return () => {
       disposed = true;
       stopPolling();
@@ -573,7 +573,7 @@ export function StandalonePlayer({ channelID }: { channelID: string }) {
       }
     };
 
-    const stopPolling = startSerialPolling(load, 2_000);
+    const stopPolling = startSerialPolling(load, PLAYBACK_STATUS_INTERVAL_MS);
     return () => {
       disposed = true;
       stopPolling();
@@ -644,6 +644,7 @@ function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, 
   const playable = channelPlaybackReady(channel);
   const player = useWHEPPlayer({
     whepPath: channel?.whepPath ?? "",
+    outputGeneration: channel?.outputGeneration,
     enabled: playable,
     retry: true,
   });
@@ -731,6 +732,7 @@ function MultiviewTile({ channel, audioContext, moveHandle, position, dragging, 
 function EmbeddedVideo({ channel }: { channel: Channel | null }) {
   const player = useWHEPPlayer({
     whepPath: channel?.whepPath ?? "",
+    outputGeneration: channel?.outputGeneration,
     enabled: channelPlaybackReady(channel),
     retry: true,
   });

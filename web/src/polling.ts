@@ -1,3 +1,7 @@
+// Bound restart discovery for visible players, including an outage that occurs
+// entirely between polls. This remains one shared serial request per surface.
+export const PLAYBACK_STATUS_INTERVAL_MS = 500;
+
 export type PollResult = {
   status: "success" | "failure" | "aborted";
   failureCount: number;

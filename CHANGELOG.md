@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Reduced SRT interruption recovery delays with generation-aware players, stalled-video recovery, fast retries, and earlier validated input discovery.
 - Made multiview tiles reflow into fewer columns on narrow windows, preserving video proportions, page membership, and saved sizes.
 - Added per-channel On/Off switches to overview grid cards and list rows to enable or disable Gateway ingest without opening configuration.
 - Replaced overview video previews with input addresses and concise configuration/status cards; playback remains available in channel details and multiview.

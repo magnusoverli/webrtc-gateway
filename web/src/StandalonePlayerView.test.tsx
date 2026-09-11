@@ -13,13 +13,13 @@ const playerHarness = vi.hoisted(() => ({
 vi.mock("./useWHEPPlayer", async () => {
   const React = await vi.importActual<typeof import("react")>("react");
   return {
-    useWHEPPlayer: (options: { whepPath: string; enabled: boolean }) => {
+    useWHEPPlayer: (options: { whepPath: string; enabled: boolean; outputGeneration?: string }) => {
       playerHarness.calls(options);
       React.useEffect(() => {
         if (!options.enabled) return;
         playerHarness.started.push(options.whepPath);
         return () => { playerHarness.stopped.push(options.whepPath); };
-      }, [options.enabled, options.whepPath]);
+      }, [options.enabled, options.whepPath, options.outputGeneration]);
       return {
         videoRef: { current: null },
         state: "playing",
@@ -104,7 +104,7 @@ describe("ChannelViewer", () => {
     render(<ChannelViewer />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
 
     expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
     expect(screen.getByRole("alert").textContent).toContain("network down");
@@ -132,7 +132,7 @@ describe("ChannelViewer", () => {
     render(<ChannelViewer />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByRole("heading", { name: "Studio A" })).toBeDefined();
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
 
     expect(screen.getByRole("heading", { name: "Studio A Remote" })).toBeDefined();
     expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
@@ -158,6 +158,25 @@ describe("ChannelViewer", () => {
 
     view.rerender(<MultiviewGrid channels={[{ ...south, outputReady: false }]} loaded />);
     expect(playerHarness.stopped).toEqual([north.whepPath, south.whepPath]);
+  });
+
+  it.each(["multiview", "embed"])("passes new output generations to a ready %s player within 500ms", async (surface) => {
+    vi.useFakeTimers();
+    const channel = fixtureChannel("studio-a", 7, "Studio A", true);
+    const runtime = { ...runtimeFor(channel), outputGeneration: "restarted:direct", outputAvailableTime: "restarted" };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => ({
+      ok: true, status: 200,
+      json: async () => surface === "embed"
+        ? (String(input).endsWith("/runtime") ? runtime : channel)
+        : { channels: [String(input).endsWith("/runtime") ? runtime : channel] },
+    })));
+    render(surface === "embed" ? <StandalonePlayer channelID="7" /> : <ChannelViewer />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(playerHarness.started).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(playerHarness.stopped).toEqual([channel.whepPath]);
+    expect(playerHarness.started).toHaveLength(2);
+    expect(playerHarness.calls).toHaveBeenLastCalledWith(expect.objectContaining({ outputGeneration: "restarted:direct", enabled: true }));
   });
 
   describe("resizable multiview", () => {
@@ -1051,7 +1070,7 @@ describe("ChannelViewer", () => {
     render(<StandalonePlayer channelID="7" />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     expect(screen.getByLabelText("Studio A embedded video")).toBeDefined();
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
 
     expect(screen.getByLabelText("Embedded channel video")).toBeDefined();
     expect(playerHarness.stopped).toEqual([channel.whepPath]);
@@ -1087,9 +1106,9 @@ describe("ChannelViewer", () => {
 
     render(<StandalonePlayer channelID="7" />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     expect(screen.getByLabelText("Embedded channel video")).toBeDefined();
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
 
     expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
       "/api/v1/channels/7",
@@ -1157,11 +1176,13 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
     viewerPath: "/view",
     embedPath: `/embed/${number}`,
     available: outputReady,
+    availableTime: outputReady ? "input" : undefined,
     online: outputReady,
     inputGeneration: outputReady ? "input:" : ":",
     inboundBytes: 0,
     outputInboundBytes: 0,
     outputGeneration: outputReady ? "output:direct" : ":direct",
+    outputAvailableTime: outputReady ? "output" : undefined,
     outboundBytes: 0,
     inboundFramesInError: 0,
     readers: [],

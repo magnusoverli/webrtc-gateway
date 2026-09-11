@@ -131,6 +131,84 @@ func TestTSDiscoveryBounds(t *testing.T) {
 	}
 }
 
+func TestTSEarlyDiscoveryRetainsBytesArrivingDuringProbe(t *testing.T) {
+	input, output := io.Pipe()
+	defer input.Close()
+	defer output.Close()
+	buffer := &tsStartup{buffer: []byte("initial"), pipe: output}
+	started := time.Now()
+	calls := 0
+	_, replay, err := discoverTS(context.Background(), buffer, make(chan struct{}), func(_ context.Context, snapshot []byte) ([]tsStream, error) {
+		calls++
+		if string(snapshot) != "initial" {
+			t.Fatalf("snapshot = %q", snapshot)
+		}
+		_, _ = buffer.Write([]byte("during-probe"))
+		return parseTSStreams(discoveryReport([]tsStream{{ID: "0x100", CodecType: "video", CodecName: "h264"}}))
+	})
+	if err != nil || calls != 1 || string(replay) != "initialduring-probe" || buffer.sink != output {
+		t.Fatalf("early discovery = %q, %v (%d calls)", replay, err, calls)
+	}
+	if time.Since(started) >= tsDiscoveryWindow {
+		t.Fatal("complete early discovery still waited for the full window")
+	}
+}
+
+func TestTSEarlyDiscoveryFallsBackWithoutDroppingDelayedTracks(t *testing.T) {
+	video := tsStream{ID: "0x100", CodecType: "video", CodecName: "h264"}
+	audio := tsStream{Index: 1, ID: "0x101", CodecType: "audio", CodecName: "s302m", Channels: 2, SampleRate: "48000"}
+	buffer := &tsStartup{buffer: []byte("initial")}
+	calls := 0
+	started := time.Now()
+	streams, replay, err := discoverTS(context.Background(), buffer, make(chan struct{}), func(_ context.Context, snapshot []byte) ([]tsStream, error) {
+		calls++
+		if calls == 1 {
+			_, _ = buffer.Write([]byte("late-audio"))
+			return parseTSStreams(bytes.Replace(discoveryReport([]tsStream{video}), []byte(`"nb_streams":1`), []byte(`"nb_streams":2`), 1))
+		}
+		if time.Since(started) < tsDiscoveryWindow || string(snapshot) != "initiallate-audio" {
+			t.Fatal("fallback did not take a fresh full-window snapshot")
+		}
+		return parseTSStreams(discoveryReport([]tsStream{video, audio}))
+	})
+	if err != nil || calls != 2 || len(streams) != 2 || streams[1] != audio || string(replay) != "initiallate-audio" {
+		t.Fatalf("fallback discovery = %v, %q, %v (%d calls)", streams, replay, err, calls)
+	}
+}
+
+func TestTSEarlyProbeTimeoutLeavesBudgetForFallback(t *testing.T) {
+	calls := 0
+	_, _, err := discoverTS(context.Background(), &tsStartup{}, make(chan struct{}), func(ctx context.Context, _ []byte) ([]tsStream, error) {
+		calls++
+		if calls == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		if ctx.Err() != nil {
+			t.Fatal("early timeout canceled full probe")
+		}
+		return []tsStream{{ID: "0x100", CodecName: "h264", CodecType: "video"}}, nil
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("discovery = %v (%d calls)", err, calls)
+	}
+}
+
+func TestTSInputEndCancelsInFlightDiscoveryWithoutFallback(t *testing.T) {
+	done := make(chan struct{})
+	buffer := &tsStartup{buffer: []byte("retained")}
+	calls := 0
+	_, replay, err := discoverTS(context.Background(), buffer, done, func(ctx context.Context, _ []byte) ([]tsStream, error) {
+		calls++
+		close(done)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) || calls != 1 || replay != nil || buffer.sink != nil || string(buffer.buffer) != "retained" {
+		t.Fatalf("canceled discovery = %q, %v (%d calls)", replay, err, calls)
+	}
+}
+
 // Runs with the same Alpine FFmpeg as the deployed image; no live source needed.
 func TestSelective302MFFmpeg(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {

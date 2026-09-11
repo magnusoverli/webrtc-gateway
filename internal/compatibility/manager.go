@@ -26,7 +26,8 @@ const pathPrefix = "compat-"
 var codecNormalizer = strings.NewReplacer(" ", "", "-", "", "_", "", "/", "")
 
 const (
-	metadataGrace        = 8 * time.Second
+	metadataGrace        = 500 * time.Millisecond
+	metadataProbeLimit   = 1500 * time.Millisecond
 	inputDiscoveryWindow = 3 * time.Second
 	probeRetryDelay      = 3 * time.Second
 	videoInspectionLimit = 4 * time.Second
@@ -649,8 +650,11 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 	defer task.cancel()
 	defer close(task.done)
 	probeURL := m.pathURL(path)
+	started := time.Now()
 	expectedVideoCodec, expectedVideoWidth, expectedVideoHeight, expectedVideoProfile := firstVideoTrack(tracks)
-	if normalizeCodec(expectedVideoCodec) == "h264" && !h264ProfileExcludesBFrames(expectedVideoProfile) {
+	// Missing MediaMTX properties need not block a complete current-stream
+	// FFprobe result. Known Main/High profiles still need structural inspection.
+	if normalizeCodec(expectedVideoCodec) == "h264" && expectedVideoProfile != "" && !h264ProfileExcludesBFrames(expectedVideoProfile) {
 		expectedVideoCodec = ""
 	}
 	var characteristics videoCharacteristics
@@ -685,6 +689,7 @@ func (m *Manager) runProbe(channelID, path, fingerprint string, task *probeTask,
 		return
 	}
 	current.classified = true
+	m.logger.Info("SRT compatibility inspection complete", "channel", channelID, "durationMs", time.Since(started).Milliseconds(), "transcodeVideo", result.transcodeVideo, "transcodeAudio", result.transcodeAudio)
 	current.decision = result
 	current.inputAudio = inputAudio
 	current.outputAudio = outputAudioMetadata(result, inputAudio)
@@ -1198,7 +1203,14 @@ func (m *Manager) probeVideoCharacteristics(ctx context.Context, sourceURL, expe
 	probeCtx, cancel := context.WithTimeout(ctx, videoInspectionLimit)
 	defer cancel()
 	if normalizeCodec(expectedCodec) == "h264" {
-		characteristics, err := m.probeH264StreamMetadata(probeCtx, sourceURL)
+		// Reserve most of the shared four-second budget for frame inspection if
+		// an encoder's headers are late, incomplete, or contradict the fast path.
+		metadataCtx, stopMetadata := context.WithTimeout(probeCtx, metadataProbeLimit)
+		characteristics, err := m.probeH264StreamMetadata(metadataCtx, sourceURL)
+		if err == nil {
+			err = metadataCtx.Err()
+		}
+		stopMetadata()
 		if err == nil && len(expectedDimensions) >= 2 && expectedDimensions[0] > 0 && expectedDimensions[1] > 0 &&
 			(characteristics.width != expectedDimensions[0] || characteristics.height != expectedDimensions[1]) {
 			err = fmt.Errorf("ffprobe H264 dimensions %dx%d differ from MediaMTX dimensions %dx%d",
@@ -1223,6 +1235,7 @@ func (m *Manager) probeVideoCharacteristics(ctx context.Context, sourceURL, expe
 func (m *Manager) probeH264StreamMetadata(ctx context.Context, sourceURL string) (videoCharacteristics, error) {
 	cmd := exec.CommandContext(ctx, m.ffprobe,
 		"-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+		"-probesize", "262144", "-analyzeduration", "200000",
 		"-show_streams",
 		"-show_entries", "stream=codec_name,profile,has_b_frames,pix_fmt,width,height,field_order,r_frame_rate,avg_frame_rate",
 		"-of", "json", sourceURL,

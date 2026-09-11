@@ -1453,6 +1453,57 @@ func TestProbeVideoCharacteristicsUsesH264StreamMetadataWithoutFrameScan(t *test
 	if got := readLines(t, calls); len(got) != 1 || !strings.Contains(got[0], "-show_streams") || strings.Contains(got[0], "-show_frames") {
 		t.Fatalf("ffprobe calls = %#v", got)
 	}
+	if got := readLines(t, calls)[0]; !strings.Contains(got, "-probesize 262144 -analyzeduration 200000") {
+		t.Fatalf("metadata probe is missing bounded low-analysis options: %s", got)
+	}
+}
+
+func TestSlowH264MetadataLeavesTimeForStructuralFallback(t *testing.T) {
+	directory := t.TempDir()
+	probe, calls := filepath.Join(directory, "ffprobe"), filepath.Join(directory, "calls")
+	frames := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":640,"height":480}],"frames":[{"pict_type":"I","interlaced_frame":0,"top_field_first":0}]}`
+	writeExecutable(t, probe, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+calls+"'\ncase \" $* \" in\n"+
+		"  *\"has_b_frames\"*) exec sleep 10 ;;\n  *) printf '%s' '"+frames+"' ;;\nesac\n")
+	manager := &Manager{ffprobe: probe}
+	started := time.Now()
+	result, err := manager.probeVideoCharacteristics(context.Background(), "rtsp://input/raw", "h264")
+	if err != nil || result.width != 640 {
+		t.Fatalf("fallback = %+v, %v", result, err)
+	}
+	if time.Since(started) >= videoInspectionLimit {
+		t.Fatal("metadata consumed the structural inspection budget")
+	}
+	assertMetadataThenFrameScan(t, readLines(t, calls))
+}
+
+func TestRecoveryInspectsCurrentMetadataWithoutWaitingForMediaMTXProperties(t *testing.T) {
+	clock := newTestClock()
+	manager := newProbeTestManager(t, clock, nil)
+	t.Cleanup(manager.Close)
+	directory := t.TempDir()
+	probe, calls := filepath.Join(directory, "ffprobe"), filepath.Join(directory, "calls")
+	metadata := `{"streams":[{"codec_name":"h264","profile":"Constrained Baseline","has_b_frames":0,"pix_fmt":"yuv420p","width":1280,"height":720,"field_order":"progressive"}]}`
+	frames := `{"streams":[{"codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080}],"frames":[{"pict_type":"B","interlaced_frame":0,"top_field_first":0}]}`
+	writeExecutable(t, probe, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+calls+"'\ncase \" $* \" in\n"+
+		"  *\"has_b_frames\"*) printf '%s' '"+metadata+"' ;;\n  *) printf '%s' '"+frames+"' ;;\nesac\n")
+	manager.ffprobe = probe
+	configured := srtChannel("channel", "raw")
+	raw := srtRuntime("first", []mediamtx.Track{{Codec: "H264"}})
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": raw})
+	clock.Advance(500 * time.Millisecond)
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": raw})
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateReady })
+	if state := manager.Snapshot(configured.ID); state.Mode != ModeDirect || state.InputVideo.Width != 1280 {
+		t.Fatalf("current Baseline metadata not used: %+v", state)
+	}
+	// A reconnect with High/B-frames must not reuse the previous direct decision.
+	raw = srtRuntime("second", []mediamtx.Track{{Codec: "H264", CodecProps: map[string]any{"profile": "High", "width": 1920, "height": 1080}}})
+	manager.reconcileChannel(context.Background(), configured, map[string]mediamtx.Channel{"raw": raw})
+	waitForState(t, manager, configured.ID, func(state State) bool { return state.State == StateStarting && state.Required })
+	if state := manager.Snapshot(configured.ID); state.Mode != ModeTranscoded || state.InputVideo.Width != 1920 {
+		t.Fatalf("new source reused stale metadata: %+v", state)
+	}
+	assertMetadataThenFrameScan(t, readLines(t, calls))
 }
 
 func TestProbeVideoCharacteristicsFallsBackForUntrustedH264Metadata(t *testing.T) {

@@ -34,7 +34,7 @@ import {
   type InputMode,
   type Track,
 } from "./channel";
-import { startSerialPolling } from "./polling";
+import { PLAYBACK_STATUS_INTERVAL_MS, startSerialPolling } from "./polling";
 import { isRequestTimeoutError, requestJSON, requestText, type BoundedRequestInit } from "./request";
 import { HelpTip, Tooltip } from "./Tooltip";
 import { ChannelOverview, type OverviewFilter, type OverviewLayout } from "./ChannelOverview";
@@ -356,7 +356,7 @@ function Dashboard() {
 
     const stopPolling = startSerialPolling(load, {
       intervalMs: () => document.visibilityState === "visible" && compactRuntimePollingRef.current
-        ? 500
+        ? PLAYBACK_STATUS_INTERVAL_MS
         : pollIntervalRef.current,
     });
     statusPollingRef.current = stopPolling;
@@ -373,7 +373,7 @@ function Dashboard() {
   selectedRevisionRef.current = selected ? { id: selected.id, revision: selected.revision } : null;
   const compactRuntimePolling = Boolean(
     view === "detail" && selected?.automaticPreview && selected.enabled &&
-    selected.applyState === "applied" && !selected.outputReady,
+    selected.applyState === "applied",
   );
   const statusStale = Boolean(status && statusError);
   const mutationsBlocked = statusStale || Boolean(pendingEnabled);
@@ -385,6 +385,7 @@ function Dashboard() {
   const hasOutput = Boolean(selected && hasOutputStream(selected));
   const preview = useWHEPPlayer({
     whepPath: selected?.whepPath ?? "",
+    outputGeneration: selected?.outputGeneration,
     enabled: Boolean(view === "detail" && selected?.automaticPreview && channelPlaybackReady(selected)),
     retry: true,
     collectStats: true,

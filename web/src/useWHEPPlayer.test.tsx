@@ -30,6 +30,42 @@ afterEach(async () => {
 });
 
 describe("useWHEPPlayer", () => {
+  it("replaces a ready session when its output generation changes without an offline poll", async () => {
+    const view = renderHook(({ generation }) => useWHEPPlayer({
+      whepPath: "/whep", outputGeneration: generation, enabled: true, retry: true, random: middleRandom,
+    }), { initialProps: { generation: "first" } });
+    await settle();
+    const first = MockPeer.instances[0];
+    view.rerender({ generation: "first" });
+    await settle();
+    expect(postCalls()).toHaveLength(1);
+    view.rerender({ generation: "second" });
+    await settle();
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(deleteCalls()).toHaveLength(1);
+    expect(postCalls()).toHaveLength(2);
+    expect(view.result.current.state).toBe("playing");
+  });
+
+  it("waits for old reader cleanup across generation changes and cancels superseded starts", async () => {
+    let finishDelete: ((value: Response) => void) | undefined;
+    fetchMock.mockImplementation(async (_input, init) => init?.method === "DELETE"
+      ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+      : response(201, "answer", "/sessions/one"));
+    const view = renderHook(({ generation }) => useWHEPPlayer({
+      whepPath: "/whep", outputGeneration: generation, enabled: true,
+    }), { initialProps: { generation: "first" } });
+    await settle();
+    view.rerender({ generation: "second" });
+    view.rerender({ generation: "third" });
+    await settle();
+    expect(postCalls()).toHaveLength(1);
+    finishDelete?.(response(204, ""));
+    await settle();
+    expect(postCalls()).toHaveLength(2);
+    expect(MockPeer.instances).toHaveLength(2);
+  });
+
   it.each(["peer", "transceiver"])("handles synchronous %s setup failure and retries cleanly", async (stage) => {
     let broken = true;
     class FailingPeer extends MockPeer {
@@ -47,7 +83,7 @@ describe("useWHEPPlayer", () => {
     expect(postCalls()).toHaveLength(0);
     if (stage === "transceiver") expect(MockPeer.instances[0].close).toHaveBeenCalledOnce();
     broken = false;
-    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
     expect(view.result.current.state).toBe("playing");
     expect(postCalls()).toHaveLength(1);
   });
@@ -240,7 +276,7 @@ describe("useWHEPPlayer", () => {
     await settle();
     expect(postCalls()).toHaveLength(1);
 
-    await act(async () => vi.advanceTimersByTimeAsync(999));
+    await act(async () => vi.advanceTimersByTimeAsync(249));
     expect(postCalls()).toHaveLength(1);
     await act(async () => vi.advanceTimersByTimeAsync(1));
     await settle();
@@ -249,7 +285,7 @@ describe("useWHEPPlayer", () => {
     await act(async () => vi.advanceTimersByTimeAsync(10_000));
     act(() => MockPeer.instances[1].setConnectionState("failed"));
     await settle();
-    await act(async () => vi.advanceTimersByTimeAsync(999));
+    await act(async () => vi.advanceTimersByTimeAsync(249));
     expect(postCalls()).toHaveLength(2);
     await act(async () => vi.advanceTimersByTimeAsync(1));
     await settle();
@@ -283,7 +319,98 @@ describe("useWHEPPlayer", () => {
 
     view.unmount();
   });
+
+  it("uses three fast retries, then backs off, and bypasses that backoff for a new generation", async () => {
+    fetchMock.mockResolvedValue(response(503, "output starting"));
+    const view = renderHook(({ generation }) => useWHEPPlayer({
+      whepPath: "/whep", outputGeneration: generation, enabled: true, retry: true, random: middleRandom,
+    }), { initialProps: { generation: "one" } });
+    await settle();
+    for (let count = 2; count <= 4; count++) {
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      expect(postCalls()).toHaveLength(count);
+    }
+    await act(async () => vi.advanceTimersByTimeAsync(999));
+    expect(postCalls()).toHaveLength(4);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(postCalls()).toHaveLength(5);
+    view.rerender({ generation: "two" });
+    await settle();
+    expect(postCalls()).toHaveLength(6);
+  });
+
+  it("recovers frozen video even while packets and audio continue on a connected peer", async () => {
+    let bytes = 100;
+    MockPeer.getStatsResult = async () => mediaReport(10, bytes += 100);
+    const view = renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true, random: middleRandom }));
+    await settle();
+    await act(async () => vi.advanceTimersByTimeAsync(1_999));
+    expect(postCalls()).toHaveLength(1);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(view.result.current.error).toContain("Video decoding stopped");
+    expect(MockPeer.instances[0].close).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(postCalls()).toHaveLength(2);
+  });
+
+  it("lets a short video gap recover without replacing the session", async () => {
+    let frames = 10;
+    MockPeer.getStatsResult = async () => mediaReport(frames, 100);
+    renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true }));
+    await settle();
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    frames++;
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(postCalls()).toHaveLength(1);
+    expect(MockPeer.instances[0].close).not.toHaveBeenCalled();
+  });
+
+  it("gives a new video decoder twelve seconds for its first frame", async () => {
+    MockPeer.getStatsResult = async () => mediaReport(0, 100);
+    const view = renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true, random: middleRandom }));
+    await settle();
+    await act(async () => vi.advanceTimersByTimeAsync(11_999));
+    expect(MockPeer.instances[0].close).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(view.result.current.error).toContain("Video decoding stopped");
+  });
+
+  it("monitors audio-only output without treating an empty video placeholder as a stalled decoder", async () => {
+    let bytes = 0;
+    MockPeer.getStatsResult = async () => mediaReport(undefined, bytes += 100);
+    renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true }));
+    await settle();
+    await act(async () => vi.advanceTimersByTimeAsync(15_000));
+    expect(postCalls()).toHaveLength(1);
+    MockPeer.getStatsResult = async () => mediaReport(undefined, bytes);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(MockPeer.instances[0].close).toHaveBeenCalledOnce();
+  });
+
+  it("resets watchdog evidence across visibility pauses and ignores stats failures", async () => {
+    MockPeer.getStatsResult = async () => mediaReport(10, 100);
+    renderHook(() => useWHEPPlayer({ whepPath: "/whep", enabled: true, retry: true }));
+    await settle();
+    act(() => setVisibility("hidden"));
+    const calls = MockPeer.instances[0].getStats.mock.calls.length;
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(MockPeer.instances[0].getStats).toHaveBeenCalledTimes(calls);
+    act(() => setVisibility("visible"));
+    await settle();
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    expect(MockPeer.instances[0].close).not.toHaveBeenCalled();
+    MockPeer.getStatsResult = async () => { throw new Error("stats unavailable"); };
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(MockPeer.instances[0].close).not.toHaveBeenCalled();
+  });
 });
+
+function mediaReport(frames: number | undefined, bytes: number): RTCStatsReport {
+  return new Map([
+    ["video", { id: "video", type: "inbound-rtp", kind: "video", framesDecoded: frames ?? 0, bytesReceived: frames === undefined ? 0 : bytes }],
+    ["audio", { id: "audio", type: "inbound-rtp", kind: "audio", bytesReceived: bytes }],
+  ]) as unknown as RTCStatsReport;
+}
 
 function middleRandom() {
   return 0.5;

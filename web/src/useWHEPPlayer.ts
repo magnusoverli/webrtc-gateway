@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { isRequestTimeoutError, requestText, requestWithDeadline } from "./request";
+import { MediaProgressWatchdog } from "./mediaHealth";
 import { preferOpusStereo, summarizeRTCStats, waitForICEGathering, type PreviewStats, type StatsSample } from "./webrtc";
 
 export type WHEPPlayerState = "off" | "connecting" | "playing" | "error";
 
 export type WHEPPlayerOptions = {
   whepPath: string;
+  outputGeneration?: string;
   enabled: boolean;
   retry?: boolean;
   collectStats?: boolean;
@@ -24,6 +26,8 @@ type WHEPSession = {
   statsRunning: boolean;
   statsPending: boolean;
   statsSample?: StatsSample;
+  mediaConnected: boolean;
+  mediaWatchdog: MediaProgressWatchdog;
 };
 
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
@@ -32,9 +36,12 @@ const CONNECTION_TIMEOUT_MS = 12_000;
 const DISCONNECTED_TIMEOUT_MS = 3_000;
 const STABLE_CONNECTION_MS = 10_000;
 const STATS_INTERVAL_MS = 1_000;
+const MEDIA_CHECK_INTERVAL_MS = 500;
 const HIDDEN_SESSION_GRACE_MS = 30_000;
 const CLEANUP_TIMEOUT_MS = 3_000;
 const REPLACEMENT_CLEANUP_WAIT_MS = 1_000;
+const FAST_RETRY_MS = 250;
+const FAST_RETRY_ATTEMPTS = 3;
 const RETRY_BASE_MS = 1_000;
 const RETRY_CAP_MS = 8_000;
 const RETRY_JITTER_RATIO = 0.2;
@@ -51,6 +58,7 @@ export function preferLowDelay(receiver: RTCRtpReceiver) {
 
 export function useWHEPPlayer({
   whepPath,
+  outputGeneration = "",
   enabled,
   retry = false,
   collectStats = false,
@@ -64,9 +72,14 @@ export function useWHEPPlayer({
   const [hasAudio, setHasAudio] = useState(false);
   const [audioTrack, setAudioTrack] = useState<MediaStreamTrack | null>(null);
   const [statePath, setStatePath] = useState(whepPath);
+  const [stateGeneration, setStateGeneration] = useState(outputGeneration);
+  // A generation change runs effect cleanup before starting its replacement.
+  // Keep DELETE coordination across effects, including rapid ready/offline edges.
+  const pendingCleanupRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     setStatePath(whepPath);
+    setStateGeneration(outputGeneration);
     setState("off");
     setError("");
     setStats(null);
@@ -76,7 +89,6 @@ export function useWHEPPlayer({
     let disposed = false;
     let pageInactive = false;
     let session: WHEPSession | null = null;
-    let pendingCleanup: Promise<void> | null = null;
     let retryTimer: number | undefined;
     let retryTimerKind: "retry" | "resume" | undefined;
     let hiddenTimer: number | undefined;
@@ -106,19 +118,21 @@ export function useWHEPPlayer({
       hiddenTimer = undefined;
     };
     const trackCleanup = (cleanup: Promise<void>) => {
-      pendingCleanup = cleanup;
-      void cleanup.finally(() => {
-        if (pendingCleanup === cleanup) pendingCleanup = null;
+      const previous = pendingCleanupRef.current;
+      const pending = previous ? Promise.all([previous, cleanup]).then(() => undefined) : cleanup;
+      pendingCleanupRef.current = pending;
+      void pending.finally(() => {
+        if (pendingCleanupRef.current === pending) pendingCleanupRef.current = null;
       });
     };
     const closeCurrent = (keepalive = false) => {
       const current = session;
       session = null;
-      if (!current) return pendingCleanup;
+      if (!current) return pendingCleanupRef.current;
       const cleanup = closeWHEPSession(current, { keepalive, retryDelete: !keepalive });
       trackCleanup(cleanup);
       clearMedia();
-      return cleanup;
+      return pendingCleanupRef.current;
     };
     const jitteredDelay = (baseMs: number) => {
       const unit = Math.min(1, Math.max(0, random()));
@@ -130,9 +144,9 @@ export function useWHEPPlayer({
         deferredStart = kind;
         return;
       }
-      const exponent = kind === "retry" ? Math.min(Math.max(0, retryCount - 1), 30) : 0;
+      const exponent = Math.min(Math.max(0, retryCount - FAST_RETRY_ATTEMPTS - 1), 30);
       const base = kind === "retry"
-        ? Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** exponent)
+        ? retryCount <= FAST_RETRY_ATTEMPTS ? FAST_RETRY_MS : Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** exponent)
         : RESUME_BASE_MS;
       retryTimerKind = kind;
       retryTimer = window.setTimeout(() => {
@@ -155,6 +169,10 @@ export function useWHEPPlayer({
     };
     const markConnected = (current: WHEPSession) => {
       if (disposed || session !== current) return;
+      if (!current.mediaConnected) {
+        current.mediaConnected = true;
+        current.mediaWatchdog.reset(performance.now());
+      }
       if (current.connectionTimer !== undefined) {
         window.clearTimeout(current.connectionTimer);
         current.connectionTimer = undefined;
@@ -172,10 +190,12 @@ export function useWHEPPlayer({
         window.clearTimeout(current.statsTimer);
         current.statsTimer = undefined;
       }
-      current.statsPending = collectStats;
+      current.statsPending = collectStats || retry;
+      current.mediaWatchdog.reset(performance.now());
+      current.statsSample = undefined;
     };
     const runStats = (current: WHEPSession) => {
-      if (!collectStats || disposed || session !== current || isPaused()) return;
+      if ((!collectStats && !retry) || disposed || session !== current || isPaused()) return;
       if (current.statsRunning) {
         current.statsPending = true;
         return;
@@ -190,18 +210,25 @@ export function useWHEPPlayer({
         try {
           const report = await current.peer.getStats();
           if (disposed || session !== current || isPaused()) return;
-          const result = summarizeRTCStats(report, current.statsSample);
-          current.statsSample = result.sample;
-          setStats(result.stats);
+          if (retry && current.mediaConnected && current.peer.connectionState === "connected") {
+            const problem = current.mediaWatchdog.inspect(report, performance.now());
+            if (problem) { fail(current, problem); return; }
+          }
+          if (collectStats) {
+            const result = summarizeRTCStats(report, current.statsSample);
+            current.statsSample = result.sample;
+            setStats(result.stats);
+          }
         } catch {
           // Stats are diagnostic only and must not interrupt playback.
+          current.mediaWatchdog.reset(performance.now());
         } finally {
           current.statsRunning = false;
-          if (!collectStats || disposed || session !== current || isPaused()) return;
+          if ((!collectStats && !retry) || disposed || session !== current || isPaused()) return;
           if (current.statsPending) {
             runStats(current);
           } else {
-            current.statsTimer = window.setTimeout(() => runStats(current), STATS_INTERVAL_MS);
+            current.statsTimer = window.setTimeout(() => runStats(current), retry ? MEDIA_CHECK_INTERVAL_MS : STATS_INTERVAL_MS);
           }
         }
       })();
@@ -217,7 +244,7 @@ export function useWHEPPlayer({
         return;
       }
 
-      const cleanup = closeCurrent(false) ?? pendingCleanup;
+      const cleanup = closeCurrent(false);
       setState("connecting");
       setError("");
       if (cleanup) {
@@ -237,6 +264,8 @@ export function useWHEPPlayer({
           closed: false,
           statsRunning: false,
           statsPending: false,
+          mediaConnected: false,
+          mediaWatchdog: new MediaProgressWatchdog(),
         };
         session = starting = current;
         const stream = new MediaStream();
@@ -264,6 +293,7 @@ export function useWHEPPlayer({
           } else if (peer.connectionState === "failed" || peer.connectionState === "closed") {
             fail(current, "The WebRTC peer connection failed.");
           } else if (peer.connectionState === "disconnected") {
+            current.mediaConnected = false;
             setState("connecting");
             if (current.stableTimer !== undefined) {
               window.clearTimeout(current.stableTimer);
@@ -321,7 +351,7 @@ export function useWHEPPlayer({
             fail(current, "ICE could not connect. Allow the configured WebRTC media port through the host firewall, verify the advertised LAN host, or enable the TCP fallback in Global settings.");
           }, CONNECTION_TIMEOUT_MS);
         }
-        if (collectStats) runStats(current);
+        if (collectStats || retry) runStats(current);
       } catch (caught) {
         if (starting?.abort.signal.aborted || disposed || session !== starting) return;
         const message = isRequestTimeoutError(caught)
@@ -368,7 +398,8 @@ export function useWHEPPlayer({
       const current = session;
       if (current) {
         deferredStart = null;
-        if (collectStats) runStats(current);
+        current.mediaWatchdog.reset(performance.now());
+        if (collectStats || retry) runStats(current);
       } else if (deferredStart) {
         scheduleStart(deferredStart);
       }
@@ -411,10 +442,10 @@ export function useWHEPPlayer({
       window.removeEventListener("pageshow", onPageShow);
       closeCurrent(false);
     };
-  }, [collectStats, enabled, random, retry, whepPath]);
+  }, [collectStats, enabled, outputGeneration, random, retry, whepPath]);
 
   // Do not expose the previous channel's receiver evidence before effect cleanup runs.
-  if (!enabled || statePath !== whepPath) return {
+  if (!enabled || statePath !== whepPath || stateGeneration !== outputGeneration) return {
     videoRef, state: "off" as const, error: "", stats: null, hasVideo: false, hasAudio: false, audioTrack: null,
   };
   return { videoRef, state, error, stats, hasVideo, hasAudio, audioTrack };

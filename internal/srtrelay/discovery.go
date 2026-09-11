@@ -14,10 +14,12 @@ import (
 )
 
 const (
-	tsDiscoveryWindow = time.Second
-	tsProbeTimeout    = 3 * time.Second
-	tsProbeBytes      = 16 * 1024 * 1024
-	tsStartupBytes    = 32 * 1024 * 1024
+	tsEarlyDiscoveryWindow = 200 * time.Millisecond
+	tsEarlyProbeTimeout    = 500 * time.Millisecond
+	tsDiscoveryWindow      = time.Second
+	tsProbeTimeout         = 3 * time.Second
+	tsProbeBytes           = 16 * 1024 * 1024
+	tsStartupBytes         = 32 * 1024 * 1024
 )
 
 type tsStream struct {
@@ -78,28 +80,69 @@ func startTSDiscovery(reader *packetReader, initial []byte, mode payloadMode) (*
 }
 
 func (s *Supervisor) discoverTS(ctx context.Context, buffer *tsStartup, done <-chan struct{}) ([]tsStream, []byte, error) {
-	timer := time.NewTimer(tsDiscoveryWindow)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	case <-done:
+	return discoverTS(ctx, buffer, done, func(ctx context.Context, snapshot []byte) ([]tsStream, error) {
+		return probeTS(ctx, s.ffprobe, snapshot)
+	})
+}
+
+// Try one short current-connection snapshot, then the original discovery window.
+// Both attempts retain every byte and use identical complete-program validation;
+// no PID or codec decision is reused from an earlier encoder connection.
+func discoverTS(ctx context.Context, buffer *tsStartup, done <-chan struct{}, probe func(context.Context, []byte) ([]tsStream, error)) ([]tsStream, []byte, error) {
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, tsDiscoveryWindow+tsProbeTimeout)
+	defer cancel()
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	defer func() { cancel(); <-watchDone }()
+	var streams []tsStream
+	for _, window := range []time.Duration{tsEarlyDiscoveryWindow, tsDiscoveryWindow} {
+		timer := time.NewTimer(max(0, time.Until(started.Add(window))))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, nil, fmt.Errorf("MPEG-TS discovery interrupted: %w", ctx.Err())
+		case <-timer.C:
+		}
 		buffer.mu.Lock()
-		err := buffer.err
+		if buffer.err != nil {
+			err := buffer.err
+			buffer.mu.Unlock()
+			return nil, nil, err
+		}
+		if len(buffer.buffer) > tsProbeBytes {
+			buffer.mu.Unlock()
+			return nil, nil, errors.New("MPEG-TS discovery exceeded the 16 MiB probe snapshot")
+		}
+		snapshot := bytes.Clone(buffer.buffer)
 		buffer.mu.Unlock()
-		return nil, nil, fmt.Errorf("MPEG-TS input ended during discovery: %w", err)
-	case <-timer.C:
-	}
-	buffer.mu.Lock()
-	if len(buffer.buffer) > tsProbeBytes {
-		buffer.mu.Unlock()
-		return nil, nil, errors.New("MPEG-TS discovery exceeded the 16 MiB probe snapshot")
-	}
-	snapshot := bytes.Clone(buffer.buffer)
-	buffer.mu.Unlock()
-	streams, err := probeTS(ctx, s.ffprobe, snapshot)
-	if err != nil {
-		return nil, nil, err
+		budget := tsProbeTimeout
+		if window == tsEarlyDiscoveryWindow {
+			budget = tsEarlyProbeTimeout
+		}
+		probeCtx, stopProbe := context.WithTimeout(ctx, budget)
+		var err error
+		streams, err = probe(probeCtx, snapshot)
+		if err == nil {
+			err = probeCtx.Err()
+		}
+		stopProbe()
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		if err == nil {
+			break
+		}
+		if window == tsDiscoveryWindow {
+			return nil, nil, err
+		}
 	}
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()

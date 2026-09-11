@@ -775,12 +775,14 @@ func (s *Supervisor) relayConnection(ctx context.Context, plan channel.SRTIngest
 			<-done
 		}()
 		var streams []tsStream
+		discoveryStarted := time.Now()
 		streams, initial, err = s.discoverTS(ctx, buffer, done)
 		if err != nil {
 			terminateInput(input)
 			return mode.String(), bridgeFailed(err.Error())
 		}
 		args = remuxArgs(plan.OutputAddress, plan.PublishPassphrase, streams)
+		s.logger.Info("SRT MPEG-TS discovery complete", "channel", plan.Listener.ChannelID, "durationMs", time.Since(discoveryStarted).Milliseconds(), "tracks", len(streams))
 		for _, stream := range streams {
 			if stream.CodecName == "s302m" {
 				s.logger.Info("converting SMPTE 302M monitor pair to Opus", "channel", plan.Listener.ChannelID, "pid", stream.ID, "inputChannels", stream.Channels)
