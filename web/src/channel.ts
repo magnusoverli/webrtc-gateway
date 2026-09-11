@@ -1,6 +1,7 @@
 export type InputMode = "srt-push" | "srt-pull" | "rtp-unicast" | "rtp-multicast";
 
 export const DEFAULT_SRT_LATENCY_MS = 20;
+export const DEFAULT_COMPATIBILITY_VIDEO_MAX_KBPS = 5000;
 
 export type Track = {
   codec: string;
@@ -70,6 +71,7 @@ export type Channel = {
     };
   };
   maxReaders: number;
+  compatibilityVideoMaxKbps: number;
   useAbsoluteTimestamp: boolean;
   applyState: "pending" | "applied" | "error" | "deleting";
   applyError?: string;
@@ -273,8 +275,11 @@ export function readChannelSnapshot(value: unknown): Channel | null {
     !item.input || typeof item.input.mode !== "string" || !isCompatibility(item.compatibility) || !isIssues(item.issues) ||
     !Array.isArray(item.readers) || !Array.isArray(item.tracks) || !Array.isArray(item.outputTracks) || !isInputVideo(item.inputVideo)) return null;
   const sourceID = item.source && typeof item.source.id === "string" ? item.source.id : "";
+  const videoMaxKbps = item.compatibilityVideoMaxKbps ?? DEFAULT_COMPATIBILITY_VIDEO_MAX_KBPS;
+  if (!Number.isInteger(videoMaxKbps) || videoMaxKbps < 100 || videoMaxKbps > 40000) return null;
   return {
     ...item,
+    compatibilityVideoMaxKbps: videoMaxKbps,
     readerCount: item.readers.length,
     inputGeneration: `${item.availableTime ?? item.onlineTime ?? ""}:${sourceID}`,
     outputGeneration: `${item.outputAvailableTime ?? ""}:${item.compatibility.mode ?? ""}`,

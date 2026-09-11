@@ -28,6 +28,7 @@ function channelWithMode(mode: InputMode): Channel {
       ? { mode, srt: { host: mode === "srt-pull" ? "2001:db8::10" : undefined, port: mode === "srt-pull" ? 9000 : 10000, streamId: mode === "srt-pull" ? "studio feed" : undefined, hasPassphrase: true, latencyMs: 120 } }
       : { mode, rtp: { address: mode === "rtp-multicast" ? "239.0.0.1" : "0.0.0.0", port: 22000, sourceIp: "192.0.2.20", sdp: "v=0" } },
     maxReaders: 0,
+    compatibilityVideoMaxKbps: 5000,
     useAbsoluteTimestamp: false,
     applyState: "applied",
     createdAt: "2026-08-25T08:00:00Z",
@@ -773,6 +774,43 @@ describe("dashboard navigation", () => {
 
     await user.click(screen.getByRole("button", { name: "Reload latest" }));
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("Latest Studio"));
+  });
+
+  it("defaults new channels to 5 Mbps and saves a custom per-channel video limit", async () => {
+    const item = { ...channelWithMode("srt-push"), compatibilityVideoMaxKbps: 7000 };
+    let saved = item;
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === `/api/v1/channels/${item.id}` && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body));
+        saved = { ...item, revision: 2, compatibilityVideoMaxKbps: body.compatibilityVideoMaxKbps };
+        return Promise.resolve(jsonResponse(saved));
+      }
+      if (url === "/api/v1/status") return Promise.resolve(jsonResponse(statusWith([saved])));
+      if (url === "/api/v1/status/runtime") return Promise.resolve(jsonResponse(runtimeStatus(statusWith([saved]), [runtimeChannel(saved)])));
+      throw new Error(`Unexpected request ${init?.method ?? "GET"} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add channel" }));
+    expect((screen.getByRole("spinbutton", { name: /Compatibility video limit/ }) as HTMLInputElement).value).toBe("5");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open details for Studio" }));
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    const limit = screen.getByRole("spinbutton", { name: /Compatibility video limit/ });
+    expect((limit as HTMLInputElement).value).toBe("7");
+    fireEvent.change(limit, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText("Compatibility video limit must be between 0.1 and 40 Mbps.")).toBeDefined();
+    expect(fetch.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+    fireEvent.change(limit, { target: { value: "3.5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(saved.compatibilityVideoMaxKbps).toBe(3500));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit channel" })).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Configure" }));
+    expect((screen.getByRole("spinbutton", { name: /Compatibility video limit/ }) as HTMLInputElement).value).toBe("3.5");
+    const call = fetch.mock.calls.find(([, init]) => init?.method === "PUT");
+    expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ compatibilityVideoMaxKbps: 3500 });
   });
 
   it("keeps settings revision metadata out of strict PUT bodies and reloads after conflict", async () => {

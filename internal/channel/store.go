@@ -82,6 +82,23 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	if err := s.addRevisionColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.addCompatibilityVideoMaxColumn(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *SQLiteStore) addCompatibilityVideoMaxColumn(ctx context.Context) error {
+	exists, err := s.channelColumnExists(ctx, "compatibility_video_max_kbps")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN compatibility_video_max_kbps INTEGER NOT NULL DEFAULT 5000`); err != nil {
+		return fmt.Errorf("add channel compatibility video bitrate setting: %w", err)
+	}
 	return nil
 }
 
@@ -194,7 +211,7 @@ func (s *SQLiteStore) channelColumnExists(ctx context.Context, column string) (b
 func (s *SQLiteStore) List(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
 		FROM channels ORDER BY channel_number`)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
@@ -218,7 +235,7 @@ func (s *SQLiteStore) List(ctx context.Context) ([]Channel, error) {
 func (s *SQLiteStore) ListPending(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
 		FROM channels
 		WHERE apply_state != ?
 		ORDER BY channel_number`, ApplyApplied)
@@ -246,7 +263,7 @@ func (s *SQLiteStore) ListPending(ctx context.Context) ([]Channel, error) {
 func (s *SQLiteStore) Get(ctx context.Context, id string) (Channel, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
 		FROM channels WHERE id = ?`, id)
 	item, err := scanChannel(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -258,7 +275,7 @@ func (s *SQLiteStore) Get(ctx context.Context, id string) (Channel, error) {
 func (s *SQLiteStore) GetByNumber(ctx context.Context, number int) (Channel, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
+		       use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
 		FROM channels WHERE channel_number = ?`, number)
 	item, err := scanChannel(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -281,11 +298,11 @@ func (s *SQLiteStore) Create(ctx context.Context, item Channel) error {
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-			use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.ID, item.Revision, item.Number, item.Name, item.Path, item.Enabled, item.AutomaticPreview, string(input), item.MaxReaders,
 		item.UseAbsoluteTimestamp, item.ApplyState, item.ApplyError,
-		item.CreatedAt.Format(time.RFC3339Nano), item.UpdatedAt.Format(time.RFC3339Nano))
+		item.CreatedAt.Format(time.RFC3339Nano), item.UpdatedAt.Format(time.RFC3339Nano), item.CompatibilityVideoMaxKbps)
 	if err != nil {
 		return fmt.Errorf("create channel: %w", err)
 	}
@@ -300,11 +317,11 @@ func (s *SQLiteStore) Update(ctx context.Context, item Channel, expectedRevision
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE channels SET
 			revision = ?, name = ?, enabled = ?, automatic_preview = ?, input_json = ?, max_readers = ?,
-			use_absolute_timestamp = ?, apply_state = ?, apply_error = ?, updated_at = ?
+			use_absolute_timestamp = ?, apply_state = ?, apply_error = ?, updated_at = ?, compatibility_video_max_kbps = ?
 		WHERE id = ? AND revision = ?`,
 		item.Revision, item.Name, item.Enabled, item.AutomaticPreview, string(input), item.MaxReaders,
 		item.UseAbsoluteTimestamp, item.ApplyState, item.ApplyError,
-		item.UpdatedAt.Format(time.RFC3339Nano), item.ID, expectedRevision)
+		item.UpdatedAt.Format(time.RFC3339Nano), item.CompatibilityVideoMaxKbps, item.ID, expectedRevision)
 	if err != nil {
 		return fmt.Errorf("update channel: %w", err)
 	}
@@ -354,6 +371,7 @@ func scanChannel(row scanner) (Channel, error) {
 	if err := row.Scan(
 		&item.ID, &item.Revision, &item.Number, &item.Name, &item.Path, &enabled, &automaticPreview, &inputJSON, &item.MaxReaders,
 		&useAbsoluteTimestamp, &item.ApplyState, &item.ApplyError, &createdAt, &updatedAt,
+		&item.CompatibilityVideoMaxKbps,
 	); err != nil {
 		return Channel{}, err
 	}
@@ -363,17 +381,19 @@ func scanChannel(row scanner) (Channel, error) {
 	if err := json.Unmarshal([]byte(inputJSON), &item.Input); err != nil {
 		return Channel{}, fmt.Errorf("decode channel input: %w", err)
 	}
-	if _, err := ValidateDraft(Draft{
-		Name:                 item.Name,
-		Enabled:              item.Enabled,
-		AutomaticPreview:     item.AutomaticPreview,
-		Input:                item.Input,
-		MaxReaders:           item.MaxReaders,
-		UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
-	}); err != nil {
+	draft, err := ValidateDraft(Draft{
+		Name:                      item.Name,
+		Enabled:                   item.Enabled,
+		AutomaticPreview:          item.AutomaticPreview,
+		Input:                     item.Input,
+		MaxReaders:                item.MaxReaders,
+		CompatibilityVideoMaxKbps: item.CompatibilityVideoMaxKbps,
+		UseAbsoluteTimestamp:      item.UseAbsoluteTimestamp,
+	})
+	if err != nil {
 		return Channel{}, fmt.Errorf("validate persisted channel: %w", err)
 	}
-	var err error
+	item.CompatibilityVideoMaxKbps = draft.CompatibilityVideoMaxKbps
 	item.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
 		return Channel{}, fmt.Errorf("decode channel created time: %w", err)

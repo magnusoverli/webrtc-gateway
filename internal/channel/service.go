@@ -149,6 +149,9 @@ func (s *Service) update(ctx context.Context, id string, draft Draft, expectedRe
 	if draft.PreserveUseAbsoluteTimestamp {
 		draft.UseAbsoluteTimestamp = current.UseAbsoluteTimestamp
 	}
+	if draft.PreserveCompatibilityVideoMaxKbps {
+		draft.CompatibilityVideoMaxKbps = current.CompatibilityVideoMaxKbps
+	}
 	draft, err = resolvePassphrase(draft, &current)
 	if err != nil {
 		return Channel{}, err
@@ -163,6 +166,8 @@ func (s *Service) update(ctx context.Context, id string, draft Draft, expectedRe
 	if sameAppliedConfiguration(current, draft) {
 		previousRevision := current.Revision
 		current.AutomaticPreview = draft.AutomaticPreview
+		// Compatibility workers reconcile this setting independently of ingest.
+		current.CompatibilityVideoMaxKbps = draft.CompatibilityVideoMaxKbps
 		current.Revision++
 		current.UpdatedAt = s.now().UTC()
 		if err := s.store.Update(ctx, current, previousRevision); err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/url"
@@ -45,7 +46,7 @@ func TestClassifyTracksConvertsOnlyIncompatibleTracks(t *testing.T) {
 		t.Fatalf("classification = %#v, %v", result, err)
 	}
 
-	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", result, 8)
+	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", result, 8, 0)
 	if !containsPair(args, "-c:v", "copy") || !containsPair(args, "-c:a", "libopus") ||
 		!containsPair(args, "-ar", "48000") || !containsPair(args, "-ac", "2") {
 		t.Fatalf("FFmpeg args = %#v", args)
@@ -337,7 +338,7 @@ func TestClassifyTracksProbesVP9WithoutProfileZero(t *testing.T) {
 }
 
 func TestFFmpegArgsPreserveCadenceAndForceKeyframes(t *testing.T) {
-	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", decision{transcodeVideo: true, videoWidth: 1920, videoHeight: 1080}, 8)
+	args := ffmpegArgs("rtsp://input/raw", "rtsp://output/compat", decision{transcodeVideo: true, videoWidth: 1920, videoHeight: 1080}, 8, 0)
 	if !containsPair(args, "-fps_mode:v", "passthrough") {
 		t.Fatalf("FFmpeg args do not preserve frame cadence: %#v", args)
 	}
@@ -347,8 +348,8 @@ func TestFFmpegArgsPreserveCadenceAndForceKeyframes(t *testing.T) {
 	if countPair(args, "-threads:v", "8") != 2 {
 		t.Fatalf("FFmpeg args do not limit decoder and encoder threads: %#v", args)
 	}
-	if !containsPair(args, "-crf:v", "23") || !containsPair(args, "-maxrate:v", "16000k") || !containsPair(args, "-bufsize:v", "8000k") {
-		t.Fatalf("FFmpeg args do not apply the 1080p rate policy: %#v", args)
+	if !containsPair(args, "-crf:v", "23") || !containsPair(args, "-maxrate:v", "5000k") || !containsPair(args, "-bufsize:v", "2500k") {
+		t.Fatalf("FFmpeg args do not apply the default video rate policy: %#v", args)
 	}
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "qsv") || strings.Contains(joined, "vaapi") {
@@ -358,13 +359,13 @@ func TestFFmpegArgsPreserveCadenceAndForceKeyframes(t *testing.T) {
 
 func TestFFmpegArgsApplyInterlacedTransforms(t *testing.T) {
 	const deinterlace = "bwdif=mode=send_field:parity=auto:deint=interlaced"
-	args := ffmpegArgs("input", "output", decision{transcodeVideo: true, videoTransform: videoTransformDeinterlace}, 8)
+	args := ffmpegArgs("input", "output", decision{transcodeVideo: true, videoTransform: videoTransformDeinterlace}, 8, 0)
 	if !containsPair(args, "-vf", deinterlace) {
 		t.Fatalf("conventional interlace FFmpeg args = %#v", args)
 	}
 
 	const weave = "select='not(eq(n\\,0)*eq(interlace_type\\,BOTTOMFIRST))',weave=first_field=top," + deinterlace
-	args = ffmpegArgs("input", "output", decision{transcodeVideo: true, videoTransform: videoTransformWeaveDeinterlace}, 8)
+	args = ffmpegArgs("input", "output", decision{transcodeVideo: true, videoTransform: videoTransformWeaveDeinterlace}, 8, 0)
 	if !containsPair(args, "-vf", weave) {
 		t.Fatalf("HEVC field sequence FFmpeg args = %#v", args)
 	}
@@ -377,17 +378,25 @@ func TestFFmpegArgsUseResolutionRateTiers(t *testing.T) {
 	tests := []struct {
 		name            string
 		width, height   int
+		limit           int
 		maxrate, buffer string
 	}{
 		{name: "480p", width: 640, height: 480, maxrate: "2000k", buffer: "1000k"},
-		{name: "720p", width: 1280, height: 720, maxrate: "6000k", buffer: "3000k"},
-		{name: "1080p", width: 1920, height: 1080, maxrate: "16000k", buffer: "8000k"},
-		{name: "1440p", width: 2560, height: 1440, maxrate: "24000k", buffer: "12000k"},
-		{name: "2160p", width: 3840, height: 2160, maxrate: "40000k", buffer: "20000k"},
+		{name: "720p default", width: 1280, height: 720, maxrate: "5000k", buffer: "2500k"},
+		{name: "1080p default", width: 1920, height: 1080, maxrate: "5000k", buffer: "2500k"},
+		{name: "1440p default", width: 2560, height: 1440, maxrate: "5000k", buffer: "2500k"},
+		{name: "2160p default", width: 3840, height: 2160, maxrate: "5000k", buffer: "2500k"},
+		{name: "custom lower", width: 1920, height: 1080, limit: 3500, maxrate: "3500k", buffer: "1750k"},
+		{name: "custom higher", width: 1920, height: 1080, limit: 8000, maxrate: "8000k", buffer: "4000k"},
+		{name: "720p ceiling", width: 1280, height: 720, limit: 40000, maxrate: "6000k", buffer: "3000k"},
+		{name: "1080p ceiling", width: 1920, height: 1080, limit: 40000, maxrate: "16000k", buffer: "8000k"},
+		{name: "1440p ceiling", width: 2560, height: 1440, limit: 40000, maxrate: "24000k", buffer: "12000k"},
+		{name: "2160p ceiling", width: 3840, height: 2160, limit: 40000, maxrate: "40000k", buffer: "20000k"},
+		{name: "unknown size", limit: 3000, maxrate: "3000k", buffer: "1500k"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			args := ffmpegArgs("input", "output", decision{transcodeVideo: true, videoWidth: test.width, videoHeight: test.height}, 8)
+			args := ffmpegArgs("input", "output", decision{transcodeVideo: true, videoWidth: test.width, videoHeight: test.height}, 8, test.limit)
 			if !containsPair(args, "-maxrate:v", test.maxrate) || !containsPair(args, "-bufsize:v", test.buffer) {
 				t.Fatalf("FFmpeg args = %#v", args)
 			}
@@ -396,7 +405,7 @@ func TestFFmpegArgsUseResolutionRateTiers(t *testing.T) {
 }
 
 func TestAudioOnlyConversionDoesNotApplyVideoLimits(t *testing.T) {
-	args := ffmpegArgs("input", "output", decision{transcodeAudio: true}, 8)
+	args := ffmpegArgs("input", "output", decision{transcodeAudio: true}, 8, 3000)
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "-threads:v") || strings.Contains(joined, "-maxrate:v") || strings.Contains(joined, "-bufsize:v") {
 		t.Fatalf("audio-only FFmpeg args contain video limits: %#v", args)
@@ -489,6 +498,72 @@ func TestReconcileNonSRTChannelCleansUpTranscodedPathAndRetriesFailure(t *testin
 	manager.reconcile(context.Background())
 	if !reflect.DeepEqual(media.deleted, []string{compatPath, compatPath}) {
 		t.Fatalf("deleted paths = %#v, want cleanup retried", media.deleted)
+	}
+}
+
+func TestReconcileCompatibilityVideoLimitChange(t *testing.T) {
+	for _, test := range []struct {
+		name                         string
+		transcodeVideo               bool
+		width, height, before, after int
+		restart                      bool
+	}{
+		{name: "lower video limit", transcodeVideo: true, width: 1920, height: 1080, before: 5000, after: 3500, restart: true},
+		{name: "higher video limit", transcodeVideo: true, width: 1920, height: 1080, before: 5000, after: 8000, restart: true},
+		{name: "same effective ceiling", transcodeVideo: true, width: 640, height: 480, before: 5000, after: 8000},
+		{name: "audio-only conversion", before: 5000, after: 3500},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configured := srtChannel("channel", "raw")
+			configured.CompatibilityVideoMaxKbps = test.after
+			raw := srtRuntime("source", []mediamtx.Track{{Codec: "H265"}})
+			compatPath := CompatibilityPath(configured.ID)
+			output := mediamtx.Channel{Name: compatPath, Available: true, Online: true}
+			stopped := false
+			result := decision{required: true, transcodeVideo: test.transcodeVideo, transcodeAudio: true, videoWidth: test.width, videoHeight: test.height, workerUnits: 1}
+			current := &entry{
+				fingerprint: fingerprint(raw), srt: true, classified: true, decision: result,
+				videoMaxKbps: test.before, compatConfigured: true,
+				worker: &worker{cancel: func() { stopped = true }},
+				state:  State{State: StateReady, Mode: ModeTranscoded, Required: true, OutputPath: compatPath, Worker: WorkerState{Running: true}},
+			}
+			media := &reconcileMediaManager{}
+			manager := &Manager{media: media, entries: map[string]*entry{configured.ID: current}}
+			paths := map[string]mediamtx.Channel{configured.Path: raw, compatPath: output}
+			manager.reconcileChannel(t.Context(), configured, paths)
+			if stopped != test.restart || (len(media.deleted) > 0) != test.restart {
+				t.Fatalf("stopped=%v, deleted=%v, want restart=%v", stopped, media.deleted, test.restart)
+			}
+			if current.fingerprint != fingerprint(raw) || !current.classified || current.videoMaxKbps != test.after {
+				t.Fatalf("input classification or desired bitrate changed unexpectedly: %+v", current)
+			}
+			if test.restart {
+				if current.state.State != StateStarting || current.state.Worker.Running || len(media.deleted) != 1 || media.deleted[0] != compatPath {
+					t.Fatalf("restart did not clear old output readiness: %+v", current.state)
+				}
+				// Simulate the old process exiting, then capture the replacement's actual arguments.
+				current.worker = nil
+				manager.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+				manager.workerCapacity = 1
+				manager.encoderThreads = 2
+				manager.ffmpeg = "ffmpeg"
+				manager.rtspURL, _ = url.Parse("rtsp://127.0.0.1:8554")
+				var args []string
+				manager.startCommand = func(cmd *exec.Cmd) error {
+					args = cmd.Args
+					return errors.New("test stops before launching FFmpeg")
+				}
+				delete(paths, compatPath)
+				manager.reconcileChannel(t.Context(), configured, paths)
+				want := fmt.Sprintf("%dk", test.after)
+				if !containsPair(args, "-maxrate:v", want) {
+					t.Fatalf("replacement worker args=%v, want maxrate %s", args, want)
+				}
+				manager.workers.Wait()
+			} else if current.state.State != StateReady || !current.state.Worker.Running {
+				t.Fatalf("unaffected output stopped: %+v", current.state)
+			}
+		})
 	}
 }
 

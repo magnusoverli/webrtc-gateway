@@ -98,3 +98,23 @@ func TestValidateDraftRejectsInvalidProtocolSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestCompatibilityVideoLimitValidation(t *testing.T) {
+	for _, test := range []struct {
+		value, want int
+	}{
+		{0, 5000}, {100, 100}, {3500, 3500}, {40000, 40000}, {-1, 0}, {99, 0}, {40001, 0},
+	} {
+		item, err := New(Draft{
+			Name: "Bitrate", CompatibilityVideoMaxKbps: test.value,
+			Input: Input{Mode: InputSRTPush, SRT: &SRTInput{Port: 10000}},
+		}, time.Now())
+		if test.want == 0 {
+			if err == nil || !strings.Contains(err.Error(), "compatibilityVideoMaxKbps") {
+				t.Fatalf("limit %d: expected validation error, got %v", test.value, err)
+			}
+		} else if err != nil || item.CompatibilityVideoMaxKbps != test.want {
+			t.Fatalf("limit %d: channel=%+v, error=%v", test.value, item, err)
+		}
+	}
+}

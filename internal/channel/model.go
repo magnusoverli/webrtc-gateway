@@ -22,6 +22,10 @@ const (
 	DefaultSRTLatencyMS = 20
 	MinimumSRTLatencyMS = 20
 	MaximumSRTLatencyMS = 8000
+
+	DefaultCompatibilityVideoMaxKbps = 5000
+	MinimumCompatibilityVideoMaxKbps = 100
+	MaximumCompatibilityVideoMaxKbps = 40000
 )
 
 type ApplyState string
@@ -57,32 +61,35 @@ type Input struct {
 }
 
 type Channel struct {
-	ID                   string     `json:"id"`
-	Revision             int        `json:"revision"`
-	Number               int        `json:"number"`
-	Name                 string     `json:"name"`
-	Path                 string     `json:"path"`
-	Enabled              bool       `json:"enabled"`
-	AutomaticPreview     bool       `json:"automaticPreview"`
-	Input                Input      `json:"input"`
-	MaxReaders           int        `json:"maxReaders"`
-	UseAbsoluteTimestamp bool       `json:"useAbsoluteTimestamp"`
-	ApplyState           ApplyState `json:"applyState"`
-	ApplyError           string     `json:"applyError,omitempty"`
-	CreatedAt            time.Time  `json:"createdAt"`
-	UpdatedAt            time.Time  `json:"updatedAt"`
+	ID                        string     `json:"id"`
+	Revision                  int        `json:"revision"`
+	Number                    int        `json:"number"`
+	Name                      string     `json:"name"`
+	Path                      string     `json:"path"`
+	Enabled                   bool       `json:"enabled"`
+	AutomaticPreview          bool       `json:"automaticPreview"`
+	Input                     Input      `json:"input"`
+	MaxReaders                int        `json:"maxReaders"`
+	CompatibilityVideoMaxKbps int        `json:"compatibilityVideoMaxKbps"`
+	UseAbsoluteTimestamp      bool       `json:"useAbsoluteTimestamp"`
+	ApplyState                ApplyState `json:"applyState"`
+	ApplyError                string     `json:"applyError,omitempty"`
+	CreatedAt                 time.Time  `json:"createdAt"`
+	UpdatedAt                 time.Time  `json:"updatedAt"`
 }
 
 type Draft struct {
-	Name                         string
-	Enabled                      bool
-	AutomaticPreview             bool
-	PreserveAutomaticPreview     bool
-	Input                        Input
-	PassphraseIntent             PassphraseIntent
-	MaxReaders                   int
-	UseAbsoluteTimestamp         bool
-	PreserveUseAbsoluteTimestamp bool
+	Name                              string
+	Enabled                           bool
+	AutomaticPreview                  bool
+	PreserveAutomaticPreview          bool
+	Input                             Input
+	PassphraseIntent                  PassphraseIntent
+	MaxReaders                        int
+	CompatibilityVideoMaxKbps         int
+	PreserveCompatibilityVideoMaxKbps bool
+	UseAbsoluteTimestamp              bool
+	PreserveUseAbsoluteTimestamp      bool
 }
 
 type PassphraseIntent uint8
@@ -111,18 +118,19 @@ func New(draft Draft, now time.Time) (Channel, error) {
 	}
 
 	return Channel{
-		ID:                   id,
-		Revision:             1,
-		Name:                 draft.Name,
-		Path:                 pathFor(draft.Name, id),
-		Enabled:              draft.Enabled,
-		AutomaticPreview:     draft.AutomaticPreview,
-		Input:                draft.Input,
-		MaxReaders:           draft.MaxReaders,
-		UseAbsoluteTimestamp: draft.UseAbsoluteTimestamp,
-		ApplyState:           ApplyPending,
-		CreatedAt:            now.UTC(),
-		UpdatedAt:            now.UTC(),
+		ID:                        id,
+		Revision:                  1,
+		Name:                      draft.Name,
+		Path:                      pathFor(draft.Name, id),
+		Enabled:                   draft.Enabled,
+		AutomaticPreview:          draft.AutomaticPreview,
+		Input:                     draft.Input,
+		MaxReaders:                draft.MaxReaders,
+		CompatibilityVideoMaxKbps: draft.CompatibilityVideoMaxKbps,
+		UseAbsoluteTimestamp:      draft.UseAbsoluteTimestamp,
+		ApplyState:                ApplyPending,
+		CreatedAt:                 now.UTC(),
+		UpdatedAt:                 now.UTC(),
 	}, nil
 }
 
@@ -137,6 +145,7 @@ func (c Channel) WithDraft(draft Draft, now time.Time) (Channel, error) {
 	c.AutomaticPreview = draft.AutomaticPreview
 	c.Input = draft.Input
 	c.MaxReaders = draft.MaxReaders
+	c.CompatibilityVideoMaxKbps = draft.CompatibilityVideoMaxKbps
 	c.UseAbsoluteTimestamp = draft.UseAbsoluteTimestamp
 	c.ApplyState = ApplyPending
 	c.ApplyError = ""
@@ -151,6 +160,12 @@ func ValidateDraft(draft Draft) (Draft, error) {
 	}
 	if draft.MaxReaders < 0 {
 		return Draft{}, invalid("maxReaders must be zero or greater")
+	}
+	if draft.CompatibilityVideoMaxKbps == 0 {
+		draft.CompatibilityVideoMaxKbps = DefaultCompatibilityVideoMaxKbps
+	}
+	if draft.CompatibilityVideoMaxKbps < MinimumCompatibilityVideoMaxKbps || draft.CompatibilityVideoMaxKbps > MaximumCompatibilityVideoMaxKbps {
+		return Draft{}, invalid("compatibilityVideoMaxKbps must be between 100 and 40000")
 	}
 
 	switch draft.Input.Mode {

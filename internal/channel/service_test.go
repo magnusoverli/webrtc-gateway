@@ -240,6 +240,32 @@ func TestServiceUpdatesAutomaticPreviewWithoutReapplyingMedia(t *testing.T) {
 	}
 }
 
+func TestServiceUpdatesCompatibilityBitrateWithoutReapplyingInput(t *testing.T) {
+	store, err := OpenSQLite(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	media := &fakePathManager{}
+	service := NewService(store, media, nil, nil, nil)
+	draft := Draft{Name: "Bitrate", Enabled: true, Input: Input{Mode: InputSRTPull, SRT: &SRTInput{Host: "source.local", Port: 9000}}}
+	item, err := service.Create(t.Context(), draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft.CompatibilityVideoMaxKbps = 3500
+	updated, err := service.UpdateExpected(t.Context(), item.ID, draft, item.Revision)
+	if err != nil || updated.CompatibilityVideoMaxKbps != 3500 || updated.ApplyState != ApplyApplied || updated.Revision != item.Revision+1 || media.replacements != 1 {
+		t.Fatalf("bitrate update=%+v, err=%v, input replacements=%d", updated, err, media.replacements)
+	}
+	draft.PreserveCompatibilityVideoMaxKbps = true
+	draft.CompatibilityVideoMaxKbps = 0
+	preserved, err := service.UpdateExpected(t.Context(), item.ID, draft, updated.Revision)
+	if err != nil || preserved.CompatibilityVideoMaxKbps != 3500 {
+		t.Fatalf("omitted bitrate update=%+v, err=%v", preserved, err)
+	}
+}
+
 func (f *fakePathManager) DeletePath(_ context.Context, name string) error {
 	f.deletedName = name
 	return f.err

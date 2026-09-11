@@ -385,6 +385,7 @@ function channel(id: string, name: string, tone: "live" | "starting" | "fault" |
     automaticPreview: false,
     input: { mode: "srt-push", srt: { port: 10000, hasPassphrase: false } },
     maxReaders: 10,
+    compatibilityVideoMaxKbps: 5000,
     useAbsoluteTimestamp: true,
     applyState: fault ? "error" : starting ? "pending" : "applied",
     applyError: fault ? "failed" : undefined,

@@ -10,6 +10,7 @@ import type { PreviewStats } from "./webrtc";
 const ready: Channel = {
   id: "studio", revision: 1, number: 1, name: "Studio", path: "studio", enabled: true, automaticPreview: true,
   input: { mode: "srt-pull", srt: { hasPassphrase: true } }, maxReaders: 0, useAbsoluteTimestamp: false,
+  compatibilityVideoMaxKbps: 5000,
   applyState: "applied", createdAt: "", updatedAt: "", whepPath: "/whep/studio", viewerPath: "/view", embedPath: "/embed/1",
   available: true, online: true, inputGeneration: "one", inboundBytes: 1000, outputInboundBytes: 1000,
   outputGeneration: "one", outboundBytes: 1000, inboundFramesInError: 0, readers: [], readerCount: 1,

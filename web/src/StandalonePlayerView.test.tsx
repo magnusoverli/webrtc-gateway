@@ -1168,6 +1168,7 @@ function fixtureChannel(id: string, number: number, name: string, outputReady: b
     automaticPreview: true,
     input: { mode: "srt-push", srt: { port: 10000, hasPassphrase: false } },
     maxReaders: 16,
+    compatibilityVideoMaxKbps: 5000,
     useAbsoluteTimestamp: true,
     applyState: "applied",
     createdAt: "2026-08-25T08:00:00Z",

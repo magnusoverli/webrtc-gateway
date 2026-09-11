@@ -51,15 +51,16 @@ type Settings struct {
 }
 
 type Channel struct {
-	ID                   string        `json:"id"`
-	Number               int           `json:"number"`
-	Name                 string        `json:"name"`
-	Path                 string        `json:"path"`
-	Enabled              bool          `json:"enabled"`
-	AutomaticPreview     bool          `json:"automaticPreview"`
-	Input                channel.Input `json:"input"`
-	MaxReaders           int           `json:"maxReaders"`
-	UseAbsoluteTimestamp bool          `json:"useAbsoluteTimestamp"`
+	ID                        string        `json:"id"`
+	Number                    int           `json:"number"`
+	Name                      string        `json:"name"`
+	Path                      string        `json:"path"`
+	Enabled                   bool          `json:"enabled"`
+	AutomaticPreview          bool          `json:"automaticPreview"`
+	Input                     channel.Input `json:"input"`
+	MaxReaders                int           `json:"maxReaders"`
+	CompatibilityVideoMaxKbps int           `json:"compatibilityVideoMaxKbps"`
+	UseAbsoluteTimestamp      bool          `json:"useAbsoluteTimestamp"`
 }
 
 type Configuration struct {
@@ -170,7 +171,8 @@ func ChannelFrom(value channel.Channel) Channel {
 	return Channel{
 		ID: value.ID, Number: value.Number, Name: value.Name, Path: value.Path, Enabled: value.Enabled,
 		AutomaticPreview: value.AutomaticPreview, Input: value.Input, MaxReaders: value.MaxReaders,
-		UseAbsoluteTimestamp: value.UseAbsoluteTimestamp,
+		CompatibilityVideoMaxKbps: value.CompatibilityVideoMaxKbps,
+		UseAbsoluteTimestamp:      value.UseAbsoluteTimestamp,
 	}
 }
 
@@ -179,7 +181,8 @@ func (value Channel) Live(revision int, now time.Time) channel.Channel {
 		ID: value.ID, Revision: revision, Number: value.Number, Name: value.Name, Path: value.Path,
 		Enabled: value.Enabled, AutomaticPreview: value.AutomaticPreview, Input: value.Input,
 		MaxReaders: value.MaxReaders, UseAbsoluteTimestamp: value.UseAbsoluteTimestamp,
-		ApplyState: channel.ApplyPending, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+		CompatibilityVideoMaxKbps: value.CompatibilityVideoMaxKbps,
+		ApplyState:                channel.ApplyPending, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
 }
 
@@ -240,11 +243,13 @@ func ValidateConfiguration(value Configuration, now time.Time) (Configuration, e
 		draft, draftErr := channel.ValidateDraft(channel.Draft{
 			Name: item.Name, Enabled: item.Enabled, AutomaticPreview: item.AutomaticPreview,
 			Input: item.Input, MaxReaders: item.MaxReaders, UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
+			CompatibilityVideoMaxKbps: item.CompatibilityVideoMaxKbps,
 		})
 		if draftErr != nil {
 			return Configuration{}, invalid("channel %s: %v", item.Name, draftErr)
 		}
 		item.Name, item.Input = draft.Name, draft.Input
+		item.CompatibilityVideoMaxKbps = draft.CompatibilityVideoMaxKbps
 		port := 0
 		if item.Input.RTP != nil {
 			port = item.Input.RTP.Port

@@ -19,10 +19,11 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	item, err := New(Draft{
-		Name:             "SRT pull",
-		Enabled:          true,
-		AutomaticPreview: true,
-		MaxReaders:       12,
+		Name:                      "SRT pull",
+		Enabled:                   true,
+		AutomaticPreview:          true,
+		MaxReaders:                12,
+		CompatibilityVideoMaxKbps: 3500,
 		Input: Input{Mode: InputSRTPull, SRT: &SRTInput{
 			Host: "source.local", Port: 8890, StreamID: "camera", Passphrase: "test+secret", LatencyMS: 200,
 		}},
@@ -39,7 +40,7 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	if loaded.Number != 3 || loaded.Input.SRT.Passphrase != "test+secret" || loaded.MaxReaders != 12 || !loaded.AutomaticPreview {
+	if loaded.Number != 3 || loaded.Input.SRT.Passphrase != "test+secret" || loaded.MaxReaders != 12 || !loaded.AutomaticPreview || loaded.CompatibilityVideoMaxKbps != 3500 {
 		t.Fatalf("stored channel did not round trip: %#v", loaded)
 	}
 	byNumber, err := store.GetByNumber(context.Background(), 3)
@@ -48,6 +49,7 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 	}
 
 	loaded.Name = "Updated"
+	loaded.CompatibilityVideoMaxKbps = 7000
 	loaded.ApplyState = ApplyApplied
 	previousRevision := loaded.Revision
 	loaded.Revision++
@@ -55,7 +57,7 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 		t.Fatalf("Update() error = %v", err)
 	}
 	items, err := store.List(context.Background())
-	if err != nil || len(items) != 1 || items[0].Name != "Updated" {
+	if err != nil || len(items) != 1 || items[0].Name != "Updated" || items[0].CompatibilityVideoMaxKbps != 7000 {
 		t.Fatalf("List() = %#v, %v", items, err)
 	}
 
@@ -114,6 +116,11 @@ func TestSQLiteStoreMigratesLegacyColumnsAndNumbers(t *testing.T) {
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.CompatibilityVideoMaxKbps != DefaultCompatibilityVideoMaxKbps {
+			t.Fatalf("legacy channel bitrate = %d, want 5000", item.CompatibilityVideoMaxKbps)
+		}
 	}
 
 	reopened, err := OpenSQLite(path)

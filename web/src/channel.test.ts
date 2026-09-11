@@ -36,6 +36,7 @@ const baseChannel: Channel = {
   automaticPreview: true,
   input: { mode: "srt-push", srt: { port: 10000, hasPassphrase: false } },
   maxReaders: 0,
+  compatibilityVideoMaxKbps: 5000,
   useAbsoluteTimestamp: false,
   applyState: "applied",
   createdAt: "2026-08-25T08:00:00Z",

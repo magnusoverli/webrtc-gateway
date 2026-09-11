@@ -6,6 +6,7 @@ import {
   channelPlaybackReady,
   channelStateLabel,
   DEFAULT_SRT_LATENCY_MS,
+  DEFAULT_COMPATIBILITY_VIDEO_MAX_KBPS,
   hasInputStream,
   hasOutputStream,
   iframeEmbedCode,
@@ -163,6 +164,7 @@ type ChannelForm = {
   clearPassphrase: boolean;
   latencyMs: string;
   maxReaders: string;
+  compatibilityVideoMaxMbps: string;
   useAbsoluteTimestamp: boolean;
 };
 
@@ -193,6 +195,7 @@ const emptyForm = (settings?: GlobalSettings, srtPort = 10000): ChannelForm => (
   clearPassphrase: false,
   latencyMs: String(DEFAULT_SRT_LATENCY_MS),
   maxReaders: String(settings?.defaultMaxReaders ?? 16),
+  compatibilityVideoMaxMbps: String(DEFAULT_COMPATIBILITY_VIDEO_MAX_KBPS / 1000),
   useAbsoluteTimestamp: true,
 });
 
@@ -597,6 +600,7 @@ function Dashboard() {
     next.automaticPreview = item.automaticPreview;
     next.mode = item.input.mode;
     next.maxReaders = String(item.maxReaders);
+    next.compatibilityVideoMaxMbps = String(item.compatibilityVideoMaxKbps / 1000);
     next.useAbsoluteTimestamp = item.useAbsoluteTimestamp;
     if (item.input.rtp) {
       next.address = item.input.rtp.address;
@@ -1552,6 +1556,11 @@ function ChannelEditor({ form, editing, error, conflict, saving, mutationBlocked
             </label>
 
             <div className="field option-stack">
+              {!isRTP && <label className="field">
+                <FieldTitle help="Maximum video bitrate when compatibility conversion encodes H264. Uses the lower of this setting and the resolution-based ceiling. Audio and transport overhead are additional; direct or copied video is unaffected. Changing an active video encoder briefly restarts its output.">Compatibility video limit (Mbps)</FieldTitle>
+                <input type="number" min="0.1" max="40" step="0.001" required value={form.compatibilityVideoMaxMbps} onChange={(event) => update("compatibilityVideoMaxMbps", event.target.value)} />
+                <small>Default 5 Mbps. Range 0.1–40 Mbps; a maximum, not a constant target.</small>
+              </label>}
               <label className="check"><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} /><span className="check-copy">Channel enabled <HelpTip label="Channel enabled" content="Starts the configured input and makes output available. Disabling stops listeners and playback without deleting configuration." placement="left" /></span></label>
               <label className="check"><input type="checkbox" checked={form.automaticPreview} onChange={(event) => update("automaticPreview", event.target.checked)} /><span className="check-copy">Dashboard preview <HelpTip label="Dashboard preview" content="Creates a muted WebRTC reader on the selected channel's detail page when output is ready. Overview cards do not play video." placement="left" /></span></label>
               <label className="check"><input type="checkbox" checked={form.useAbsoluteTimestamp} onChange={(event) => update("useAbsoluteTimestamp", event.target.checked)} /><span className="check-copy">Preserve absolute timestamps <HelpTip label="Preserve absolute timestamps" content="Keeps source timing information on the original path when the input provides usable timestamps. Converted compatibility output uses Gateway time." placement="left" /></span></label>
@@ -1983,11 +1992,16 @@ function BindingSelect({ label, labelledBy, value, interfaces, includeCustom = f
 }
 
 function channelPayload(form: ChannelForm) {
+  const videoMaxMbps = Number(form.compatibilityVideoMaxMbps);
+  if (!Number.isFinite(videoMaxMbps) || videoMaxMbps < 0.1 || videoMaxMbps > 40) {
+    throw new Error("Compatibility video limit must be between 0.1 and 40 Mbps.");
+  }
   const common = {
     name: form.name,
     enabled: form.enabled,
     automaticPreview: form.automaticPreview,
     maxReaders: Number(form.maxReaders),
+    compatibilityVideoMaxKbps: Math.round(videoMaxMbps * 1000),
     useAbsoluteTimestamp: form.useAbsoluteTimestamp,
   };
   if (form.mode === "rtp-unicast" || form.mode === "rtp-multicast") {

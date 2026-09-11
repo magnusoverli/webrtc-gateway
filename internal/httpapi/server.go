@@ -190,12 +190,13 @@ type mediaStatus struct {
 }
 
 type channelRequest struct {
-	Name                 string       `json:"name"`
-	Enabled              bool         `json:"enabled"`
-	AutomaticPreview     *bool        `json:"automaticPreview,omitempty"`
-	Input                inputRequest `json:"input"`
-	MaxReaders           int          `json:"maxReaders"`
-	UseAbsoluteTimestamp *bool        `json:"useAbsoluteTimestamp,omitempty"`
+	Name                      string       `json:"name"`
+	Enabled                   bool         `json:"enabled"`
+	AutomaticPreview          *bool        `json:"automaticPreview,omitempty"`
+	Input                     inputRequest `json:"input"`
+	MaxReaders                int          `json:"maxReaders"`
+	CompatibilityVideoMaxKbps *int         `json:"compatibilityVideoMaxKbps,omitempty"`
+	UseAbsoluteTimestamp      *bool        `json:"useAbsoluteTimestamp,omitempty"`
 }
 
 type inputRequest struct {
@@ -215,41 +216,42 @@ type srtInputRequest struct {
 }
 
 type channelResponse struct {
-	ID                   string                       `json:"id"`
-	Revision             int                          `json:"revision"`
-	Number               int                          `json:"number"`
-	Name                 string                       `json:"name"`
-	Path                 string                       `json:"path"`
-	Enabled              bool                         `json:"enabled"`
-	AutomaticPreview     bool                         `json:"automaticPreview"`
-	Input                inputResponse                `json:"input"`
-	MaxReaders           int                          `json:"maxReaders"`
-	UseAbsoluteTimestamp bool                         `json:"useAbsoluteTimestamp"`
-	ApplyState           channel.ApplyState           `json:"applyState"`
-	ApplyError           string                       `json:"applyError,omitempty"`
-	CreatedAt            time.Time                    `json:"createdAt"`
-	UpdatedAt            time.Time                    `json:"updatedAt"`
-	WHEPPath             string                       `json:"whepPath"`
-	ViewerPath           string                       `json:"viewerPath"`
-	EmbedPath            string                       `json:"embedPath"`
-	Available            bool                         `json:"available"`
-	AvailableTime        *string                      `json:"availableTime,omitempty"`
-	Online               bool                         `json:"online"`
-	OnlineTime           *string                      `json:"onlineTime,omitempty"`
-	InboundBytes         uint64                       `json:"inboundBytes"`
-	OutputInboundBytes   uint64                       `json:"outputInboundBytes"`
-	OutputAvailableTime  *string                      `json:"outputAvailableTime,omitempty"`
-	OutboundBytes        uint64                       `json:"outboundBytes"`
-	InboundFramesInError uint64                       `json:"inboundFramesInError"`
-	Source               *mediamtx.PathSource         `json:"source,omitempty"`
-	Readers              []mediamtx.PathReader        `json:"readers"`
-	Tracks               []mediamtx.Track             `json:"tracks"`
-	InputVideo           *compatibility.VideoMetadata `json:"inputVideo"`
-	OutputReady          bool                         `json:"outputReady"`
-	OutputTracks         []mediamtx.Track             `json:"outputTracks"`
-	Compatibility        compatibility.State          `json:"compatibility"`
-	Relay                *srtrelay.Status             `json:"relay,omitempty"`
-	Issues               []channelIssueResponse       `json:"issues"`
+	ID                        string                       `json:"id"`
+	Revision                  int                          `json:"revision"`
+	Number                    int                          `json:"number"`
+	Name                      string                       `json:"name"`
+	Path                      string                       `json:"path"`
+	Enabled                   bool                         `json:"enabled"`
+	AutomaticPreview          bool                         `json:"automaticPreview"`
+	Input                     inputResponse                `json:"input"`
+	MaxReaders                int                          `json:"maxReaders"`
+	CompatibilityVideoMaxKbps int                          `json:"compatibilityVideoMaxKbps"`
+	UseAbsoluteTimestamp      bool                         `json:"useAbsoluteTimestamp"`
+	ApplyState                channel.ApplyState           `json:"applyState"`
+	ApplyError                string                       `json:"applyError,omitempty"`
+	CreatedAt                 time.Time                    `json:"createdAt"`
+	UpdatedAt                 time.Time                    `json:"updatedAt"`
+	WHEPPath                  string                       `json:"whepPath"`
+	ViewerPath                string                       `json:"viewerPath"`
+	EmbedPath                 string                       `json:"embedPath"`
+	Available                 bool                         `json:"available"`
+	AvailableTime             *string                      `json:"availableTime,omitempty"`
+	Online                    bool                         `json:"online"`
+	OnlineTime                *string                      `json:"onlineTime,omitempty"`
+	InboundBytes              uint64                       `json:"inboundBytes"`
+	OutputInboundBytes        uint64                       `json:"outputInboundBytes"`
+	OutputAvailableTime       *string                      `json:"outputAvailableTime,omitempty"`
+	OutboundBytes             uint64                       `json:"outboundBytes"`
+	InboundFramesInError      uint64                       `json:"inboundFramesInError"`
+	Source                    *mediamtx.PathSource         `json:"source,omitempty"`
+	Readers                   []mediamtx.PathReader        `json:"readers"`
+	Tracks                    []mediamtx.Track             `json:"tracks"`
+	InputVideo                *compatibility.VideoMetadata `json:"inputVideo"`
+	OutputReady               bool                         `json:"outputReady"`
+	OutputTracks              []mediamtx.Track             `json:"outputTracks"`
+	Compatibility             compatibility.State          `json:"compatibility"`
+	Relay                     *srtrelay.Status             `json:"relay,omitempty"`
+	Issues                    []channelIssueResponse       `json:"issues"`
 }
 
 type channelIssueResponse struct {
@@ -1372,6 +1374,7 @@ func (s *server) updateChannel(id string, w http.ResponseWriter, r *http.Request
 	draft := request.toDraft(nil)
 	draft.PreserveAutomaticPreview = request.AutomaticPreview == nil
 	draft.PreserveUseAbsoluteTimestamp = request.UseAbsoluteTimestamp == nil
+	draft.PreserveCompatibilityVideoMaxKbps = request.CompatibilityVideoMaxKbps == nil
 	item, err := s.channels.UpdateExpected(r.Context(), id, draft, expectedRevision)
 	if err != nil && item.ID == "" {
 		writeServiceError(w, err)
@@ -1412,7 +1415,8 @@ func (s *server) patchChannel(id string, w http.ResponseWriter, r *http.Request)
 			item, err = s.channels.UpdateExpected(r.Context(), id, channel.Draft{
 				Name: item.Name, Enabled: *request.Enabled, Input: item.Input,
 				PreserveAutomaticPreview: true, PreserveUseAbsoluteTimestamp: true,
-				PassphraseIntent: channel.PassphraseKeep, MaxReaders: item.MaxReaders,
+				PreserveCompatibilityVideoMaxKbps: true,
+				PassphraseIntent:                  channel.PassphraseKeep, MaxReaders: item.MaxReaders,
 			}, revision)
 		}
 	} else {
@@ -1757,14 +1761,22 @@ func (r channelRequest) toDraft(current *channel.Channel) channel.Draft {
 	if r.UseAbsoluteTimestamp != nil {
 		useAbsoluteTimestamp = *r.UseAbsoluteTimestamp
 	}
+	videoMaxKbps := channel.DefaultCompatibilityVideoMaxKbps
+	if current != nil {
+		videoMaxKbps = current.CompatibilityVideoMaxKbps
+	}
+	if r.CompatibilityVideoMaxKbps != nil {
+		videoMaxKbps = *r.CompatibilityVideoMaxKbps
+	}
 	return channel.Draft{
-		Name:                 r.Name,
-		Enabled:              r.Enabled,
-		AutomaticPreview:     automaticPreview,
-		Input:                input,
-		PassphraseIntent:     passphraseIntent,
-		MaxReaders:           r.MaxReaders,
-		UseAbsoluteTimestamp: useAbsoluteTimestamp,
+		Name:                      r.Name,
+		Enabled:                   r.Enabled,
+		AutomaticPreview:          automaticPreview,
+		Input:                     input,
+		PassphraseIntent:          passphraseIntent,
+		MaxReaders:                r.MaxReaders,
+		CompatibilityVideoMaxKbps: videoMaxKbps,
+		UseAbsoluteTimestamp:      useAbsoluteTimestamp,
 	}
 }
 
@@ -1886,40 +1898,41 @@ func channelRuntimeView(item channel.Channel, runtime, output mediamtx.Channel, 
 		outputTracks = enrichAudioTrack(output.Tracks, compatibilityState.OutputAudio)
 	}
 	view := channelResponse{
-		ID:                   item.ID,
-		Revision:             item.Revision,
-		Number:               item.Number,
-		Name:                 item.Name,
-		Path:                 item.Path,
-		Enabled:              item.Enabled,
-		AutomaticPreview:     item.AutomaticPreview,
-		Input:                inputView(item.Input),
-		MaxReaders:           item.MaxReaders,
-		UseAbsoluteTimestamp: item.UseAbsoluteTimestamp,
-		ApplyState:           item.ApplyState,
-		ApplyError:           item.ApplyError,
-		CreatedAt:            item.CreatedAt,
-		UpdatedAt:            item.UpdatedAt,
-		WHEPPath:             "/api/v1/channels/" + url.PathEscape(item.ID) + "/whep",
-		ViewerPath:           "/view",
-		EmbedPath:            "/embed/" + strconv.Itoa(item.Number),
-		Available:            runtime.Available,
-		AvailableTime:        runtime.AvailableTime,
-		Online:               runtime.Online,
-		OnlineTime:           runtime.OnlineTime,
-		InboundBytes:         runtime.InboundBytes,
-		OutputInboundBytes:   outputInboundBytes,
-		OutputAvailableTime:  outputAvailableTime,
-		OutboundBytes:        outboundBytes,
-		InboundFramesInError: runtime.InboundFramesInError,
-		Source:               runtime.Source,
-		Readers:              readers,
-		Tracks:               enrichAudioTrack(runtime.Tracks, compatibilityState.InputAudio),
-		InputVideo:           compatibilityState.InputVideo,
-		OutputReady:          outputReady,
-		OutputTracks:         outputTracks,
-		Compatibility:        compatibilityState,
-		Issues:               []channelIssueResponse{},
+		ID:                        item.ID,
+		Revision:                  item.Revision,
+		Number:                    item.Number,
+		Name:                      item.Name,
+		Path:                      item.Path,
+		Enabled:                   item.Enabled,
+		AutomaticPreview:          item.AutomaticPreview,
+		Input:                     inputView(item.Input),
+		MaxReaders:                item.MaxReaders,
+		CompatibilityVideoMaxKbps: item.CompatibilityVideoMaxKbps,
+		UseAbsoluteTimestamp:      item.UseAbsoluteTimestamp,
+		ApplyState:                item.ApplyState,
+		ApplyError:                item.ApplyError,
+		CreatedAt:                 item.CreatedAt,
+		UpdatedAt:                 item.UpdatedAt,
+		WHEPPath:                  "/api/v1/channels/" + url.PathEscape(item.ID) + "/whep",
+		ViewerPath:                "/view",
+		EmbedPath:                 "/embed/" + strconv.Itoa(item.Number),
+		Available:                 runtime.Available,
+		AvailableTime:             runtime.AvailableTime,
+		Online:                    runtime.Online,
+		OnlineTime:                runtime.OnlineTime,
+		InboundBytes:              runtime.InboundBytes,
+		OutputInboundBytes:        outputInboundBytes,
+		OutputAvailableTime:       outputAvailableTime,
+		OutboundBytes:             outboundBytes,
+		InboundFramesInError:      runtime.InboundFramesInError,
+		Source:                    runtime.Source,
+		Readers:                   readers,
+		Tracks:                    enrichAudioTrack(runtime.Tracks, compatibilityState.InputAudio),
+		InputVideo:                compatibilityState.InputVideo,
+		OutputReady:               outputReady,
+		OutputTracks:              outputTracks,
+		Compatibility:             compatibilityState,
+		Issues:                    []channelIssueResponse{},
 	}
 	if view.Readers == nil {
 		view.Readers = []mediamtx.PathReader{}

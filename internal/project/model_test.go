@@ -52,6 +52,39 @@ func TestValidateConfigurationRejectsCrossChannelPortConflict(t *testing.T) {
 	}
 }
 
+func TestProjectCompatibilityBitrateRoundTripAndLegacyDefault(t *testing.T) {
+	for _, test := range []struct{ value, want int }{{0, 5000}, {3500, 3500}} {
+		now := time.Now()
+		configuration := validConfiguration(now)
+		configuration.Channels[0].CompatibilityVideoMaxKbps = test.value
+		manifest := Manifest{Kind: ManifestKind, SchemaVersion: SchemaVersion, Name: "Bitrate", Configuration: configuration}
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if test.value == 0 {
+			encoded = []byte(strings.ReplaceAll(string(encoded), `,"compatibilityVideoMaxKbps":0`, ""))
+		}
+		var imported Manifest
+		if err := json.Unmarshal(encoded, &imported); err != nil {
+			t.Fatal(err)
+		}
+		validated, err := ValidateManifest(imported, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved := validated.Configuration.Channels[0]
+		if live := ChannelFrom(saved.Live(1, now)); live.CompatibilityVideoMaxKbps != test.want {
+			t.Fatalf("project bitrate=%d, want %d", live.CompatibilityVideoMaxKbps, test.want)
+		}
+	}
+	configuration := validConfiguration(time.Now())
+	configuration.Channels[0].CompatibilityVideoMaxKbps = -1
+	if _, err := ValidateConfiguration(configuration, time.Now()); err == nil {
+		t.Fatal("project accepted invalid video bitrate")
+	}
+}
+
 func TestValidateManifestRejectsUnknownVersion(t *testing.T) {
 	value := Manifest{Kind: ManifestKind, SchemaVersion: 2, Name: "Studio", Configuration: validConfiguration(time.Now())}
 	if _, err := ValidateManifest(value, time.Now()); err == nil || !strings.Contains(err.Error(), "unsupported schemaVersion") {

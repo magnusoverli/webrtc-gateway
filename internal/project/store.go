@@ -173,11 +173,11 @@ func (s *SQLiteStore) ReplaceLive(ctx context.Context, configuration Configurati
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO channels (
 			id, revision, channel_number, name, path, enabled, automatic_preview, input_json, max_readers,
-			use_absolute_timestamp, apply_state, apply_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)`,
+			use_absolute_timestamp, apply_state, apply_error, created_at, updated_at, compatibility_video_max_kbps
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
 			item.ID, item.Revision, item.Number, item.Name, item.Path, item.Enabled, item.AutomaticPreview,
 			string(input), item.MaxReaders, item.UseAbsoluteTimestamp, channel.ApplyPending,
-			item.CreatedAt.Format(time.RFC3339Nano), item.UpdatedAt.Format(time.RFC3339Nano)); err != nil {
+			item.CreatedAt.Format(time.RFC3339Nano), item.UpdatedAt.Format(time.RFC3339Nano), item.CompatibilityVideoMaxKbps); err != nil {
 			return fmt.Errorf("replace live channel %s: %w", item.Name, err)
 		}
 	}

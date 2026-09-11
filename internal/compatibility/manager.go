@@ -155,6 +155,7 @@ type entry struct {
 	worker             *worker
 	retryAt            time.Time
 	compatLimit        int
+	videoMaxKbps       int
 	compatConfigured   bool
 }
 
@@ -584,9 +585,23 @@ func (m *Manager) reconcileChannel(ctx context.Context, item channel.Channel, by
 		current.inputVideo = nil
 		current.inputAudio = nil
 		current.outputAudio = nil
+		current.videoMaxKbps = item.CompatibilityVideoMaxKbps
 		current.retryAt = time.Time{}
 		current.outputResetPending = byPath[compatPath].Name != ""
 		current.state = State{State: StateProbing, Reasons: []string{}, OutputPath: item.Path, InputFingerprint: fingerprint}
+	}
+	if current.videoMaxKbps != item.CompatibilityVideoMaxKbps {
+		previousMax, _ := videoRateLimit(current.decision.videoWidth, current.decision.videoHeight, current.videoMaxKbps)
+		nextMax, _ := videoRateLimit(current.decision.videoWidth, current.decision.videoHeight, item.CompatibilityVideoMaxKbps)
+		current.videoMaxKbps = item.CompatibilityVideoMaxKbps
+		if current.classified && current.decision.transcodeVideo && previousMax != nextMax {
+			stopWorkerLocked(current)
+			current.retryAt = time.Time{}
+			current.outputResetPending = byPath[compatPath].Name != ""
+			current.state.State = StateStarting
+			current.state.LastError = ""
+			current.state.Worker.Error = ""
+		}
 	}
 	if current.outputResetPending {
 		if !current.retryAt.IsZero() && now.Before(current.retryAt) {
@@ -862,7 +877,7 @@ func (m *Manager) ensureTranscoded(ctx context.Context, item channel.Channel, re
 func (m *Manager) reserveWorkerLocked(ctx context.Context, item channel.Channel, current *entry, result decision, reservation int) *worker {
 	workerCtx, cancel := context.WithCancel(ctx)
 	stderr := newRingWriter(8192)
-	args := ffmpegArgs(m.pathURL(item.Path), m.pathURL(CompatibilityPath(item.ID)), result, m.encoderThreads)
+	args := ffmpegArgs(m.pathURL(item.Path), m.pathURL(CompatibilityPath(item.ID)), result, m.encoderThreads, item.CompatibilityVideoMaxKbps)
 	cmd := exec.CommandContext(workerCtx, m.ffmpeg, args...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = stderr
@@ -1661,7 +1676,7 @@ func browserCompatibleH264PixelFormat(pixelFormat string) bool {
 	return pixelFormat == "yuv420p" || pixelFormat == "yuvj420p"
 }
 
-func ffmpegArgs(inputURL, outputURL string, result decision, encoderThreads int) []string {
+func ffmpegArgs(inputURL, outputURL string, result decision, encoderThreads, videoMaxKbps int) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-rtsp_transport", "tcp",
 		"-fflags", "nobuffer", "-flags", "low_delay", "-max_delay", "0",
@@ -1674,7 +1689,7 @@ func ffmpegArgs(inputURL, outputURL string, result decision, encoderThreads int)
 		"-map", "0:v:0?", "-map", "0:a:0?",
 	)
 	if result.transcodeVideo {
-		maxRateKbps, bufferKbps := videoRateLimit(result.videoWidth, result.videoHeight)
+		maxRateKbps, bufferKbps := videoRateLimit(result.videoWidth, result.videoHeight, videoMaxKbps)
 		if filter := videoFilter(result.videoTransform); filter != "" {
 			args = append(args, "-vf", filter)
 		}
@@ -1708,7 +1723,7 @@ func videoFilter(transform videoTransform) string {
 	}
 }
 
-func videoRateLimit(width, height int) (int, int) {
+func videoRateLimit(width, height, videoMaxKbps int) (int, int) {
 	pixels := int64(width) * int64(height)
 	maxRateKbps := 16000
 	switch {
@@ -1723,6 +1738,10 @@ func videoRateLimit(width, height int) (int, int) {
 	case pixels > 2560*1440:
 		maxRateKbps = 40000
 	}
+	if videoMaxKbps == 0 {
+		videoMaxKbps = channel.DefaultCompatibilityVideoMaxKbps
+	}
+	maxRateKbps = min(maxRateKbps, videoMaxKbps)
 	return maxRateKbps, maxRateKbps / 2
 }
 
